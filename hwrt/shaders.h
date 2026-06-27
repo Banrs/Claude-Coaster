@@ -205,14 +205,18 @@ struct Hit {
     int    mat;
 };
 
-static Hit traceRay(ray r, primitive_acceleration_structure accel,
-                    device const Vertex* verts) {
-    intersector<triangle_data> it;
+// Two-instance AS: instance 0 = terrain (vertsT), instance 1 = track+train (vertsK).
+// Splitting them lets the big terrain AS rebuild rarely (only on ring-centre moves)
+// while the tiny track/train AS rebuilds every few frames -> steady-state fps.
+static Hit traceRay(ray r, instance_acceleration_structure accel,
+                    device const Vertex* vertsT, device const Vertex* vertsK) {
+    intersector<triangle_data, instancing> it;
     it.assume_geometry_type(geometry_type::triangle);
-    intersection_result<triangle_data> h = it.intersect(r, accel);
+    intersection_result<triangle_data, instancing> h = it.intersect(r, accel);
     Hit out;
     out.valid = (h.type != intersection_type::none);
     if (out.valid) {
+        device const Vertex* verts = (h.instance_id == 0) ? vertsT : vertsK;
         Vertex v0 = verts[h.primitive_id * 3 + 0];
         out.n      = normalize(float3(v0.normal));
         out.albedo = float3(v0.albedo);
@@ -224,16 +228,16 @@ static Hit traceRay(ray r, primitive_acceleration_structure accel,
 }
 
 static bool occluded(float3 origin, float3 dir, float maxd,
-                     primitive_acceleration_structure accel) {
+                     instance_acceleration_structure accel) {
     ray sr;
     sr.origin = origin;
     sr.direction = dir;
     sr.min_distance = 0.002;
     sr.max_distance = maxd;
-    intersector<triangle_data> sit;
+    intersector<triangle_data, instancing> sit;
     sit.assume_geometry_type(geometry_type::triangle);
     sit.accept_any_intersection(true);
-    intersection_result<triangle_data> sh = sit.intersect(sr, accel);
+    intersection_result<triangle_data, instancing> sh = sit.intersect(sr, accel);
     return sh.type != intersection_type::none;
 }
 
@@ -247,7 +251,7 @@ static void basis(float3 n, thread float3& t, thread float3& b) {
 // Soft sun shadow: jitter the shadow ray inside the sun's angular cone so edges
 // feather instead of being razor-hard. `rng` advances per sample.
 static float softSunShadow(float3 pos, float3 n, float3 L, thread float& rng,
-                          primitive_acceleration_structure accel) {
+                          instance_acceleration_structure accel) {
     float3 t, b; basis(L, t, b);
     float occ = 0.0;
     const int S = 8;                             // more shadow samples -> softer, lower-noise penumbra (balanced for fps)
@@ -293,7 +297,7 @@ static float3 sunSpec(float3 n, float3 V, float3 L, float rough, float3 specCol)
 // bounce surfaces), 2 = soft multi-sample sun shadow (primary surfaces only).
 static float3 shadeSurface(float3 pos, float3 n, float3 albedo, int mat,
                            float3 L, float3 V, thread float& rng,
-                           primitive_acceleration_structure accel, int shadowMode) {
+                           instance_acceleration_structure accel, int shadowMode) {
     albedo = voxelGrain(albedo, pos, n, mat);
     float ndl = max(dot(n, L), 0.0);
     float shadow = 1.0;
@@ -317,8 +321,9 @@ static float3 shadeSurface(float3 pos, float3 n, float3 albedo, int mat,
 
 kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
                         constant CameraUniforms& cam [[buffer(0)]],
-                        primitive_acceleration_structure accel [[buffer(1)]],
-                        device const Vertex* verts [[buffer(2)]],
+                        instance_acceleration_structure accel [[buffer(1)]],
+                        device const Vertex* vertsT [[buffer(2)]],   // terrain (instance 0)
+                        device const Vertex* vertsK [[buffer(3)]],   // track+train (instance 1)
                         uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= cam.width || gid.y >= cam.height) return;
@@ -345,7 +350,7 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
 
     float3 L = normalize(cam.sunDir);
     float3 V = -dir;
-    Hit hit = traceRay(r, accel, verts);
+    Hit hit = traceRay(r, accel, vertsT, vertsK);
 
     float3 color;
     if (!hit.valid) {
@@ -374,7 +379,7 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
             gr.direction = sdir;
             gr.min_distance = 0.002;
             gr.max_distance = 60.0;             // local occlusion / colour bleed
-            Hit gh = traceRay(gr, accel, verts);
+            Hit gh = traceRay(gr, accel, vertsT, vertsK);
             if (gh.valid) {
                 // near hits occlude strongly, distant ones fade out (range AO)
                 aoSum += 1.0 - smoothstep(2.0, 28.0, gh.dist);
@@ -405,7 +410,7 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
             rr.direction = refl;
             rr.min_distance = 0.002;
             rr.max_distance = 10000.0;
-            Hit rh = traceRay(rr, accel, verts);
+            Hit rh = traceRay(rr, accel, vertsT, vertsK);
             float3 reflCol = rh.valid
                 ? shadeSurface(rh.pos, rh.n, rh.albedo, rh.mat, L, -refl, rng, accel, 1)
                 : sampleSky(rr.origin, refl, L, t);

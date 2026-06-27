@@ -172,12 +172,14 @@ static Terrain buildTerrain(float centerX, float centerZ, int N = 220, float cel
 
     // Sample heights (in voxel units) once per cell. terrainH is heavy multi-octave
     // noise and at 1m blocks there are N*N (~0.5M) cells, so sample the rows in
-    // parallel across cores (GCD) — this is the dominant rebuild cost.
+    // parallel across cores (GCD) — this is the dominant rebuild cost. Run at UTILITY
+    // QoS so the OS preempts it for the higher-priority render thread (the rebuild
+    // runs on a worker; starving the frame loop with USER_INITIATED caused hitches).
     std::vector<int> H(N * N);
     {
         int* Hp = H.data();
         float ox = t.originX, oz = t.originZ, cl = cell;
-        dispatch_apply((size_t)N, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        dispatch_apply((size_t)N, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
                        ^(size_t z) {
             for (int x = 0; x < N; x++) {
                 float wx = ox + x * cl + cl * 0.5f, wz = oz + (int)z * cl + cl * 0.5f;

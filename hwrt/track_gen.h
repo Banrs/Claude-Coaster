@@ -17,7 +17,7 @@
 // this same radius so no track ever floats beyond the terrain edge. 1m blocks
 // (CELL=1) keep true Minecraft scale on all sides.
 static constexpr float TG_CELL = 1.0f;     // 1m voxel blocks (true MC scale)
-static constexpr float TG_RING = 1100.0f;   // half-extent meshed around the train
+static constexpr float TG_RING = 400.0f;   // half-extent meshed around the train
 
 // ---------------------------------------------------------------------------
 // A self-contained, copyable snapshot of the spline window the meshing reads:
@@ -106,7 +106,7 @@ struct StreamTrack {
     Track gen;
     float trainU   = 6.0f;     // local u of the train along the deque
     int   winLo    = 4;        // first local index to build geometry for
-    int   buildAhead = 250;    // local indices of track to keep meshed ahead of the train
+    int   buildAhead = 150;    // local indices of track to keep meshed ahead of the train
     int   buildBehind = 26;    // local indices kept meshed behind the train (so it doesn't pop into view)
 
     // physics (mirrors src/main.cpp ride loop)
@@ -391,9 +391,22 @@ static void buildTrackT(const Src& s, std::vector<MeshVertex>& out) {
     buildTrainT(s, out);   // train consist near the head (rides with the camera)
 }
 
-// Full scene mesh for a snapshot (terrain ring + clipped track + train).
+// Full scene mesh for a snapshot (terrain ring + clipped track + train). Kept for
+// the --shot path's forceSyncRebuild; the live renderer meshes the two halves
+// separately (different rebuild cadences) via meshTerrainOnly / meshTrackOnly.
 static void meshSnapshot(const TrackSnapshot& s, std::vector<MeshVertex>& out) {
     out.clear();
     buildTerrainRingT(s, out);
+    buildTrackT(s, out);
+}
+
+// Terrain ring only (instance 0 — big, rebuilt rarely on ring-centre moves).
+static void meshTerrainOnly(const TrackSnapshot& s, std::vector<MeshVertex>& out) {
+    out.clear();
+    buildTerrainRingT(s, out);
+}
+// Track + supports + train only (instance 1 — tiny, rebuilt every few frames).
+static void meshTrackOnly(const TrackSnapshot& s, std::vector<MeshVertex>& out) {
+    out.clear();
     buildTrackT(s, out);
 }
