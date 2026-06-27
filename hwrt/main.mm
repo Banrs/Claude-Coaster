@@ -120,7 +120,7 @@ void Renderer::init() {
         minz = fminf(minz, q.z); maxz = fmaxf(maxz, q.z);
     }
     float cx = (minx + maxx) * 0.5f, cz = (minz + maxz) * 0.5f;
-    const float CELL = 6.0f, MARGIN = 160.0f;
+    const float CELL = 4.0f, MARGIN = 120.0f;   // finer voxels so trees/track read to scale
     float halfExtent = fmaxf(maxx - minx, maxz - minz) * 0.5f + MARGIN;
     int N = (int)ceilf(2.0f * halfExtent / CELL);
 

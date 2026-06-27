@@ -207,7 +207,10 @@ static Terrain buildTerrain(float centerX, float centerZ, int N = 220, float cel
             bool isGrass = (topAlb.x == grass.x || topAlb.x == grassHi.x);
             if (cps && isGrass && h < snowLvl && slope < 4) {
                 float wcx = wx + cell * 0.5f, wcz = wz + cell * 0.5f;
-                if (hashf(x * 7 + 1, z * 7 + 3) < 0.07f) {        // forest density
+                // per-AREA density (independent of cell size, so finer terrain
+                // doesn't multiply the tree count and blow up the triangle budget)
+                float dens = 0.07f * (cell / 6.0f) * (cell / 6.0f);
+                if (hashf(x * 7 + 1, z * 7 + 3) < dens) {
                     bool clear = true;                            // keep a corridor clear of track
                     for (int k = 0; k < ncps; k++) {
                         float dx = cps[k].x - wcx, dz = cps[k].z - wcz;
@@ -216,7 +219,7 @@ static Terrain buildTerrain(float centerX, float centerZ, int N = 220, float cel
                     if (clear) {
                         float r2 = hashf(x * 3 + 5, z * 9 + 2);
                         int type = (h > rockLvl - 6) ? 2 : (r2 < 0.30f ? 1 : 0);   // spruce up high
-                        float s  = 0.85f + hashf(x * 5 + 7, z * 5 + 1) * 0.5f;     // size variety
+                        float s  = 1.3f + hashf(x * 5 + 7, z * 5 + 1) * 0.9f;      // realistic tree height (~8-13m)
                         pushTree(t.verts, wcx, topY, wcz, type, s);
                     }
                 }
