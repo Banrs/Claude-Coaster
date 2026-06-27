@@ -655,8 +655,8 @@ void Renderer::rideAdvance(float dt) {
     // gravity along the slope, quadratic air drag, low rolling friction, and active
     // launch/boost/lift acceleration on powered sections -> the boosts actually work
     // (the orange spine sections noticeably surge), instead of a constant crawl.
-    const float GRAV=22.0f, DRAG=0.0016f, FRICTION=0.016f;
-    const float LAUNCH_V=108.0f, BOOST_V=74.0f, CLIMB_V=40.0f;
+    const float GRAV=22.0f, DRAG=0.0013f, FRICTION=0.016f;   // sync w/ src/main.cpp
+    const float LAUNCH_V=108.0f, BOOST_V=79.0f, CLIMB_V=40.0f;
     const int   M_CLIMB=1, M_LAUNCH=9, M_BOOST=11;
 
     // SPACE boost on powered sections (benchmark map): surge toward the cap.

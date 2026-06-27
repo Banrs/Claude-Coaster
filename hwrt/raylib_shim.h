@@ -26,14 +26,14 @@ struct Color { unsigned char r, g, b, a; };
 // ----- world constants (authoritative; mirror src/main.cpp) -----
 static const float SEG_LEN   = 14.0f;
 static const float GRAV      = 22.0f;
-static const float DRAG      = 0.0016f;
+static const float DRAG      = 0.0013f;   // sync w/ src/main.cpp (was 0.0016 — sped-down train)
 static const float FRICTION  = 0.016f;
 static const float CHAIN_V   = 22.0f;
-static const float MIN_V     = 42.0f;
+static const float MIN_V     = 42.0f;     // generator forward-sim cruise floor (still used by track-gen)
 static const float MAX_V     = 82.0f;
 static const float LAUNCH_V  = 108.0f;
 static const float CLIMB_V   = 40.0f;
-static const float BOOST_V   = 74.0f;
+static const float BOOST_V   = 79.0f;     // sync w/ src/main.cpp (was 74)
 static const float BUILD_MAX = 430.0f;
 // WATER_Y / TERRA_MAX come from terrain.h.
 static const Vector3 WUP = { 0.0f, 1.0f, 0.0f };
