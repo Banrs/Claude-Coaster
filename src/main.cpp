@@ -1034,10 +1034,14 @@ static Sound makeWhooshSound() {
     float y = 0;
     for (int i = 0; i < n; i++) {
         float t = (float)i / sr;
+        float p = t / dur;                                 // 0..1 progress
         float x = frnd(-1, 1);
-        y += 0.09f * (x - y);
-        float env = powf(sinf(PI * t / dur), 1.6f);
-        d[i] = (short)(y * env * 14000);
+        // filtered noise whose cutoff sweeps OPEN through the middle (dark -> bright ->
+        // dark) so it reads as an accelerating air rush rather than a dull rumble.
+        float cut = 0.05f + 0.30f * sinf(PI * p);
+        y += cut * (x - y);
+        float env = powf(sinf(PI * p), 1.3f);
+        d[i] = (short)(y * env * 17000);
     }
     Wave w = { (unsigned)n, 44100, 16, 1, d };
     Sound s = LoadSoundFromWave(w);
@@ -1045,23 +1049,28 @@ static Sound makeWhooshSound() {
     return s;
 }
 
-// continuous wind rush — streamed so it scales with speed and never cuts off.
-// the callback runs on the audio thread, so it uses its own RNG (no race with
-// the game RNG) and reads a single float the main thread updates.
-static volatile float g_windVol = 0.0f;             // 0..1, set from main
+// continuous wind rush + rolling-stock rumble — streamed so it scales with speed
+// and never cuts off. the callback runs on the audio thread, so it uses its own
+// RNG (no race with the game RNG) and reads two floats the main thread updates:
+// g_windVol = airy rush (grows with speed), g_rumbleVol = low track rumble (ditto).
+static volatile float g_windVol   = 0.0f;           // 0..1, airy wind rush
+static volatile float g_rumbleVol = 0.0f;           // 0..1, low rolling-stock rumble
 static void windCallback(void *buffer, unsigned int frames) {
     short *d = (short *)buffer;
     static uint32_t ar = 0x9e3779b9u;
-    static float lp = 0, hp = 0, sm = 0;
-    float target = g_windVol;
+    static float lp = 0, hp = 0, rmb = 0, sm = 0, smR = 0;
+    float target = g_windVol, targetR = g_rumbleVol;
     for (unsigned int i = 0; i < frames; i++) {
-        sm += (target - sm) * 0.0006f;              // smooth gain ramp (no clicks)
+        sm  += (target  - sm)  * 0.0006f;           // smooth gain ramps (no clicks)
+        smR += (targetR - smR) * 0.0006f;
         ar ^= ar << 13; ar ^= ar >> 17; ar ^= ar << 5;
         float white = ((int)(ar & 0xffff) - 32768) / 32768.0f;
-        lp += 0.06f * (white - lp);                 // low rumble
-        hp += 0.40f * (white - hp);                 // airy hiss
-        float s = lp * 0.65f + hp * 0.35f;
-        int v = (int)(s * sm * sm * 27000.0f);      // sm^2 ~ perceptual loudness
+        lp  += 0.06f * (white - lp);                // low wind body
+        hp  += 0.40f * (white - hp);                // airy hiss
+        rmb += 0.012f * (white - rmb);              // deep, heavily-filtered track rumble
+        float wind   = (lp * 0.65f + hp * 0.35f) * sm * sm;       // sm^2 ~ perceptual loudness
+        float rumble = rmb * 4.0f * smR;            // rumble already very low-energy -> boost it
+        int v = (int)((wind * 27000.0f) + (rumble * 30000.0f));
         d[i] = (short)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v));
     }
 }
@@ -1335,6 +1344,7 @@ int main(int argc, char **argv) {
     float u = 0.5f, v = 7.0f;
     float boost = 40.0f, score = 0;
     float simTime = 0, clackTimer = 0, whooshCD = 0, prevSlope = 0;
+    unsigned char prevTag = 255;                        // last frame's track tag (launch/boost whoosh edge)
     // g-force meter: signed vertical g (the headline number; +1 at rest, negative =
     // airtime) and lateral g for the ball, plus this session's peak + lowest vertical g
     float gVert = 1.0f, gLat = 0.0f, gVertMax = 1.0f, gVertMin = 1.0f;
@@ -1625,11 +1635,17 @@ int main(int argc, char **argv) {
                 if (clackTimer <= 0) { PlaySound(sndClack); clackTimer = 0.16f; }
             }
             whooshCD -= dt;
-            if (prevSlope > -0.18f && slope <= -0.18f && whooshCD <= 0) {
+            // launch/boost whoosh: fire the instant the train enters a LAUNCH or BOOST
+            // section (rising edge of the tag), and also on a steep-descent plunge.
+            bool launchEdge = (tg == M_LAUNCH || tg == M_BOOST) &&
+                              !(prevTag == M_LAUNCH || prevTag == M_BOOST);
+            bool diveEdge   = prevSlope > -0.18f && slope <= -0.18f;
+            if ((launchEdge || diveEdge) && whooshCD <= 0) {
                 PlaySound(sndWhoosh);
-                whooshCD = 2.5f;
+                whooshCD = launchEdge ? 1.2f : 2.5f;     // launches can re-trigger sooner than dives
             }
             prevSlope = slope;
+            prevTag = tg;
         }
 
         // current frame at the lead car
@@ -1696,6 +1712,11 @@ int main(int argc, char **argv) {
                   ? fmaxf(Clamp((v - 12.0f) / (MAX_V - 12.0f), 0.0f, 1.0f),
                           Clamp(-T.y, 0.0f, 1.0f) * 0.45f)
                   : 0.0f;
+        // rolling-stock rumble: a low track-noise bed that comes in once moving and
+        // deepens with speed (kicks in earlier than the wind so slow rolls aren't silent)
+        g_rumbleVol = (dispatched && !paused)
+                    ? Clamp((v - 4.0f) / (MAX_V - 4.0f), 0.0f, 1.0f)
+                    : 0.0f;
 
         // hydraulic launch / booster sections auto-refill the boost meter (the
         // LSM fins recharge the train), replacing the old gold-block pickups
