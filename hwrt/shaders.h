@@ -80,7 +80,8 @@ static float3 skyGradient(float3 dir) {
 // slab. Coverage from low-frequency FBM, detail erosion from high-frequency FBM.
 // Returns density in [0,1].
 static float cloudDensity(float3 wp, float t) {
-    float2 uv = wp.xz * 0.00045 + float2(t * 0.004, t * 0.001);  // big puffs, slow drift
+    (void)t;                                                     // clouds are static (no drift)
+    float2 uv = wp.xz * 0.00045;                                 // big puffs, fixed in the sky
     float3 q = float3(uv, 0.0);
     float base = fbm3(q);
     float coverage = smoothstep(0.55, 0.82, base);           // mostly clear sky
@@ -226,7 +227,7 @@ static float softSunShadow(float3 pos, float3 n, float3 L, thread float& rng,
                           primitive_acceleration_structure accel) {
     float3 t, b; basis(L, t, b);
     float occ = 0.0;
-    const int S = 2;
+    const int S = 5;
     for (int i = 0; i < S; i++) {
         rng = fract(rng * 1.61803 + 0.31831);
         float a = rng * 6.2831853;
@@ -299,7 +300,10 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
                            + cam.up    * (uv.y * cam.tanHalfFov));
 
     float t = float(cam.frame);
-    float rng = hash12(float2(gid) + 0.123 * t) + 0.0001;
+    // Frame-INDEPENDENT per-pixel seed: the Monte-Carlo dither is fixed in screen
+    // space instead of being reseeded every frame, so shadows/AO don't crawl
+    // (that temporal shimmer read as the whole scene "moving").
+    float rng = hash12(float2(gid)) + 0.0001;
 
     ray r;
     r.origin = cam.origin;
@@ -320,7 +324,7 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
 
         // --- Ray-traced AO + one GI bounce (shared cosine-hemisphere samples) ---
         float3 tt, bb; basis(n, tt, bb);
-        const int AO_SAMPLES = 6;
+        const int AO_SAMPLES = 16;
         float aoSum = 0.0;
         float3 giSum = float3(0.0);
         float3 surfAlb = voxelGrain(hit.albedo, hit.pos, n, hit.mat);
