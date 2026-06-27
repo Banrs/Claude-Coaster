@@ -2170,7 +2170,10 @@ int main(int argc, char **argv) {
         auto drawVBent = [&](Vector3 p, float topY, float gC, Vector3 lat, Vector3 tang, Vector3 railUp, Color sc) {
             float hgt = topY - gC;
             if (hgt < 1.0f) return;
-            float baseHalf = Clamp(hgt * 0.20f, 1.5f, 4.5f);   // ground splay (grows with height, capped)
+            // deterministic per-location variation so the run of bents isn't uniform
+            float vary = hashf((int)floorf(p.x * 0.5f), (int)floorf(p.z * 0.5f));
+            float baseHalf = Clamp(hgt * (0.17f + vary * 0.07f), 1.5f, 5.5f);  // ground splay grows with height, varied
+            float legR     = Clamp(0.30f + hgt * 0.0045f, 0.30f, 0.55f);       // taller -> thicker legs
             float topHalf  = 0.22f;                            // leg tops attach just inside the node edges
             // Build the whole TOP of the bent in the rail frame (railUp / rRight) so it
             // tucks under the box-spine even where the track banks — no world-vertical
@@ -2183,16 +2186,41 @@ int main(int argc, char **argv) {
             Vector3 latH   = Vector3Normalize(Vector3{ rRight.x, 0.0f, rRight.z }); // its ground projection: feet splay here
             float nodeDrop = 0.58f;                            // node centre below the centreline, along railUp
             Vector3 node = Vector3Subtract(p, Vector3Scale(railUp, nodeDrop));
+            Vector3 tops[2], feet[2]; int si = 0;
             for (float s : { -1.0f, 1.0f }) {                  // two raked legs, each one solid beam
                 Vector3 top  = Vector3Add(node, Vector3Scale(rRight, s * topHalf));   // welds into the node, +s -> +rRight side
                 float bx = p.x + latH.x * s * baseHalf, bz = p.z + latH.z * s * baseHalf;  // foot on the SAME side
                 Vector3 foot = { bx, groundTopAt(bx, bz), bz };
+                tops[si] = top; feet[si] = foot; si++;
                 Vector3 dir  = Vector3Subtract(foot, top);
                 float len = Vector3Length(dir);
                 Vector3 mid = Vector3Scale(Vector3Add(top, foot), 0.5f);
                 pushFrame(mid, Vector3Normalize(dir), WUP);    // local +z runs down the leg
-                drawCubeTex(T_IRON, Vector3{ 0, 0, 0 }, 0.36f, 0.36f, len, sc);
+                drawCubeTex(T_IRON, Vector3{ 0, 0, 0 }, legR, legR, len, sc);
                 popFrame();
+            }
+            // a steel strut between two world points (cross-ties / diagonal bracing)
+            auto strut = [&](Vector3 a, Vector3 b, float r) {
+                Vector3 d = Vector3Subtract(b, a); float L = Vector3Length(d);
+                if (L < 0.3f) return;
+                pushFrame(Vector3Scale(Vector3Add(a, b), 0.5f), Vector3Normalize(d), WUP);
+                drawCubeTex(T_IRON, Vector3{ 0, 0, 0 }, r, r, L, sc);
+                popFrame();
+            };
+            // Taller bents get trussed: horizontal cross-ties (more the taller it is) and,
+            // for the big towers, diagonal X-bracing between tie levels -> proper braced
+            // support instead of two bare splayed sticks.
+            if (hgt > 14.0f) {
+                int levels = (int)Clamp(hgt / 16.0f, 1.0f, 4.0f);
+                Vector3 prevL{}, prevR{}; bool have = false;
+                for (int k = 1; k <= levels; k++) {
+                    float f = (float)k / (float)(levels + 1);              // node(0) -> foot(1)
+                    Vector3 L = Vector3Lerp(tops[0], feet[0], f);
+                    Vector3 R = Vector3Lerp(tops[1], feet[1], f);
+                    strut(L, R, legR * 0.7f);                              // horizontal tie
+                    if (have && hgt > 22.0f) { strut(prevL, R, legR * 0.5f); strut(prevR, L, legR * 0.5f); } // X-brace
+                    prevL = L; prevR = R; have = true;
+                }
             }
             // node block where the legs converge, oriented to the rail frame so it carries
             // pitch + bank; square 0.56 cross-section (width == height) running along the rail.

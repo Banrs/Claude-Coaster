@@ -68,7 +68,7 @@ struct Track {
     std::vector<Vector3> cbPts, cbUps;   // cobra resampled to UNIFORM arc length (no g artifact)
     int     cbIdx = 0;
     // new elements (pretzel teardrop loop / stengel over-tipped airtime / banana 0g winder)
-    Vector3 pzF{}, pzBase{};            float pzR = 30, pzDrift = 0; int pzSteps = 26;
+    Vector3 pzF{}, pzSide{}, pzBase{};  float pzR = 30, pzDrift = 0, pzLat = 0; int pzSteps = 26;
     Vector3 sdF{}, sdSide{}, sdBase{};  float sdH = 12, sdSpan = 0, sdDrop = 0;  int sdSteps = 13;
     Vector3 brF{}, brSide{}, brBase{};  float brH = 18, brSpan = 0, brDir = 1; int brSteps = 26;
     // heartline-roll state (straight, level inline twist — hangtime, low g)

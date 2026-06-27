@@ -32,11 +32,14 @@
     void initPretzel() {
         mode = M_PRETZEL;
         pzF    = headingVec();
+        pzSide = Vector3Normalize(Vector3CrossProduct(WUP, pzF));
+        if (rnd01() < 0.5f) pzSide = Vector3Scale(pzSide, -1.0f);   // sweep either way
         pzBase = gpos;
         // REAL teardrop-loop bottom radius (~18-22m); the managed entry speed sets the g
         // (g_bottom ~ v^2/(pzR*GRAV)), not an inflated radius.
         pzR    = frnd(18.0f, 22.0f);
-        pzDrift = pzR * 1.5f;                        // strong forward creep so the descending back leg never swings behind the entry (was 0.85 -> self-overlap)
+        pzDrift = pzR * 1.5f;                        // forward creep so the descending leg doesn't sit on the ascending one
+        pzLat   = pzR * frnd(1.4f, 1.9f);            // LATERAL sweep so the loop veers off the entry line (was planar -> sat 1:1 on the existing track)
         pzSteps = 26;
         remain  = pzSteps;
     }
@@ -50,9 +53,12 @@
         // climb UP and over: up = R*(1-cos(ang)) (0 at bottom, ~2R at crest)
         float fwd = pzDrift * t + R * sinf(ang);                 // forward swing + net creep
         float up  = R * (1.0f - cosf(ang));                      // rises to the crest, back to 0
-        gpos = { pzBase.x + pzF.x * fwd,
+        // lateral sweep, eased so velocity is 0 at entry AND exit (clean forward
+        // heading both ends) -> the loop veers clear of the lead-in track line.
+        float lat = pzLat * 0.5f * (1.0f - cosf(PI * t));
+        gpos = { pzBase.x + pzF.x * fwd + pzSide.x * lat,
                  pzBase.y + up,
-                 pzBase.z + pzF.z * fwd };
+                 pzBase.z + pzF.z * fwd + pzSide.z * lat };
         // rider up = inward normal (toward loop centre): UP at the bottom (ang~0),
         // DOWN at the crest (ang~PI) -> single inversion over the top.
         Vector3 upv = Vector3Normalize(Vector3{ pzF.x * (-sinf(ang)), cosf(ang), pzF.z * (-sinf(ang)) });
