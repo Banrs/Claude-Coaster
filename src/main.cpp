@@ -1972,9 +1972,9 @@ int main(int argc, char **argv) {
                 popFrame();
             }
             // node block where the legs converge, oriented to the rail frame so it carries
-            // pitch + bank; 0.56 wide (substantial, sits a touch proud of the 0.38 spine).
+            // pitch + bank; square 0.56 cross-section (width == height) running along the rail.
             pushFrame(node, tang, railUp);
-            drawCubeTex(T_IRON, Vector3{ 0, 0, 0 }, 0.56f, 0.42f, 1.0f, sc);
+            drawCubeTex(T_IRON, Vector3{ 0, 0, 0 }, 0.56f, 0.56f, 1.0f, sc);
             popFrame();
         };
         for (int i = k0; i <= k1 && i + 1 < (int)trk.cp.size(); i++) {
