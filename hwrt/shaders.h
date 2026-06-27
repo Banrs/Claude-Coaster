@@ -76,17 +76,24 @@ static float3 skyGradient(float3 dir) {
     return col;
 }
 
-// Sample the layered cloud density at the point where a ray crosses the cloud
-// slab. Coverage from low-frequency FBM, detail erosion from high-frequency FBM.
-// Returns density in [0,1].
+// 2D cloud COVERAGE field (cheap, no vertical structure): a single low-freq FBM
+// lookup keyed to world xz. Reused both by the volumetric march (as the base
+// density) and by the surface cloud-shadow term, so the shapes match exactly.
+static float cloudCoverage(float2 xz) {
+    float2 uv = xz * 0.00036;                                  // big fair-weather puffs
+    float base = fbm3(float3(uv, 0.0));
+    // broader coverage than before so the sky reads as partly-cloudy, not bald.
+    return smoothstep(0.42, 0.70, base);
+}
+
+// Full cloud density at a point in the slab: coverage eroded by higher-freq detail
+// so the puffs get billowed edges. Returns density in [0,1].
 static float cloudDensity(float3 wp, float t) {
     (void)t;                                                     // clouds are static (no drift)
-    float2 uv = wp.xz * 0.00045;                                 // big puffs, fixed in the sky
-    float3 q = float3(uv, 0.0);
-    float base = fbm3(q);
-    float coverage = smoothstep(0.55, 0.82, base);           // mostly clear sky
-    float detail = fbm3(q * 4.3 + 11.0);
-    float d = coverage - detail * 0.28;
+    float coverage = cloudCoverage(wp.xz);
+    if (coverage <= 0.0) return 0.0;
+    float detail = fbm3(float3(wp.xz * 0.0019, 0.0) + 11.0);    // billow erosion
+    float d = coverage - detail * 0.30;
     return clamp(d, 0.0, 1.0);
 }
 
@@ -94,36 +101,52 @@ static float cloudDensity(float3 wp, float t) {
 // alpha. The slab sits at high altitude; clouds are self-shadowed toward the sun.
 static float4 clouds(float3 ro, float3 dir, float3 sunDir, float t) {
     if (dir.y < 0.02) return float4(0.0);                    // below horizon: none
-    const float slabLo = 900.0, slabHi = 1300.0;
+    const float slabLo = 900.0, slabHi = 1320.0;
     float d0 = (slabLo - ro.y) / dir.y;
     float d1 = (slabHi - ro.y) / dir.y;
     if (d1 < 0.0) return float4(0.0);
     d0 = max(d0, 0.0);
     float seg = (d1 - d0);
-    const int STEPS = 6;
+    const int STEPS = 7;
     float dt = seg / float(STEPS);
     float transmittance = 1.0;
     float3 scattered = float3(0.0);
-    float3 sunCol = float3(1.0, 0.95, 0.85);
+    float3 sunCol = float3(1.0, 0.96, 0.88);
     for (int i = 0; i < STEPS; i++) {
         float dist = d0 + (float(i) + 0.5) * dt;
         float3 p = ro + dir * dist;
         float dens = cloudDensity(p, t);
         if (dens > 0.01) {
-            // cheap sun shadowing: sample density a step toward the sun.
-            float toward = cloudDensity(p + sunDir * 140.0, t);
-            float light = exp(-toward * 2.5);
-            float3 c = mix(float3(0.55, 0.58, 0.66), sunCol, light); // shadow->lit
-            float a = dens * 0.85;
+            // cheap sun self-shadowing: sample coverage a step toward the sun.
+            float toward = cloudCoverage(p.xz + sunDir.xz * 260.0);
+            float light = exp(-toward * 2.6);
+            // darker shadowed base -> brighter than-white lit tops: more relief so
+            // the puffs read as 3D billows against the blue instead of flat haze.
+            float3 c = mix(float3(0.50, 0.54, 0.62), sunCol * 1.08, light); // shadow->lit
+            float a = dens * 0.95;
             scattered += transmittance * c * a;
             transmittance *= (1.0 - a);
             if (transmittance < 0.02) break;
         }
     }
     float alpha = 1.0 - transmittance;
-    // fade clouds out toward the horizon so the slab edge isn't a hard line.
-    alpha *= smoothstep(0.02, 0.22, dir.y);
+    // fade clouds out toward the horizon so the slab edge isn't a hard line (but
+    // keep them reaching closer to the horizon so they read from a low eye).
+    alpha *= smoothstep(0.015, 0.12, dir.y);
     return float4(scattered, alpha);
+}
+
+// Cheap cloud shadow on the ground: project the surface point up to the cloud slab
+// along the sun direction and sample the SAME coverage field. Returns a [0,1]
+// sun-light multiplier (1 = full sun, <1 = under a cloud). One 2D FBM lookup —
+// no extra rays — so terrain visibly dims under the drifting cloud cover.
+static float cloudSunLight(float3 wp, float3 sunDir) {
+    if (sunDir.y < 0.05) return 1.0;
+    float toSlab = (1100.0 - wp.y) / sunDir.y;                 // mid-slab altitude
+    if (toSlab < 0.0) return 1.0;
+    float2 hit = wp.xz + sunDir.xz * toSlab;
+    float cov = cloudCoverage(hit);
+    return 1.0 - cov * 0.55;                                   // up to 55% dimming under cloud
 }
 
 // Full sky for a primary/miss ray: gradient + sun disc + glow + clouds.
@@ -277,8 +300,10 @@ static float3 shadeSurface(float3 pos, float3 n, float3 albedo, int mat,
     if (shadowMode > 0 && ndl > 0.0) {
         if (shadowMode == 1)                       // cheap hard shadow (GI bounce)
             shadow = occluded(pos + n * 0.03, L, 8000.0, accel) ? 0.0 : 1.0;
-        else                                       // soft penumbra (primary)
+        else {                                     // soft penumbra (primary)
             shadow = softSunShadow(pos, n, L, rng, accel);
+            shadow *= cloudSunLight(pos, L);       // dim direct sun under cloud cover
+        }
     }
     float3 sunColor = float3(1.05, 0.92, 0.70);
     float3 diff = albedo * sunColor * (ndl * shadow);
