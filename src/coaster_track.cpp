@@ -178,10 +178,18 @@ struct Track {
     void initRoll() {
         rf     = headingVec();
         rside  = Vector3Normalize(Vector3CrossProduct(WUP, rf));
-        rR     = frnd(8.0f, 11.0f);                     // a corkscrew is SMALL — fixed realistic radius (~8-11m -> ~16-22m tall)
-        int turns = (rnd01() < 0.14f) ? 3 : irnd(1, 2);
-        remain   = 16 * turns;                          // 16 pts/rotation (was 8 -> octagonal); half the fwd step keeps the same length
-        rtheta   = 0; rfwd = 0; rfwdStep = SEG_LEN * frnd(0.65f, 0.95f) * 0.5f; // stretch the corkscrew forward
+        if (rnd01() < 0.5f) rside = Vector3Scale(rside, -1.0f);   // alternate handedness so consecutive corkscrews aren't carbon copies
+        // distinct corkscrew STYLES (the user noted "all the rolls are very similar") — vary
+        // count, radius and forward stretch so each roll reads differently:
+        int turns; float stretch;
+        switch (irnd(0, 3)) {
+            case 0: turns = 1; rR = frnd(7.0f,  9.0f);  stretch = frnd(0.45f, 0.65f); break; // tight quick single
+            case 1: turns = 1; rR = frnd(9.5f, 12.0f);  stretch = frnd(1.00f, 1.40f); break; // long lazy stretched
+            case 2: turns = 2; rR = frnd(8.0f, 10.5f);  stretch = frnd(0.60f, 0.90f); break; // classic double
+            default:turns = 3; rR = frnd(8.0f, 10.0f);  stretch = frnd(0.55f, 0.80f); break; // triple coil
+        }
+        remain   = 16 * turns;                          // 16 pts/rotation -> reads round, not octagonal
+        rtheta   = 0; rfwd = 0; rfwdStep = SEG_LEN * stretch * 0.5f;
         raxis    = { gpos.x, gpos.y + rR, gpos.z };
     }
     // zero-g stall: float over an airtime hill while barrel-rolling fully inverted at
@@ -362,7 +370,7 @@ struct Track {
             case M_LOOP:     return {5.5f, 14.0f, 19.0f, 1.6f, 2.6f}; // clothoid loop: 36-64m (<=1.30x the ~49m record), wide bottom keeps g sane
             case M_IMMEL:    return {5.5f, 16.0f, 22.0f, 1.0f, 2.0f}; // Immelmann half-loop -> up to ~57m
             case M_DIVELOOP: return {5.0f, 16.0f, 22.0f, 1.0f, 2.0f}; // dive loop -> up to ~57m
-            case M_COBRA:    return {4.6f, 13.5f, 16.5f, 1.0f, 2.2f}; // cobra hood ~2.2R -> up to ~47m (real 25-37m)
+            case M_COBRA:    return {4.6f, 13.5f, 18.0f, 1.0f, 2.2f}; // cobra hood ~2.2R -> ~39-51m (user cap: max 50-55m)
             case M_PRETZEL:  return {5.5f, 19.0f, 23.0f, 1.0f, 2.0f}; // teardrop loop
             default:         return {0.0f,  0.0f,  0.0f, 1.0f, 2.0f};
         }
