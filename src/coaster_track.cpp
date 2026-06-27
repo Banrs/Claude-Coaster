@@ -27,6 +27,8 @@ struct Track {
     Vector3 genPrevUp = WUP;          // previous point's up-vector (banking-exit easing)
     int     upEaseSteps = 0;          // points remaining to ease banking back to level after an element
     int     queuedInv = 0;            // 0 none, 1 loop, 2 roll — run after a booster straight
+    SegMode trimNext = M_FLAT;        // element waiting behind a speed-trim run (M_FLAT = none)
+    float   trimV    = 0;             // entry-speed target the current trim run is bleeding genV down to (0 = no active trim)
     SegMode lastElem = M_FLAT, prevElem = M_FLAT;
     SegMode launchElem = M_CLIMB;     // mid-course launches do not always top-hat
     float   clearanceBase = 14.0f;    // per-element target height above terrain
@@ -149,7 +151,7 @@ struct Track {
     }
 
     void initLoop() {
-        lR     = invR(6.0f, 18.0f, 30.0f);                   // speed-aware: ~6G (bigger radius -> peak stays under the +10G cap)
+        lR     = frnd(13.0f, 16.0f);                         // REAL vertical-loop radius (~13-16m, B&M/Intamin); the felt g comes from a MANAGED entry speed, not an inflated radius
         lf     = headingVec();
         lside  = Vector3Normalize(Vector3CrossProduct(WUP, lf));
         lcenter = { gpos.x, gpos.y + lR, gpos.z };
@@ -163,7 +165,7 @@ struct Track {
     // direction change). reuses the loop frame; lsteps drives a 180° arc.
     void initImmel() {
         mode    = M_IMMEL;
-        lR      = invR(7.0f, 14.0f, 25.0f);             // speed-aware Immelmann loop-up (~7G)
+        lR      = frnd(13.0f, 16.0f);                   // REAL Immelmann loop-up radius (managed entry speed sets the g, not the radius)
         lf      = headingVec();
         lside   = Vector3Normalize(Vector3CrossProduct(WUP, lf));
         lcenter = { gpos.x, gpos.y + lR, gpos.z };
@@ -205,7 +207,7 @@ struct Track {
     void initDiveLoop() {
         mode = M_DIVELOOP;
         setClearance(18.0f, 40.0f);
-        dlR      = invR(5.5f, 21.0f, 32.0f);                 // speed-aware dive-loop (bigger -> peak under the +10G cap)
+        dlR      = frnd(14.0f, 18.0f);                       // REAL dive-loop radius; managed entry speed sets the g
         dlf      = headingVec();
         dlside   = Vector3Normalize(Vector3CrossProduct(WUP, dlf));
         dlcenter = { gpos.x, gpos.y + dlR, gpos.z };
@@ -238,7 +240,7 @@ struct Track {
     void initCobra() {
         mode = M_COBRA;
         setClearance(24.0f, 58.0f);
-        cbR     = invR(5.0f, 20.0f, 32.0f);   // LARGE hoods; the speed-gate keeps the entry slow so g stays sane
+        cbR     = frnd(11.0f, 14.0f);         // REAL cobra-roll hood radius; the managed entry speed keeps g sane (not a giant radius)
         cbF     = headingVec();
         float side = (rnd01() < 0.5f) ? 1.0f : -1.0f;
         cbSide  = Vector3Scale(Vector3Normalize(Vector3CrossProduct(WUP, cbF)), side);
@@ -376,8 +378,8 @@ struct Track {
         }
         float usable      = fmaxf(gpos.y - maxFloor - 8.0f, 4.0f);   // vertical room down to clearance
         float stepsPerRev = 2.0f * PI / turnMag;                     // ~6-7 steps / coil
-        int   coils       = Clamp((int)(usable / 14.0f), 1, 3);      // >=14m drop PER COIL -> coils never stack vertically
-        remain    = (int)(coils * stepsPerRev + 0.5f);
+        int   coils       = Clamp((int)(usable / 14.0f), 1, 2);      // 1-2 coils: a real helix tower, but bounded so it doesn't eat the whole ride (keeps element variety dense)
+        remain    = Clamp((int)(coils * stepsPerRev + 0.5f), 8, 38); // cap total length -> denser element mix over a ride
         helixDrop = -usable / (float)remain;                         // whole descent spread evenly -> no truncation
     }
     int     scurveLen = 10;                              // total S-curve length (for the half-way flip)
@@ -464,12 +466,26 @@ struct Track {
     static bool isHardInversion(SegMode m) {       // the positive-g inversions (NOT the 0g float ones)
         return m == M_LOOP || m == M_ROLL || m == M_IMMEL || m == M_DIVELOOP || m == M_COBRA || m == M_PRETZEL;
     }
+    // REAL coaster physics: each fixed-size inversion is only safe up to a certain ENTRY
+    // SPEED (g ~ v^2 on its fixed radius). Rather than inflate the radius at speed (which
+    // makes the element tame), we BLEED the train down to this entry speed in a trim run
+    // before the element, then re-accelerate out — exactly like a real ride. Returns the
+    // target entry speed for an element (0 = no trim, take it at whatever speed it carries).
+    static float elemEntryV(SegMode m) {
+        switch (m) {
+            case M_LOOP:     return 50.0f;   // ~14.5m loop -> ~6G at the bottom
+            case M_IMMEL:    return 50.0f;
+            case M_DIVELOOP: return 53.0f;   // larger radius -> a touch more entry speed for a punchy ~5.5G
+            case M_COBRA:    return 47.0f;   // tightest hoods
+            case M_PRETZEL:  return 53.0f;   // wide teardrop bottom
+            case M_ROLL:     return 54.0f;   // gentle helical corkscrew tolerates more
+            default:         return 0.0f;
+        }
+    }
     bool eligibleElem(SegMode m) const {
-        // PLACE g-heavy inversions only where the train is already SLOW — never brake to
-        // kill KE, just don't schedule a tight inversion right after a boost or a top-hat
-        // drop (high speed * tight inversion = lethal g). They become eligible once airtime
-        // hills / turns / drag have bled the speed down.
-        if (isHardInversion(m) && genV > 64.0f) return false;   // enter inversions at moderate-HIGH speed -> bigger + punchier (not tame), still well short of lethal
+        // Tight inversions are no longer gated OUT at speed (that left half of them
+        // un-spawnable). They are kept REAL-SIZED and instead entered via a speed-managed
+        // trim (see elemEntryV / nextMode), so every element can appear over a long ride.
         return elemFamily(m) != elemFamily(lastElem) && m != prevElem;
     }
     // pick from the pool weighted toward the LEAST-recently-used eligible type, so
@@ -505,9 +521,30 @@ struct Track {
         return pickFromPool(pool, (int)(sizeof(pool) / sizeof(pool[0])));
     }
 
+    // begin a real-coaster TRIM run before a fixed-size tight inversion: a level brake
+    // section that bleeds the train's speed down to the element's safe ENTRY SPEED, then
+    // the element is initialised when the trim completes (see nextMode's trimNext branch).
+    // length is sized so the (mirrored) live brake has room to shed the excess speed.
+    void startTrim(SegMode elem) {
+        trimNext = elem;
+        trimV    = elemEntryV(elem);
+        mode     = M_FLAT;
+        // brake budget ~ a real trim (~0.8g). distance to bleed v->trimV: (v^2-trimV^2)/(2a).
+        float a  = 0.8f * GRAV;
+        float d  = (genV * genV - trimV * trimV) / (2.0f * a);
+        remain   = Clamp((int)(d / SEG_LEN) + 2, 3, 9);   // a few extra points to settle level
+    }
+
     void chooseElement(float h) {
         (void)h;
         SegMode pick = rollElementPick();
+        // a fixed-size tight inversion ridden too fast = lethal g. If we're above its
+        // safe entry speed, run a trim brake first (real-coaster style) and init it after.
+        if (isHardInversion(pick) && genV > elemEntryV(pick) + 3.0f) {
+            rememberElement(pick);
+            startTrim(pick);
+            return;
+        }
         rememberElement(pick);
 
         // inversions get a booster straight first so they always carry speed;
@@ -538,8 +575,26 @@ struct Track {
         }
     }
 
+    // dispatch the inversion that was waiting behind a finished speed-trim run
+    void startTrimmedElem() {
+        SegMode elem = trimNext; trimNext = M_FLAT; trimV = 0;
+        // element was already remembered when its trim was scheduled (chooseElement)
+        switch (elem) {
+            case M_LOOP:     initLoop();     mode = M_LOOP; break;
+            case M_ROLL:     initRoll();     mode = M_ROLL; break;
+            case M_IMMEL:    initImmel();    break;
+            case M_DIVELOOP: initDiveLoop(); break;
+            case M_COBRA:    initCobra();    break;
+            case M_PRETZEL:  initPretzel();  break;
+            default:         initLoop();     mode = M_LOOP; break;
+        }
+    }
+
     void nextMode() {
         float h = gpos.y - groundTopAt(gpos.x, gpos.z);
+        // a speed-trim run just finished -> the train is now at the inversion's safe
+        // entry speed, so dispatch the real-sized inversion it was bleeding down for
+        if (trimNext != M_FLAT) { startTrimmedElem(); return; }
         // berth an exit station once armed and we're genuinely low & level so the
         // finish a level ramp-up that eased the track to the deck height -> berth
         if (stationRamping) { stationRamping = false; startStation(); return; }
@@ -600,19 +655,19 @@ struct Track {
                 break;
             case M_DROP:
                 if (h > 30.0f) { remain = 2; return; }    // ride a big drop all the way down
-                mode = M_FLAT; remain = irnd(3, 4);        // LEVEL run after the drop bottoms -> the pull-out eases fully to flat before the next element (kills the end-of-drop jerk)
+                mode = M_FLAT; remain = irnd(5, 7);        // DILATED level run after the drop bottoms -> a long, gentle ease to flat (low curvature gradient, mild recovery g) before the next element
                 break;
             case M_LOOP:
             case M_ROLL:
             case M_IMMEL:                                 // swoop out of an inversion
-                mode = M_DROP; remain = irnd(3, 5);
+                mode = M_DROP; remain = irnd(4, 6);       // longer, gentler swoop-out of the inversion
                 break;
             default:                                      // HILLS / TURN / HELIX / DIP / FLAT
                 if (elems >= elemLimit || h < 14.0f) startLaunch();   // re-energize with a launch, not a chain hill
-                // real coasters never butt two g-elements together — insert a short LEVEL
-                // transition (trim/brake-run) so banking eases to level and the felt g
-                // recovers between pulls instead of two curvatures stacking into one spike
-                else if (mode != M_FLAT)     { mode = M_FLAT; remain = irnd(2, 3); }
+                // real coasters never butt two g-elements together — insert a LEVEL transition
+                // (trim/brake-run). DILATED to several points so banking eases fully to level and
+                // the felt g recovers GENTLY between pulls (low curvature gradient, no sharp dip)
+                else if (mode != M_FLAT)     { mode = M_FLAT; remain = irnd(4, 6); }
                 else                         chooseElement(h);
         }
     }
@@ -660,7 +715,11 @@ struct Track {
                 break;
             }
             case M_CLIMB: dy = mega ? 19.0f : 11.0f; break;          // consistent climb rate (was random per-point -> jitter)
-            case M_DROP:  dy = (gpos.y - gt > 70.0f) ? -44.0f : -19.0f; break;   // consistent steep descent (the pull-out cap eases it near the floor); was random -> jitter
+            case M_DROP: {                                          // descent rate by height: real big drops plunge; short post-element recovery dips glide GENTLY (dilated pull-out, mild g)
+                float dh = gpos.y - gt;
+                dy = (dh > 70.0f) ? -44.0f : (dh > 34.0f) ? -19.0f : -fmaxf(dh - 9.0f, 0.0f) * 0.32f - 2.0f;
+                break;
+            }
             case M_HELIX: dy = helixDrop; break;      // constant step-down so coils never stack/overlap
             case M_DIVE:  dy = ((gt + 6.0f) - gpos.y) * 0.30f - 4.0f; break; // banked turn diving downhill
             case M_SCURVE: dy = ((gt + 12.0f) - gpos.y) * 0.35f; break; // roughly level S (consistent target)
@@ -969,6 +1028,10 @@ struct Track {
                 else if (tag == M_CLIMB && ch == 0 && genV < CLIMB_V)  genV = fminf(genV + 34.0f * gdt, CLIMB_V);
                 if (tag == M_BOOST && genV < BOOST_V) genV = fminf(genV + 55.0f * gdt, BOOST_V);
                 if (ch && slope > 0.05f) { float lv = (slope > 0.55f) ? 27.0f : CHAIN_V; if (genV < lv) genV = fminf(genV + 20.0f * gdt, lv); }
+                // TRIM brake: bleed the forward-sim speed down to the queued inversion's
+                // safe entry speed during its level trim run (mirrors the live brake below)
+                if (trimNext != M_FLAT && trimV > 0.0f && genV > trimV)
+                    genV = fmaxf(genV - 18.0f * gdt, trimV);
                 genV = fmaxf(genV, MIN_V); genV = fminf(genV, 135.0f);
             }
         }
