@@ -2125,7 +2125,11 @@ int main(int argc, char **argv) {
 
         // track supports (at control points; skip inverted parts of loops/rolls).
         // Drawn in the depth pass too, so the support legs cast real shadows.
-        int k0 = (int)fmaxf(1.0f, u - 14.0f), k1 = (int)(u + 46);   // wide index window; spatial+fog cull bounds the real cost (keeps looped-back 180° spans connected)
+        int k0 = (int)fmaxf(1.0f, u - 14.0f), k1 = (int)(u + 64);   // wide index window; spatial+fog cull bounds the real cost (keeps looped-back 180° spans connected)
+        // the coaster is tall, sparse geometry -> render it well PAST the terrain
+        // border so big structures stay visible on the horizon instead of vanishing
+        // at the 12-chunk terrain edge along with the ground.
+        float trackFog = fogEnd * 1.9f;
         // a HELIX gets ONE central tower (each coil ties in with a short radial strut) so the
         // legs never punch straight down through the coils stacked below. axis = centroid.
         // axis = centroid of the WHOLE coil run, not the sliding window: averaging
@@ -2150,7 +2154,7 @@ int main(int argc, char **argv) {
             hxAxis.x /= hxN; hxAxis.z /= hxN;
             float gAxis = groundTopAt(hxAxis.x, hxAxis.z), th = hxTopY - gAxis;
             float ddxA = hxAxis.x - P.x, ddzA = hxAxis.z - P.z;
-            float fogA = Clamp((sqrtf(ddxA*ddxA+ddzA*ddzA) - fogEnd*0.70f)/(fogEnd*0.27f), 0.0f, 1.0f);
+            float fogA = Clamp((sqrtf(ddxA*ddxA+ddzA*ddzA) - trackFog*0.70f)/(trackFog*0.27f), 0.0f, 1.0f);
             if (fogA < 0.97f && th > 3.0f) {
                 Color scA = mixc(Color{ 122, 126, 134, 255 }, SKY, fogA);
                 // OPEN 4-post lattice tower (NOT a solid central block) — 4 thin corner posts
@@ -2237,7 +2241,7 @@ int main(int argc, char **argv) {
                  tg == M_PRETZEL || tg == M_BANANA) && trk.up[i].y < 0.35f) continue; // skip overhead spans
             float ddx = p.x - P.x, ddz = p.z - P.z;
             float dist = sqrtf(ddx * ddx + ddz * ddz);
-            float fog = Clamp((dist - fogEnd * 0.70f) / (fogEnd * 0.27f), 0.0f, 1.0f);   // fully fades to sky BEFORE the cull radius (no hard circular edge)
+            float fog = Clamp((dist - trackFog * 0.70f) / (trackFog * 0.27f), 0.0f, 1.0f);   // fully fades to sky BEFORE the cull radius (no hard circular edge)
             if (fog > 0.97f) continue;
             float g = groundTopAt(p.x, p.z);
             if (p.y - g < 1.5f) continue;
@@ -2294,7 +2298,7 @@ int main(int argc, char **argv) {
         int kS = (int)fmaxf(u - 14.0f, 0.0f);
         int kE = (int)(u + 46.0f);                                   // wide window so spatially-near track at a far u-index (180° loop-backs) still draws
         if (kE > (int)trk.cp.size() - 2) kE = (int)trk.cp.size() - 2;
-        float spineCull2 = (fogEnd + SEG_LEN) * (fogEnd + SEG_LEN);
+        float spineCull2 = (trackFog + SEG_LEN) * (trackFog + SEG_LEN);
         for (int k = kS; k <= kE; k++) {
             // per-segment spatial pre-cull: skip whole segments past the terrain
             // radius so the wide index window (which keeps the far halves of 180°
@@ -2314,7 +2318,7 @@ int main(int argc, char **argv) {
                 Vector3 uvec = trk.upAt(uu);
                 float ddx = p.x - P.x, ddz = p.z - P.z;
                 float dist = sqrtf(ddx * ddx + ddz * ddz);
-                float fog = Clamp((dist - fogEnd * 0.70f) / (fogEnd * 0.27f), 0.0f, 1.0f);   // fully fades to sky BEFORE the cull radius (no hard circular edge)
+                float fog = Clamp((dist - trackFog * 0.70f) / (trackFog * 0.27f), 0.0f, 1.0f);   // fully fades to sky BEFORE the cull radius (no hard circular edge)
                 if (fog > 0.97f) continue;
                 float rl = segLen / nSmp + 0.18f;          // piece length, slight overlap
                 unsigned char segTag = trk.tagAt(uu);
