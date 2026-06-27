@@ -52,11 +52,11 @@ static const float GRAV      = 22.0f;
 static const float DRAG      = 0.0016f;  // quadratic air drag — caps the fast peaks (keeps flow, no crawling)
 static const float FRICTION  = 0.016f;   // very low rolling friction (light steel-on-steel)
 static const float CHAIN_V   = 22.0f;    // lift hills
-static const float MIN_V     = 30.0f;    // keep the train flowing briskly (108 km/h floor) — no long dwell at min through crests/lifts/inversions
+static const float MIN_V     = 42.0f;    // brisk cruising floor (~150 km/h) so the ride sustains a high average — sits below the tightest inversion entry speed (47) so trim brakes can still bleed down to a sane entry g
 static const float MAX_V     = 82.0f;    // top speed reachable on the biggest drops (~295 km/h)
 static const float LAUNCH_V  = 108.0f;   // hydraulic-launch CEILING (~390 km/h, ABOVE the real top-speed record ~250 km/h); the short hard launch keeps accelerating the whole way (rarely binds -> no "stuck at peak")
-static const float CLIMB_V   = 18.0f;    // WEAK climb sustain: train decelerates naturally up the top-hat (slower at the peak), only caught from stalling
-static const float BOOST_V   = 70.0f;    // mid-course LSM re-launch target (~252 km/h) — boosts slow arrivals, never brakes
+static const float CLIMB_V   = 40.0f;    // hydraulic top-hat sustain: hold a brisk speed up the climb so the train never crawls over a crest (the v^2 drag + the trims still bring the average into the 65-75 band)
+static const float BOOST_V   = 74.0f;    // mid-course LSM re-launch target (~266 km/h) — boosts slow arrivals back up to cruise, never brakes
 
 static const Vector3 WUP = { 0, 1, 0 };
 
@@ -1407,6 +1407,19 @@ int main(int argc, char **argv) {
                 chain = true;
                 float liftV = (slope > 0.55f) ? 27.0f : CHAIN_V;
                 if (v < liftV) v = fminf(v + 20.0f * dt, liftV);
+            }
+
+            // TRIM brake: a real coaster bleeds speed in the level run BEFORE a fixed-size
+            // tight inversion so it enters at a sane g. Look a few control points ahead; if a
+            // hard inversion is coming and we're above its safe entry speed, ease v down to it
+            // (the track-gen forward-sim brakes its genV the same way, so geometry + ride agree).
+            for (float la = 1.0f; la <= 9.0f; la += 1.0f) {   // window spans the full trim run (up to ~9 points)
+                SegMode ahead = (SegMode)trk.tagAt(u + la);
+                if (!Track::isHardInversion(ahead)) continue;
+                float ev = Track::elemEntryV(ahead);
+                // brake harder the closer the inversion is, so the entry speed is always met
+                if (v > ev) v = fmaxf(v - (la <= 4.0f ? 24.0f : 16.0f) * dt, ev);
+                break;
             }
 
             v = fmaxf(v, MIN_V); v = fminf(v, 135.0f);   // NO speed cap — 135 m/s is just a runaway safety guard

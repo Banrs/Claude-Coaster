@@ -33,9 +33,9 @@
         mode = M_PRETZEL;
         pzF    = headingVec();
         pzBase = gpos;
-        // g_bottom ~ v^2/(R_bottom*GRAV) with R_bottom = pzR; crest is tighter -> ~7g.
-        float v = Clamp(genV, 40.0f, 95.0f);
-        pzR    = Clamp(v * v / (4.6f * GRAV), 24.0f, 52.0f);     // bottom radius -> ~4.6g there
+        // REAL teardrop-loop bottom radius (~18-22m); the managed entry speed sets the g
+        // (g_bottom ~ v^2/(pzR*GRAV)), not an inflated radius.
+        pzR    = frnd(18.0f, 22.0f);
         pzDrift = pzR * 1.5f;                        // strong forward creep so the descending back leg never swings behind the entry (was 0.85 -> self-overlap)
         pzSteps = 26;
         remain  = pzSteps;
