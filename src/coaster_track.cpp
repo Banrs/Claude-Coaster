@@ -157,7 +157,7 @@ struct Track {
         lf     = headingVec();
         lside  = Vector3Normalize(Vector3CrossProduct(WUP, lf));
         lcenter = { gpos.x, gpos.y + lR, gpos.z };
-        ltheta = 0; lsteps = irnd(16, 22);
+        ltheta = 0; lsteps = irnd(26, 32);                   // denser ring -> the loop path reads round, not polygonal
         ldrift = lR * frnd(0.9f, 1.4f);                      // forward drift
         llat   = lR * frnd(0.6f, 1.2f) * (rnd01() < 0.5f ? -1.0f : 1.0f); // sideways drift -> curving loop, no overlap
         remain = lsteps;
@@ -171,7 +171,7 @@ struct Track {
         lf      = headingVec();
         lside   = Vector3Normalize(Vector3CrossProduct(WUP, lf));
         lcenter = { gpos.x, gpos.y + lR, gpos.z };
-        ltheta  = 0; lsteps = 20;                       // full-circle step size; we ride half + roll-out
+        ltheta  = 0; lsteps = 30;                       // denser half-loop arc -> smooth, not faceted
         immelDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
         remain  = lsteps / 2 + 3;                       // half loop + short roll-out (loop dominates the felt g)
     }
@@ -180,8 +180,8 @@ struct Track {
         rside  = Vector3Normalize(Vector3CrossProduct(WUP, rf));
         rR     = frnd(6.0f, 9.0f);                      // a corkscrew is SMALL — fixed realistic radius
         int turns = (rnd01() < 0.14f) ? 3 : irnd(1, 2);
-        remain   = 8 * turns;
-        rtheta   = 0; rfwd = 0; rfwdStep = SEG_LEN * frnd(0.65f, 0.95f); // stretch the corkscrew forward
+        remain   = 16 * turns;                          // 16 pts/rotation (was 8 -> octagonal); half the fwd step keeps the same length
+        rtheta   = 0; rfwd = 0; rfwdStep = SEG_LEN * frnd(0.65f, 0.95f) * 0.5f; // stretch the corkscrew forward
         raxis    = { gpos.x, gpos.y + rR, gpos.z };
     }
     // zero-g stall: float over an airtime hill while barrel-rolling fully inverted at
@@ -213,7 +213,7 @@ struct Track {
         dlf      = headingVec();
         dlside   = Vector3Normalize(Vector3CrossProduct(WUP, dlf));
         dlcenter = { gpos.x, gpos.y + dlR, gpos.z };
-        dltheta  = 0; dlsteps = irnd(16, 20);
+        dltheta  = 0; dlsteps = irnd(26, 30);           // denser dive-loop ring (was faceted)
         dlturn   = (rnd01() < 0.5f ? 1.0f : -1.0f) * frnd(1.2f, 1.7f);   // ~70-100° dive-out
         remain   = dlsteps;
     }
@@ -256,7 +256,7 @@ struct Track {
         dl[0] = 0.0f;
         for (int k = 1; k <= DENSE; k++) dl[k] = dl[k-1] + Vector3Distance(dp[k], dp[k-1]);
         float total = dl[DENSE];
-        cbSteps = Clamp((int)(total / 6.0f), 20, 56);   // ~6m control-point spacing -> smoother rails through the tight hoods (was blocky)
+        cbSteps = Clamp((int)(total / 4.0f), 28, 80);   // ~4m control-point spacing -> the tight hoods read round, not faceted
         cbPts.clear(); cbUps.clear(); cbIdx = 0;
         int j = 0;
         for (int i = 0; i < cbSteps; i++) {
@@ -892,7 +892,7 @@ struct Track {
     }
 
     Vector3 stepRoll() {
-        rtheta += (2.0f * PI) / 8.0f;
+        rtheta += (2.0f * PI) / 16.0f;
         rfwd   += rfwdStep;
         float s = sinf(rtheta), c = cosf(rtheta);
         Vector3 radial = { rside.x * s, -c, rside.z * s };
