@@ -1104,7 +1104,23 @@ struct Track {
                     float v2   = fmaxf(gvlog[i] * gvlog[i], 100.0f);
                     float sd   = cp[i + 1].y - 2.0f * cp[i].y + cp[i - 1].y;
                     float k    = span * span * GRAV / v2;
-                    float target = Clamp(sd, (Gmin - 1.0f) * k, (Gmax - 1.0f) * k);
+                    // V-valley fix: the Catmull spline overshoots its cp target between
+                    // points, so an upward-concave valley floor (sd>0) sitting at the +8 cp
+                    // cap renders ~+13 vert-g. On a SHALLOW floor of the gravity-driven
+                    // drop/hill family (a real drop pull-out, not a steep face, powered
+                    // straight, or inversion) cap the trough side tighter (~+5) so the drop
+                    // eases into a gentle valley instead of a sharp V. Skip the head cp
+                    // (i == n-2): it feeds the genV speed integrator below, so leaving it on
+                    // the original cap keeps downstream element sizing (loop/inversion radii)
+                    // and ride speed effectively unchanged.
+                    bool valleyFam = (ki == M_DROP || ki == M_DIP || ki == M_WAVE ||
+                                      ki == M_HILLS || ki == M_FLAT || ki == M_BANKAIR);
+                    float Gtrough = Gmax;
+                    if (valleyFam && i < n - 2) {
+                        float dyMag = fmaxf(fabsf(cp[i].y - cp[i-1].y), fabsf(cp[i+1].y - cp[i].y));
+                        if (dyMag < 0.65f * span) Gtrough = 5.0f;
+                    }
+                    float target = Clamp(sd, (Gmin - 1.0f) * k, (Gtrough - 1.0f) * k);
                     cp[i].y = 0.5f * (cp[i + 1].y + cp[i - 1].y - target);
                 }
         }

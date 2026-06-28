@@ -2,6 +2,8 @@ build/
 src/vendor/
 minecoaster
 minecoaster_orbit
+src/vk/minecoaster_vk
+.claude/
 *.png
 *.o
 track.txt

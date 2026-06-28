@@ -626,10 +626,16 @@ struct TerrainField {
     }
 
     void draw(const Frustum &fr, Material mat) {
+        // Frustum-cull per chunk (drawing all ~400 in-radius chunks is ~5x slower at native
+        // res). The positive-vertex plane test is conservative -- it never culls a visible
+        // box -- and we inflate each AABB by a generous margin so edge chunks / tree overhang
+        // never pop. This is the lightweight "don't draw what can't be seen" cull, not an
+        // aggressive one.
+        const float M = 4.0f;   // tiny tree-overhang slack; the AABB already bounds all verts
         for (auto &kv : chunks) {
             Chunk &c = kv.second;
             if (!c.live || c.mesh.vertexCount == 0) continue;
-            if (!fr.aabb(c.minX, c.minY, c.minZ, c.maxX, c.maxY, c.maxZ)) continue;
+            if (!fr.aabb(c.minX - M, c.minY - M, c.minZ - M, c.maxX + M, c.maxY + M, c.maxZ + M)) continue;
             DrawMesh(c.mesh, mat, MatrixIdentity());
         }
     }
@@ -1135,7 +1141,7 @@ int main(int argc, char **argv) {
 
                 if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !t.chainAt(u) && v < 36.0f)
                     v = fminf(v + 28.0f * dt, 36.0f);
-                v = fmaxf(v, 20.0f); v = fminf(v, 83.0f);
+                v = fmaxf(v, 20.0f);
                 if (f > 120) { sumV += v; nV++; gSumV += v; gNV++; if (v > maxV) maxV = v;
                     if (tg == M_BOOST) gBoostF++; if (tg == M_LAUNCH) gLaunchF++;
                     if (tg != prevTag && Track::isHardInversion((SegMode)tg)) gInv++;
@@ -1171,8 +1177,8 @@ int main(int argc, char **argv) {
             }
             double avg = nV ? sumV / nV : 0;
             const char* NM[] = {"FLAT","CLIMB","DROP","HILLS","TURN","LOOP","ROLL","STN","DIP","LAUNCH","HELIX","BOOST","IMMEL","SCURVE","DIVE","BANKAIR","WAVE","STALL","DIVELOOP","COBRA","WINGOVER","HEARTLINE","PRETZEL","STENGEL","BANANA"};
-            printf("seed %u  avgV=%.1f (%.0f km/h)  minV=%.1f (%.0f km/h)  worst stall=%d frames (%.1fs) on %s (after %s)\n",
-                   seed, avg, avg * 3.6, minV, minV * 3.6, maxRun, maxRun / 60.0f,
+            printf("seed %u  avgV=%.1f (%.0f km/h)  maxV=%.1f (%.0f km/h)  minV=%.1f (%.0f km/h)  worst stall=%d frames (%.1fs) on %s (after %s)\n",
+                   seed, avg, avg * 3.6, maxV, maxV * 3.6, minV, minV * 3.6, maxRun, maxRun / 60.0f,
                    stallTag < 25 ? NM[stallTag] : "-", stallPrev < 25 ? NM[stallPrev] : "-");
         }
         printf("SIMTEST DONE (no hang)  -> OVERALL AVG RIDE SPEED = %.1f m/s (%.0f km/h)  | powered duty: boost %.1f%% launch %.1f%% | inversions: %ld over 8 seeds (~%.1f/ride)\n",
@@ -1241,7 +1247,7 @@ int main(int argc, char **argv) {
                 }
                 if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !t.chainAt(u) && v < 36.0f)
                     v = fminf(v + 28.0f * dt, 36.0f);
-                v = fmaxf(v, 20.0f); v = fminf(v, 83.0f);
+                v = fmaxf(v, 20.0f);
                 int ki = (int)u;
                 if (ki > lastK) { for (int q = lastK + 1; q <= ki && q < n; q++) vAt[q] = v; lastK = ki; }
                 float du = v * dt / fmaxf(t.speedScale(u), 0.5f);
@@ -1334,7 +1340,7 @@ int main(int argc, char **argv) {
                 v += acc * dt;
                 if (t.tagAt(u) == M_LAUNCH && v < LAUNCH_V) v = fminf(v + 40 * dt, LAUNCH_V);
                 if (t.tagAt(u) == M_BOOST) v += Clamp(BOOST_V - v, -55.0f * dt, 30.0f * dt);
-                v = fmaxf(v, 20.0f); v = fminf(v, 83.0f);
+                v = fmaxf(v, 20.0f);
 
                 sinceStation += dt;
                 if (sinceStation > 6.0f && !t.stationPending && !t.stationActive)
@@ -1698,7 +1704,7 @@ int main(int argc, char **argv) {
 
             if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !onLift && v < 36.0f)
                 v = fminf(v + 28.0f * dt, 36.0f);
-            v = fmaxf(v, 20.0f); v = fminf(v, 83.0f);
+            v = fmaxf(v, 20.0f);
             if (gForceSpeed > 0.0f) v = gForceSpeed;
 
             sinceStation += dt;
@@ -2165,7 +2171,8 @@ int main(int argc, char **argv) {
                 int   ci  = (dz + TERRA_R) * carveW + (dx + TERRA_R);
                 float cLo = carveLo[ci], cHi = carveHi[ci];
                 if (carveDeep[ci] < colBot) colBot = carveDeep[ci];
-                if (cHi > cLo && cHi > colBot && cLo < top) {
+                bool carved = (cHi > cLo && cHi > colBot && cLo < top);
+                if (carved) {
 
                     float loTop = fminf(cLo, top);
                     if (loTop > colBot + 0.1f)
@@ -2197,6 +2204,8 @@ int main(int argc, char **argv) {
                 }
 
                 if (top < WATER_Y && !depthPass) gCapCur->water.push_back(Vector3{ wx, cellSz, wz });
+
+                if (carved) treeType = -1;  // no floating trees/flowers/pots/rocks over bored tunnels
 
 	                float th = hashf(cx * 9 + 7, cz * 9 + 3);
 
@@ -2746,7 +2755,7 @@ int main(int argc, char **argv) {
             for (auto &kv : gTerrain.chunks) {
               Chunk &ch = kv.second;
               if (!ch.live || ch.water.empty()) continue;
-              if (!wfr.aabb(ch.minX, WATER_Y - 2.0f, ch.minZ, ch.maxX, WATER_Y + 2.0f, ch.maxZ)) continue;
+              if (!wfr.aabb(ch.minX - 4.0f, WATER_Y - 4.0f, ch.minZ - 4.0f, ch.maxX + 4.0f, WATER_Y + 4.0f, ch.maxZ + 4.0f)) continue;
               for (auto &wc : ch.water) {
                 float hs = wc.y * 0.5f;
                 float x0 = wc.x - hs, x1 = wc.x + hs;
