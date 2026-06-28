@@ -31,10 +31,13 @@ static std::string g_baseDir;
 #include "terrain.h"
 #include "coaster.h"
 #include "shaders.h"
-#ifdef RT_STREAM
 #include "track_gen.h"     // infinite streaming generator (struct StreamTrack)
-#endif
 #include "audio.h"         // simple procedural ride audio (wind/rumble/launch whoosh)
+
+// Runtime mode (chosen from the START MENU): infinite streaming generator vs the
+// pre-generated benchmark demo map. This used to be the -DRT_STREAM COMPILE flag;
+// it is now a single executable that selects the mode at launch.
+enum class GameMode { Streaming, Benchmark };
 
 // ---------------------------------------------------------------------------
 // Renderer: owns Metal objects, terrain, acceleration structure, pipelines.
@@ -123,32 +126,35 @@ struct Renderer {
     float rideBoost = 1.0f;   // 0..1 boost meter
     float rideG     = 1.0f;   // total felt g (HUD)
     float rideVertG = 1.0f;   // signed vertical felt g (HUD, e.g. -1.7g airtime)
+    float rideLatG  = 0.0f;   // signed lateral felt g (HUD g-meter ball swings sideways in turns)
     bool  boostHeld = false;  // SPACE: fire boost / re-launch in powered sections
     bool  brakeHeld = false;  // S: trim-brake the train (parity with the SW game's brake)
     int   camMode   = 0;      // C cycles: 0 first-person, 1 chase, 2 side (parity w/ SW)
     long  rideScore = 0;      // simple score (distance + airtime), HUD top-left
     struct RideAudio* audio = nullptr;  // procedural ride audio (nullptr in headless)
 
-#ifdef RT_STREAM
-    StreamTrack stream;       // infinite generator; geometry rebuilt as it slides
+    // --- RUNTIME MODE (selected from the start menu) ---
+    GameMode mode = GameMode::Streaming;
+    bool isStreaming() const { return mode == GameMode::Streaming; }
+
+    // STREAMING: infinite generator; geometry rebuilt as the window slides.
+    StreamTrack stream;
     float lastStreamCx = 1e30f, lastStreamCz = 1e30f; // ring centre at last rebuild
-    std::vector<MeshVertex> scratchVerts;  // reused tessellation buffer
-#else
-    // benchmark: a 1m terrain ring + clipped track that FOLLOWS the ride camera
+
+    // BENCHMARK: a 1m terrain ring + clipped track that FOLLOWS the ride camera
     // (so blocks stay 1m everywhere without meshing the whole 2km circuit at once).
     static constexpr float BENCH_CELL = 1.0f;     // 1m voxel blocks (true MC scale)
-    static constexpr float BENCH_RING = 750.0f;   // ring half-extent around the camera
-                                                  // (lowered 1200->750 to match TG_RING;
-                                                  //  smaller ring -> smooth moving-ride fps)
+    static constexpr float BENCH_RING = 750.0f;   // ring half-extent (matches TG_RING)
     std::vector<float3> trackPts;          // all track control points (for trees/carve)
     std::vector<unsigned char> trackKinds; // per-point SegMode tag (for the helix carve)
-    std::vector<MeshVertex> scratchVerts;  // reused tessellation buffer
     float lastRingCx = 1e30f, lastRingCz = 1e30f; // ring centre at last rebuild
     bool  ringOverride = false; float ringCx = 0, ringCz = 0; // SHOT_WATER: ring elsewhere
     void buildBenchScene(bool async);      // (re)mesh the 1m ring around rideU
-#endif
+
+    std::vector<MeshVertex> scratchVerts;  // reused tessellation buffer (both modes)
 
     void init();
+    void startGame(GameMode m);              // build the scene for the chosen mode (menu)
     void rideAdvance(float dt);              // step the ride camera one frame
     // Build/refresh the tiny track+train prim-AS from `verts` (synchronous, cheap).
     void buildTrackAS(const std::vector<MeshVertex>& verts);
@@ -182,8 +188,11 @@ void Renderer::init() {
     device = MTLCreateSystemDefaultDevice();
     if (!device) { fprintf(stderr, "no Metal device\n"); exit(1); }
     if (!device.supportsRaytracing) {
-        // exit(3) is the launcher's signal to fall back to the software renderer.
-        fprintf(stderr, "device does not support hardware raytracing\n"); exit(3);
+        // FORCE RAY TRACING: this is an RT-only build. If the GPU has no hardware RT we
+        // exit as incompatible — there is NO software fallback.
+        fprintf(stderr, "INCOMPATIBLE GPU: this build requires hardware ray tracing "
+                        "(no software fallback). Exiting.\n");
+        exit(2);
     }
     fprintf(stdout,
             "[RT] GPU=%s  supportsRaytracing=%d  supportsRaytracingFromRender=%d\n",
@@ -196,68 +205,66 @@ void Renderer::init() {
     tracePSO = makePSO(device, "traceKernel");
     camBuffer = [device newBufferWithLength:sizeof(CameraUniforms)
                                     options:MTLResourceStorageModeShared];
-    // Raking sun so hardware ray-traced shadows of the track stretch across terrain.
-    sunDir = normalize(vec3(0.55f, 0.62f, 0.35f));
+    // Lower, raking afternoon sun: long hardware ray-traced shadows of the track,
+    // supports and trees stretch dramatically across the terrain (leaning into the RT
+    // advantage the user asked for — clearly stronger shadows than the software raster).
+    sunDir = normalize(vec3(0.62f, 0.46f, 0.38f));
+    // Scene geometry is built later by startGame(), once the player picks a mode in
+    // the START MENU (or, headless, from --shot/--bench).
+}
 
-#ifdef RT_STREAM
-    // --- INFINITE mode: stream the software generator + terrain around the train.
-    stream.init((uint32_t)time(nullptr));
-    forceSyncRebuild();    // builds terrain prim-AS + track prim-AS + instance-AS
-    {
-        float3 tc = stream.pos(stream.trainU);
-        lastStreamCx = floorf(tc.x / TG_CELL) * TG_CELL;
-        lastStreamCz = floorf(tc.z / TG_CELL) * TG_CELL;
+// Build the initial scene for the selected mode. Split out from init() so the start
+// menu can choose Streaming vs Benchmark at RUNTIME (was the -DRT_STREAM compile flag).
+void Renderer::startGame(GameMode m) {
+    mode = m;
+    rideMode = true;
+    if (m == GameMode::Streaming) {
+        // --- INFINITE mode: stream the software generator + terrain around the train.
+        stream.init((uint32_t)time(nullptr));
+        forceSyncRebuild();    // builds terrain prim-AS + track prim-AS + instance-AS
+        {
+            float3 tc = stream.pos(stream.trainU);
+            lastStreamCx = floorf(tc.x / TG_CELL) * TG_CELL;
+            lastStreamCz = floorf(tc.z / TG_CELL) * TG_CELL;
+        }
+        { uint32_t tt = 0; for (auto& kv : chunks) tt += kv.second.tris;
+          fprintf(stderr, "[stream] initial scene: %u terrain (%zu chunks) + %u track tris (infinite generator)\n",
+                  tt, chunks.size(), triCountK); }
+        // start the ride camera on the train
+        rideU = stream.trainU;
+        rideSpeed = stream.speed;
+        {
+            float3 p = stream.pos(stream.trainU);
+            float3 fwd = stream.tangent(stream.trainU);
+            camPos = p; exFwd = fwd; exUp = vec3(0,1,0);
+            yaw = std::atan2(fwd.x, fwd.z); pitch = 0;
+        }
+    } else {
+        // --- BENCHMARK mode: the pre-generated demo map from hwrt/track.txt.
+        Coaster& co = coaster;
+        if (!co.load((g_baseDir + "hwrt/track.txt").c_str()) &&
+            !co.load((g_baseDir + "track.txt").c_str()) &&
+            !co.load("track.txt")) {
+            fprintf(stderr, "could not load track.txt (run minecoaster --exporttrack hwrt/track.txt)\n");
+            exit(1);
+        }
+        nRender = co.nFull - 3;     // ride the FULL circuit
+        trackPts.resize(nRender);
+        trackKinds.resize(nRender);
+        for (int i = 0; i < nRender; i++) { trackPts[i] = co.cps[i].p;
+                                            trackKinds[i] = (unsigned char)co.cps[i].kind; }
+        rideU = 6.0f;
+        buildBenchScene(false);
+        { uint32_t tt = 0; for (auto& kv : chunks) tt += kv.second.tris;
+          fprintf(stderr, "benchmark: 1m terrain ring (R=%.0f) -> %u terrain (%zu chunks) + %u track tris\n",
+                  BENCH_RING, tt, chunks.size(), triCountK); }
+        float3 launch = co.pos(8.0f), hot = co.pos(20.0f);
+        float3 look   = (launch + hot) * 0.5f;
+        camPos = vec3(launch.x - 150.0f, launch.y + 55.0f, launch.z - 40.0f);
+        float3 toLook = normalize(look - camPos);
+        yaw   = std::atan2(toLook.x, toLook.z);
+        pitch = std::asin(toLook.y);
     }
-    { uint32_t tt = 0; for (auto& kv : chunks) tt += kv.second.tris;
-      fprintf(stderr, "[stream] initial scene: %u terrain (%zu chunks) + %u track tris (infinite generator)\n",
-              tt, chunks.size(), triCountK); }
-
-    // start the ride camera on the train
-    rideU = stream.trainU;
-    rideSpeed = stream.speed;
-    {
-        float3 p = stream.pos(stream.trainU);
-        float3 fwd = stream.tangent(stream.trainU);
-        camPos = p; exFwd = fwd; exUp = vec3(0,1,0);
-        yaw = std::atan2(fwd.x, fwd.z); pitch = 0;
-    }
-#else
-    // --- BENCHMARK mode: the pre-generated demo map from hwrt/track.txt.
-    Coaster& co = coaster;
-    if (!co.load((g_baseDir + "hwrt/track.txt").c_str()) &&
-        !co.load((g_baseDir + "track.txt").c_str()) &&
-        !co.load("track.txt")) {
-        fprintf(stderr, "could not load track.txt (run minecoaster --exporttrack hwrt/track.txt)\n");
-        exit(1);
-    }
-    // Render the FULL circuit so the real-time ride covers the whole coaster.
-    nRender = co.nFull - 3;
-
-    // Cache all track control points (used to keep trees clear of the coaster).
-    trackPts.resize(nRender);
-    trackKinds.resize(nRender);
-    for (int i = 0; i < nRender; i++) { trackPts[i] = co.cps[i].p;
-                                        trackKinds[i] = (unsigned char)co.cps[i].kind; }
-
-    // Build the first 1m terrain ring + clipped track around the ride start. The
-    // ring follows the camera (rebuilt as it rides) so blocks stay 1m everywhere
-    // without meshing the whole ~2km circuit at once (see buildBenchScene).
-    rideU = 6.0f;
-    buildBenchScene(false);
-    { uint32_t tt = 0; for (auto& kv : chunks) tt += kv.second.tris;
-      fprintf(stderr, "benchmark: 1m terrain ring (R=%.0f) -> %u terrain (%zu chunks) + %u track tris\n",
-              BENCH_RING, tt, chunks.size(), triCountK); }
-
-    // Hero shot: stand off to the side of the launch run and look up at the
-    // signature opening top-hat tower so the rails/spine/ties and train read.
-    float3 launch = co.pos(8.0f);   // train sits here
-    float3 hot    = co.pos(20.0f);  // top of the opening top-hat
-    float3 look   = (launch + hot) * 0.5f;          // aim between train and crest
-    camPos = vec3(launch.x - 150.0f, launch.y + 55.0f, launch.z - 40.0f);
-    float3 toLook = normalize(look - camPos);
-    yaw   = std::atan2(toLook.x, toLook.z);
-    pitch = std::asin(toLook.y);
-#endif
 }
 
 // Grow a shared-storage vertex buffer to hold `bytes`, with headroom so we don't
@@ -573,22 +580,22 @@ void Renderer::pollAsyncBuild() {
 // Rebuild the CURRENT scene geometry synchronously into FRONT. Used by --shot / init,
 // where the tight advance loop has no render() calls to poll async swaps.
 void Renderer::forceSyncRebuild() {
-#ifdef RT_STREAM
-    TrackSnapshot snap = stream.snapshot();
-    std::vector<MeshVertex> kv;
-    meshTrackOnly(snap, kv);
-    // chunks first (sync), then the track AS + instance AS
-    float3 tc = stream.pos(stream.trainU);
-    std::vector<unsigned char> cpsKind;
-    std::vector<float3> cps = snapshotTrackPts(snap, &cpsKind);
-    recentreChunks(tc.x, tc.z, TG_RING, cps, cpsKind, true);
-    buildTrackAS(kv);              // builds track AS + instance AS
-#else
-    buildBenchScene(false);
-#endif
+    if (isStreaming()) {
+        TrackSnapshot snap = stream.snapshot();
+        std::vector<MeshVertex> kv;
+        meshTrackOnly(snap, kv);
+        // chunks first (sync), then the track AS + instance AS. SHOT_WATER recentres the
+        // terrain ring on a lake (ringOverride) instead of the train.
+        float3 tc = ringOverride ? vec3(ringCx, 0, ringCz) : stream.pos(stream.trainU);
+        std::vector<unsigned char> cpsKind;
+        std::vector<float3> cps = snapshotTrackPts(snap, &cpsKind);
+        recentreChunks(tc.x, tc.z, TG_RING, cps, cpsKind, true);
+        buildTrackAS(kv);              // builds track AS + instance AS
+    } else {
+        buildBenchScene(false);
+    }
 }
 
-#ifndef RT_STREAM
 // Benchmark: (re)mesh a 1m terrain ring + ring-clipped track around the ride
 // camera (rideU), then rebuild the AS. The ring centre is snapped to the voxel
 // grid so the terrain is stable between rebuilds; the track is clipped to the
@@ -610,13 +617,12 @@ void Renderer::buildBenchScene(bool async) {
         buildTrackAS(scratchVerts);   // track prim-AS + instance-AS
     }
 }
-#endif
 
 // Advance the ride camera one frame: move a u parameter along the spline at a
 // steady pace, place the eye just above the track, look down the tangent with
 // the rider-up (so banking/inversions roll the view). Loops at the circuit end.
 void Renderer::rideAdvance(float dt) {
-#ifdef RT_STREAM
+    if (isStreaming()) {
     // --- INFINITE mode: physics + streaming live in StreamTrack ---
     int prevPt = (int)stream.trainU;
     bool shifted = stream.advance(dt);
@@ -632,6 +638,7 @@ void Renderer::rideAdvance(float dt) {
 
     rideSpeed = stream.speed; rideAlt = stream.alt; rideKind = stream.kind;
     rideBoost = stream.boost; rideG = stream.gLoad; rideVertG = stream.vertG;
+    rideLatG = stream.latG;
     rideScore += (long)(stream.speed * dt * 0.6f) +
                  (fabsf(stream.vertG) < 0.35f ? 2 : 0);   // distance + airtime bonus
 
@@ -676,7 +683,8 @@ void Renderer::rideAdvance(float dt) {
         recentreChunks(ccx, ccz, TG_RING, cps, cpsKind, false);
     }
     return;
-#else
+    }  // end streaming branch
+    {
     // Real ride physics on the loaded map (mirrors the software game's constants):
     // gravity along the slope, quadratic air drag, low rolling friction, and active
     // launch/boost/lift acceleration on powered sections -> the boosts actually work
@@ -762,9 +770,10 @@ void Renderer::rideAdvance(float dt) {
         float3 felt = aCent + vec3(0, GRAV, 0);
         rideG = length(felt) / GRAV;
         rideVertG = dot(felt, up) / GRAV;       // signed vertical felt g (airtime = negative)
+        rideLatG  = dot(felt, lat) / GRAV;      // signed lateral felt g (turns)
     }
     useExplicitFrame = true;
-#endif
+    }  // end benchmark branch
 }
 
 void Renderer::updateCamera(CameraUniforms& cam, uint32_t w, uint32_t h) {
@@ -834,40 +843,31 @@ static int runShot(Renderer& r) {
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> tex = [r.device newTextureWithDescriptor:td];
 
-#ifdef RT_STREAM
     // Advance the ride a few seconds so the shot lands on interesting geometry
     // (off the launch straight, into a climb/element) and the scene has streamed.
+    // Works in EITHER runtime mode (streaming or benchmark): the train accessors
+    // resolve through whichever generator is live.
     r.rideMode = true;
-    // SHOT_SEC (default 9): seconds to advance the ride before framing the hero shot,
-    // so verification can land the camera on different elements (helix/water/etc).
     int shotSec = 9; if (const char* s = getenv("SHOT_SEC")) { int v = atoi(s); if (v > 0) shotSec = v; }
     for (int i = 0; i < 60 * shotSec; i++) r.rideAdvance(1.0f / 60.0f);
-    // Side-on hero framing: stand well back and ABOVE the train, look down at it so
-    // the tall track, supports, train, trees and voxel terrain all read to scale.
+    auto trainPos = [&]() -> float3 {
+        return r.isStreaming() ? (float3)r.stream.pos(r.stream.trainU) : r.coaster.pos(r.rideU);
+    };
+    auto trainTan = [&]() -> float3 {
+        return r.isStreaming() ? (float3)r.stream.tangent(r.stream.trainU) : r.coaster.tangent(r.rideU);
+    };
     {
-        float3 look = r.stream.pos(r.stream.trainU);          // aim at the train
-        float3 fwd  = normalize(r.stream.tangent(r.stream.trainU));
+        float3 look = trainPos();                              // aim at the train
+        float3 fwd  = normalize(trainTan());
         float3 side = normalize(cross(fwd, vec3(0,1,0)));
-        r.camPos = look - fwd * 120.0f + side * 95.0f + vec3(0, 70.0f, 0);
+        // SHOT_CLOSE=1: a tight chase view right beside the train so the rail gauge,
+        // ties, spine and car all read at 1m scale (verification of scale parity).
+        if (getenv("SHOT_CLOSE"))
+            r.camPos = look - fwd * 9.0f + side * 6.0f + vec3(0, 3.5f, 0);
+        else
+            r.camPos = look - fwd * 120.0f + side * 95.0f + vec3(0, 70.0f, 0);
         // keep the eye safely above terrain so we never sit inside a voxel wall
-        float gtop = groundTopAt(r.camPos.x, r.camPos.z) + 20.0f;
-        if (r.camPos.y < gtop) r.camPos.y = gtop;
-        float3 toLook = normalize(look - r.camPos);
-        r.exFwd = toLook; r.exUp = vec3(0,1,0);
-        r.useExplicitFrame = true;
-    }
-#else
-    // Benchmark: advance the ride a few seconds (rebuilds the 1m terrain ring as it
-    // goes), then frame the train from behind/above so the 1m blocks, track, supports
-    // and terrain all read to scale.
-    r.rideMode = true;
-    for (int i = 0; i < 60 * 9; i++) r.rideAdvance(1.0f / 60.0f);
-    {
-        float3 look = r.coaster.pos(r.rideU);
-        float3 fwd  = normalize(r.coaster.tangent(r.rideU));
-        float3 side = normalize(cross(fwd, vec3(0,1,0)));
-        r.camPos = look - fwd * 120.0f + side * 95.0f + vec3(0, 70.0f, 0);
-        float gtop = groundTopAt(r.camPos.x, r.camPos.z) + 20.0f;
+        float gtop = groundTopAt(r.camPos.x, r.camPos.z) + (getenv("SHOT_CLOSE") ? 1.5f : 20.0f);
         if (r.camPos.y < gtop) r.camPos.y = gtop;
         float3 toLook = normalize(look - r.camPos);
         r.exFwd = toLook; r.exUp = vec3(0,1,0);
@@ -888,7 +888,7 @@ static int runShot(Renderer& r) {
             float score = (float)wn;
             if (score > bestScore) { bestScore = score; best = vec3(px, WATER_Y, pz); }
         }
-        float3 toSun = normalize(vec3(0.55f, 0.62f, 0.35f));
+        float3 toSun = normalize(vec3(0.62f, 0.46f, 0.38f));
         // stand back on the shore, low, looking across the water toward the sun glints
         r.camPos = best - vec3(toSun.x, 0, toSun.z) * 85.0f + vec3(0, 12.0f, 0);
         float3 look = best + vec3(toSun.x, 0, toSun.z) * 40.0f + vec3(0, -3.0f, 0);
@@ -898,7 +898,6 @@ static int runShot(Renderer& r) {
         r.ringOverride = true; r.ringCx = best.x; r.ringCz = best.z;
         fprintf(stderr, "water vantage: lake@%.0f,%.0f\n", best.x, best.z);
     }
-#endif
 
     r.forceSyncRebuild();   // tessellate + block-build at the final camera position
     r.render(tex, W, H);
@@ -1066,6 +1065,147 @@ static bool kindSpecial(int k) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// HUDView: a transparent Core Graphics overlay that draws the SAME HUD as the
+// software game (src/main.cpp draws it in raylib): SCORE top-left; big SPEED km/h
+// + ALT + element NAME top-right; BOOST bar + felt-g bottom-left; and the circular
+// accelerometer g-meter dial bottom-right (ball sinks under +g, floats up in
+// airtime, swings sideways in turns). Drawn over the Metal layer each frame.
+// ---------------------------------------------------------------------------
+@interface HUDView : NSView
+@property (nonatomic, assign) Renderer* renderer;
+@end
+
+@implementation HUDView
+- (BOOL)isFlipped { return YES; }          // top-left origin, like the SW game's screen space
+- (BOOL)acceptsFirstResponder { return NO; }
+- (NSView*)hitTest:(NSPoint)p { return nil; }  // click-through to the MetalView below
+
+static void hudPanel(CGContextRef c, CGFloat x, CGFloat y, CGFloat w, CGFloat h, CGFloat a) {
+    CGContextSetRGBFillColor(c, 0.07f, 0.085f, 0.13f, a);
+    NSBezierPath* bp = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x,y,w,h) xRadius:7 yRadius:7];
+    CGContextAddPath(c, [bp CGPath]); CGContextFillPath(c);
+}
+static void hudText(const char* s, CGFloat x, CGFloat y, CGFloat sz,
+                    CGFloat r, CGFloat g, CGFloat b, NSTextAlignment al) {
+    NSMutableParagraphStyle* ps = [[NSMutableParagraphStyle alloc] init];
+    ps.alignment = al;
+    NSDictionary* at = @{
+        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:sz weight:NSFontWeightBold],
+        NSForegroundColorAttributeName: [NSColor colorWithRed:r green:g blue:b alpha:1.0],
+        NSParagraphStyleAttributeName: ps,
+    };
+    NSString* str = [NSString stringWithUTF8String:s];
+    // a soft shadow for legibility over bright terrain
+    NSDictionary* sh = @{
+        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:sz weight:NSFontWeightBold],
+        NSForegroundColorAttributeName: [NSColor colorWithRed:0 green:0 blue:0 alpha:0.55],
+        NSParagraphStyleAttributeName: ps,
+    };
+    [str drawAtPoint:NSMakePoint(x+1.5, y+1.5) withAttributes:sh];
+    [str drawAtPoint:NSMakePoint(x, y) withAttributes:at];
+}
+
+- (void)drawRect:(NSRect)dirty {
+    Renderer* r = self.renderer;
+    if (!r || !r->rideMode) return;
+    CGContextRef c = [[NSGraphicsContext currentContext] CGContext];
+    CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
+
+    // --- SCORE chip (top-left) ---
+    { char s[32]; snprintf(s, sizeof s, "%06ld", r->rideScore);
+      hudPanel(c, 16, 14, 150, 40, 0.66f);
+      hudText("SCORE", 28, 24, 15, 0.59f,0.66f,0.78f, NSTextAlignmentLeft);
+      hudText(s, 86, 20, 24, 1,1,1, NSTextAlignmentLeft); }
+
+    // --- SPEED card (top-right): big km/h + unit, ALT under it, element name under that ---
+    {
+        int kmh = (int)(r->rideSpeed * 3.6f);
+        char num[16]; snprintf(num, sizeof num, "%d", kmh);
+        CGFloat cardW = 200, cardX = W - cardW - 16;
+        hudPanel(c, cardX, 14, cardW, 62, 0.66f);
+        CGFloat sr=1,sg=1,sb=1;
+        if      (kmh > 250) { sr=1.0f; sg=0.47f; sb=0.35f; }
+        else if (kmh > 150) { sr=0.47f; sg=0.90f; sb=0.66f; }
+        hudText(num, cardX + 18, 18, 42, sr,sg,sb, NSTextAlignmentLeft);
+        hudText("KM/H", cardX + cardW - 70, 30, 17, 0.66f,0.72f,0.84f, NSTextAlignmentLeft);
+        char alt[24]; snprintf(alt, sizeof alt, "ALT %dm", (int)r->rideAlt);
+        hudText(alt, cardX, 52, 15, 0.59f,0.66f,0.78f, NSTextAlignmentRight);
+        // element name chip, just under the speed card (pink/amber on inversions)
+        const char* en = kindName(r->rideKind);
+        bool special = kindSpecial(r->rideKind);
+        CGFloat py = 84;
+        hudPanel(c, cardX, py, cardW, 28, 0.62f);
+        CGFloat er = special?1.0f:0.59f, eg = special?0.78f:0.72f, eb = special?0.43f:0.90f;
+        hudText(en, cardX + 14, py + 6, 16, er,eg,eb, NSTextAlignmentLeft);
+    }
+
+    // --- BOOST bar + felt-g (bottom-left), matching the SW capsule ---
+    {
+        CGFloat bx = 20, bw = 228, bh = 20, by = H - 40;
+        hudText("BOOST", bx, by - 22, 15, 0.59f,0.66f,0.78f, NSTextAlignmentLeft);
+        CGContextSetRGBFillColor(c, 0.05f,0.07f,0.11f, 0.78f);
+        NSBezierPath* cap = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(bx,by,bw,bh) xRadius:bh*0.5 yRadius:bh*0.5];
+        CGContextAddPath(c, [cap CGPath]); CGContextFillPath(c);
+        CGFloat fillW = (bw - 6) * r->rideBoost;
+        if (fillW > 4) {
+            CGFloat fr,fg,fb;
+            if      (r->rideBoost > 0.6f) { fr=0.47f; fg=0.90f; fb=0.66f; }
+            else if (r->rideBoost > 0.3f) { fr=1.0f;  fg=0.70f; fb=0.27f; }
+            else                          { fr=0.92f; fg=0.35f; fb=0.27f; }
+            CGContextSetRGBFillColor(c, fr,fg,fb, 1.0f);
+            NSBezierPath* fp = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(bx+3,by+3,fillW,bh-6) xRadius:(bh-6)*0.5 yRadius:(bh-6)*0.5];
+            CGContextAddPath(c, [fp CGPath]); CGContextFillPath(c);
+        }
+    }
+
+    // --- circular accelerometer g-meter (bottom-right), ported from the SW gauge ---
+    {
+        CGFloat gx = W - 96, gy = H - 110, R = 48.0f, scale = R / 4.5f;
+        // backdrop + rim
+        CGContextSetRGBFillColor(c, 0.05f,0.06f,0.10f, 0.6f);
+        CGContextFillEllipseInRect(c, CGRectMake(gx-R-6, gy-R-6, 2*(R+6), 2*(R+6)));
+        CGContextSetRGBStrokeColor(c, 0.31f,0.35f,0.43f, 0.85f);
+        CGContextSetLineWidth(c, 3);
+        CGContextStrokeEllipseInRect(c, CGRectMake(gx-R-2, gy-R-2, 2*(R+2), 2*(R+2)));
+        // 1..4 g guide rings (the 1g rest ring reads brighter)
+        for (int gg = 1; gg <= 4; gg++) {
+            if (gg == 1) CGContextSetRGBStrokeColor(c, 0.43f,0.66f,0.55f, 0.6f);
+            else         CGContextSetRGBStrokeColor(c, 0.31f,0.34f,0.41f, 0.35f);
+            CGContextSetLineWidth(c, 1);
+            CGFloat rr = gg * scale;
+            CGContextStrokeEllipseInRect(c, CGRectMake(gx-rr, gy-rr, 2*rr, 2*rr));
+        }
+        CGContextSetRGBStrokeColor(c, 0.31f,0.34f,0.41f, 0.28f);
+        CGContextMoveToPoint(c, gx-R, gy); CGContextAddLineToPoint(c, gx+R, gy);
+        CGContextMoveToPoint(c, gx, gy-R); CGContextAddLineToPoint(c, gx, gy+R);
+        CGContextStrokePath(c);
+        // accelerometer ball: vertical = full felt g (hangs at 1g rest, floats to 0g in
+        // airtime, sinks under +g); lateral = swings to the OUTSIDE of a turn.
+        CGFloat gv = r->rideVertG, gl = r->rideLatG;
+        gv = gv < -4.5f ? -4.5f : (gv > 4.5f ? 4.5f : gv);
+        gl = gl < -4.5f ? -4.5f : (gl > 4.5f ? 4.5f : gl);
+        CGFloat ox = -gl * scale, oy = gv * scale;   // +gv sinks DOWN (this view is flipped: +y is down)
+        CGFloat ol = sqrt(ox*ox + oy*oy);
+        if (ol > R - 8) { ox *= (R-8)/ol; oy *= (R-8)/ol; }
+        CGFloat bxp = gx + ox, byp = gy + oy;
+        CGFloat br,bg,bb;
+        if      (gv < -0.1f) { br=0.31f; bg=0.86f; bb=1.0f; }   // ejector airtime
+        else if (gv <  0.5f) { br=0.38f; bg=0.80f; bb=1.0f; }   // floater airtime
+        else if (gv <  2.0f) { br=0.49f; bg=0.90f; bb=0.55f; }
+        else if (gv <  3.5f) { br=1.0f;  bg=0.78f; bb=0.33f; }
+        else                 { br=1.0f;  bg=0.38f; bb=0.33f; }  // heavy g
+        CGContextSetRGBFillColor(c, 0.04f,0.05f,0.08f, 0.85f);
+        CGContextFillEllipseInRect(c, CGRectMake(bxp-8, byp-8, 16, 16));
+        CGContextSetRGBFillColor(c, br,bg,bb, 1.0f);
+        CGContextFillEllipseInRect(c, CGRectMake(bxp-6.5, byp-6.5, 13, 13));
+        // signed vertical-g readout above the dial
+        char gt[16]; snprintf(gt, sizeof gt, "%+.1f G", gv);
+        hudText(gt, gx - 40, gy - R - 30, 22, 1,1,1, NSTextAlignmentCenter);
+    }
+}
+@end
+
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property (nonatomic) NSWindow* window;
 @property (nonatomic) MetalView* view;
@@ -1075,11 +1215,18 @@ static bool kindSpecial(int k) {
 @property (nonatomic) double lastTime;
 @property (nonatomic) int frameCount;
 @property (nonatomic) double fpsClock;
-@property (nonatomic) NSTextField* hud;       // speed km/h + alt + element (top-RIGHT, like the SW game)
-@property (nonatomic) NSTextField* hud2;      // score (top-left) + boost bar (bottom-left)
-@property (nonatomic) NSTextField* hud3;      // felt-g readout (bottom-right, like the SW g-gauge)
+@property (nonatomic) HUDView*     hud;        // Core Graphics HUD overlay (SW-game parity, incl. g-meter dial)
+@property (nonatomic) NSView*      menu;       // START MENU overlay (Play / Benchmark / Quit)
 @property (nonatomic) RideAudio*   audio;     // procedural ride audio
+@property (nonatomic) BOOL         started;    // true once a mode is chosen + scene built
+- (void)startMode:(GameMode)m;                 // build the chosen scene + dismiss the menu
 @end
+
+// --- START MENU buttons: each carries the GameMode it launches; clicks call -startMode:.
+@interface MenuButton : NSButton
+@property (nonatomic) GameMode launchMode;
+@end
+@implementation MenuButton @end
 
 @implementation AppDelegate
 - (void)applicationDidFinishLaunching:(NSNotification*)n {
@@ -1104,28 +1251,50 @@ static bool kindSpecial(int k) {
 
     [self.window setContentView:self.view];
 
-    // HUD layout mirrors the software game:
-    //   hud  (top-RIGHT, right-aligned): SPEED km/h + ALT + current element name
-    //   hud2 (top-LEFT):                 SCORE
-    //   hud3 (bottom-LEFT):              felt-g + BOOST bar
-    auto mkField = [&](NSRect r, CGFloat size, NSTextAlignment al, NSUInteger mask) {
-        NSTextField* f = [[NSTextField alloc] initWithFrame:r];
-        [f setBezeled:NO]; [f setDrawsBackground:NO];
-        [f setEditable:NO]; [f setSelectable:NO];
-        [f setTextColor:[NSColor whiteColor]];
-        [f setFont:[NSFont monospacedSystemFontOfSize:size weight:NSFontWeightBold]];
-        [f setAlignment:al];
-        [f setAutoresizingMask:mask];
-        f.maximumNumberOfLines = 3;
-        [self.view addSubview:f];
-        return f;
+    // HUD: a single transparent Core Graphics overlay (HUDView) that draws the whole
+    // SW-game HUD — SCORE (top-left), SPEED km/h + ALT + element (top-right), BOOST bar
+    // + felt-g, and the circular accelerometer g-meter dial (bottom-right).
+    self.hud = [[HUDView alloc] initWithFrame:frame];
+    self.hud.renderer = self.renderer;
+    self.hud.wantsLayer = YES;
+    self.hud.layer.backgroundColor = [[NSColor clearColor] CGColor];
+    [self.hud setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+    [self.view addSubview:self.hud];
+
+    self.hud.hidden = YES;   // HUD appears once the ride starts
+
+    // --- START MENU overlay: Play (infinite streaming), Benchmark (pre-gen demo map), Quit.
+    // The streaming-vs-pregen choice is now a RUNTIME selection (was a compile flag).
+    self.menu = [[NSView alloc] initWithFrame:frame];
+    self.menu.wantsLayer = YES;
+    self.menu.layer.backgroundColor = [[NSColor colorWithRed:0.04 green:0.06 blue:0.10 alpha:0.96] CGColor];
+    [self.menu setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+
+    auto mkTitle = [&](NSString* s, CGFloat y, CGFloat sz, NSColor* col) {
+        NSTextField* t = [[NSTextField alloc] initWithFrame:NSMakeRect(0, y, frame.size.width, sz + 14)];
+        [t setBezeled:NO]; [t setDrawsBackground:NO]; [t setEditable:NO]; [t setSelectable:NO];
+        [t setAlignment:NSTextAlignmentCenter]; [t setTextColor:col];
+        [t setFont:[NSFont monospacedSystemFontOfSize:sz weight:NSFontWeightBold]];
+        [t setStringValue:s]; [t setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin | NSViewMaxYMargin];
+        [self.menu addSubview:t]; return t;
     };
-    self.hud  = mkField(NSMakeRect(frame.size.width - 416, frame.size.height - 96, 400, 82),
-                        20, NSTextAlignmentRight, NSViewMinYMargin | NSViewMinXMargin);
-    self.hud2 = mkField(NSMakeRect(16, frame.size.height - 44, 320, 28),
-                        18, NSTextAlignmentLeft, NSViewMinYMargin);
-    self.hud3 = mkField(NSMakeRect(16, 16, 460, 56),
-                        16, NSTextAlignmentLeft, NSViewMaxYMargin);
+    mkTitle(@"MINECOASTER  RT", 470, 40, [NSColor whiteColor]);
+    mkTitle(@"hardware ray-traced voxel coaster", 430, 16, [NSColor colorWithRed:0.6 green:0.7 blue:0.85 alpha:1.0]);
+
+    auto mkButton = [&](NSString* s, CGFloat y, GameMode m, SEL action) {
+        MenuButton* b = [[MenuButton alloc] initWithFrame:NSMakeRect(frame.size.width/2 - 150, y, 300, 52)];
+        b.launchMode = m;
+        [b setTitle:s];
+        [b setBezelStyle:NSBezelStyleRegularSquare];
+        [b setFont:[NSFont monospacedSystemFontOfSize:20 weight:NSFontWeightBold]];
+        [b setTarget:self]; [b setAction:action];
+        [b setAutoresizingMask:NSViewMinXMargin | NSViewMaxXMargin | NSViewMinYMargin | NSViewMaxYMargin];
+        [self.menu addSubview:b]; return b;
+    };
+    mkButton(@"Play  (infinite ride)", 320, GameMode::Streaming, @selector(menuPlay:));
+    mkButton(@"Benchmark  (demo map)", 250, GameMode::Benchmark, @selector(menuBench:));
+    mkButton(@"Quit",                  180, GameMode::Streaming, @selector(menuQuit:));
+    [self.view addSubview:self.menu];
 
     [self.window makeKeyAndOrderFront:nil];
     [self.window makeFirstResponder:self.view];
@@ -1144,11 +1313,25 @@ static bool kindSpecial(int k) {
                                                 userInfo:nil repeats:YES];
 }
 
+- (void)menuPlay:(id)s  { [self startMode:GameMode::Streaming]; }
+- (void)menuBench:(id)s { [self startMode:GameMode::Benchmark]; }
+- (void)menuQuit:(id)s  { [NSApp terminate:nil]; }
+
+- (void)startMode:(GameMode)m {
+    self.renderer->startGame(m);     // build the chosen scene (blocking, one-time)
+    [self.menu removeFromSuperview]; self.menu = nil;
+    self.hud.hidden = NO;
+    self.started = YES;
+    [self.window makeFirstResponder:self.view];
+}
+
 - (void)frame:(NSTimer*)t {
     double now0 = CACurrentMediaTime();
     float dt = (float)(now0 - self.lastTime);
     if (dt <= 0 || dt > 0.1f) dt = 1.0f/60.0f;
     self.lastTime = now0;
+
+    if (!self.started) return;       // sit on the START MENU until a mode is chosen
 
     [self.view tick];
 
@@ -1160,29 +1343,8 @@ static bool kindSpecial(int k) {
         self.audio->tick(dt);
     }
 
-    // HUD (ride mode), matching the software game's content + layout:
-    //   top-right: big SPEED km/h, ALT, current element NAME
-    //   top-left:  SCORE (6 digits)
-    //   bottom-left: felt-g (signed vertical g) + BOOST bar
-    if (r->rideMode) {
-        [self.hud setStringValue:[NSString stringWithFormat:@"%.0f KM/H\nALT %.0f m\n%s",
-                                  r->rideSpeed * 3.6f, r->rideAlt, kindName(r->rideKind)]];
-        // colour the element name like the SW chip (pink/amber for inversions)
-        [self.hud setTextColor:kindSpecial(r->rideKind)
-                                 ? [NSColor colorWithRed:1.0 green:0.78 blue:0.55 alpha:1.0]
-                                 : [NSColor whiteColor]];
-        [self.hud2 setStringValue:[NSString stringWithFormat:@"SCORE %06ld", r->rideScore]];
-        // boost bar drawn as a run of block glyphs (no extra views)
-        int filled = (int)(r->rideBoost * 20.0f + 0.5f);
-        char bar[48]; for (int i = 0; i < 20; i++) bar[i] = (i < filled) ? '|' : '.'; bar[20] = 0;
-        [self.hud3 setStringValue:[NSString stringWithFormat:
-            @"%+.1f g\nBOOST [%s]  SPACE", r->rideVertG, bar]];
-    } else {
-        [self.hud setStringValue:@"FREE-FLY\nWASD+QE / mouse\nF: ride"];
-        [self.hud setTextColor:[NSColor whiteColor]];
-        [self.hud2 setStringValue:@""];
-        [self.hud3 setStringValue:@""];
-    }
+    // HUD overlay redraws from the live ride state each frame (drawRect reads r).
+    [self.hud setNeedsDisplay:YES];
 
     CAMetalLayer* layer = self.view.metalLayer;
     CGSize ds = layer.drawableSize;
@@ -1218,17 +1380,24 @@ int main(int argc, const char** argv) {
         { char rp[4096]; if (realpath(argv[0], rp)) { std::string s(rp);
             auto p = s.find_last_of('/'); if (p != std::string::npos) g_baseDir = s.substr(0, p + 1); } }
 
-        bool shot = false, bench = false;
+        bool shot = false, bench = false, benchMap = false;
         for (int i = 1; i < argc; i++) {
-            if (strcmp(argv[i], "--shot") == 0) shot = true;
-            if (strcmp(argv[i], "--bench") == 0) bench = true;
+            if (strcmp(argv[i], "--shot") == 0)     shot = true;
+            if (strcmp(argv[i], "--bench") == 0)    bench = true;
+            if (strcmp(argv[i], "--benchmap") == 0) benchMap = true;   // headless: use the pre-gen demo map
         }
 
         static Renderer r;
         r.init();
 
-        if (shot)  return runShot(r);
-        if (bench) return runBench(r);
+        // Headless paths (--shot / --bench) build the scene directly (no menu). Mode is
+        // streaming by default; --benchmap (or SHOT_BENCH=1) selects the pre-gen demo map.
+        if (shot || bench) {
+            bool useBench = benchMap || getenv("SHOT_BENCH") != nullptr;
+            r.startGame(useBench ? GameMode::Benchmark : GameMode::Streaming);
+            if (shot)  return runShot(r);
+            if (bench) return runBench(r);
+        }
 
         NSApplication* app = [NSApplication sharedApplication];
         [app setActivationPolicy:NSApplicationActivationPolicyRegular];
