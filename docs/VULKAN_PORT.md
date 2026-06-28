@@ -9,14 +9,49 @@ The GL build (`src/main.cpp` + vendored raylib) stays the shipping renderer unti
 Vulkan path reaches parity. Do **not** break it while porting — the Vulkan renderer lives
 in `src/vk/` and builds as a *separate* target.
 
+## Measured raster perf (native Retina 2560×1440, M4 Pro, 2026-06)
+Before assuming Vulkan will hit the ~120 fps target, here is what the GL renderer actually
+costs (uniform-sampled median of the `--bench` flythrough; new `MC_BENCH_W` / `MC_BENCH_FRAMES`
+env knobs):
+
+| internal res | median frame | fps |
+|---|---|---|
+| 1280×720  | ~13.3 ms | ~75 |
+| 2560×1440 (native Retina) | ~24.5 ms | ~41 |
+
+4× the pixels costs only 1.84× the time, so the frame splits roughly:
+- **~9.6 ms (≈39%) resolution-independent** — CPU + vertex: per-chunk frustum cull, ~400×
+  `DrawMesh` submissions, vertex transform of the full-density terrain+decoration meshes.
+- **~14.9 ms (≈61%) fill/fragment** — overdraw, dominated by the large terrain cap quads
+  (full-screen ground coverage); decorations add little to *steady-state* fill (thin trunks /
+  small leaf clusters), but their bigger chunk meshes worsen upload-stall **hitches** (60–190 ms
+  spikes when a chunk row streams in). Spreading uploads across frames in `finish()`
+  (`gUploadBudget`, default 4/frame) cuts the hitch *count* ~20% (same-thermal A/B: 48→38),
+  but the **worst ~190 ms spikes are main-thread rebuild prep** (carve + `forceTop` over the
+  carve grid on rebuild frames), not uploads — moving that prep onto the worker thread is the
+  next perf target.
+
+**Implication for the 120 fps goal:** that target (8.3 ms) is **not reachable at native Retina
+with this renderer architecture** — the ~9.6 ms resolution-independent floor caps it near ~100 fps
+*even at zero resolution*. Realistic native-Retina levers, in order of payoff/effort:
+1. lower internal render scale (e.g. 1.6× instead of 2×) + upscale — biggest fill win, mild blur;
+2. drop MSAA 4×→2× (real game uses `FLAG_MSAA_4X_HINT`; the bench is MSAA-off so true in-game fps is *lower* than the table) — fill win;
+3. GPU-driven culling / instanced decorations / indirect draw — large effort, attacks the fixed cost (**this is where a modern API helps**).
+
 ## Why Vulkan (and why MoltenVK on Mac)
-- The raster bottleneck was geometry/overdraw, already fixed on GL (chunking + face
-  culling). Vulkan does **not** make those triangles rasterize faster.
-- Vulkan's real wins here: lower CPU driver overhead, multithreaded command buffers,
-  async transfer queues (stall-free chunk streaming), explicit memory — and, on PC only,
-  access to **RT cores** for path tracing, which OpenGL cannot touch at all.
-- The user does not need RT on Mac, so MoltenVK's lack of `VK_KHR_ray_tracing` is a
-  non-issue: Mac runs the raster path via MoltenVK; PC runs raster + RT via native Vulkan.
+- **Vulkan does NOT make the fill-bound 61% faster** — the same triangles rasterize at the same
+  rate on Metal. So MoltenVK is *not* a free path to higher native-Retina fps; the fill levers
+  above are. Set expectations accordingly.
+- Where Vulkan *does* help is the ~39% resolution-independent cost: lower CPU driver overhead,
+  multithreaded command buffers, `vkCmdDrawIndirect` + GPU culling (one dispatch instead of 400
+  `DrawMesh` calls), async transfer queues for stall-free streaming, explicit memory.
+- The decisive reason for Vulkan is **PC-only RT cores** for path tracing, which OpenGL cannot
+  touch at all (see RTX doc). The user does not need RT on Mac, so MoltenVK's lack of
+  `VK_KHR_ray_tracing` is a non-issue: Mac runs raster via MoltenVK; PC runs raster + RT via
+  native Vulkan.
+- **Honest scope note:** a full raster port is multi-session and (per the numbers above) buys at
+  most a partial native-Retina fps gain on Mac. Its real payoff is (a) the Windows RTX path and
+  (b) the GPU-driven-culling headroom. The cheap raster levers should be exhausted first.
 
 ## Toolchain (already installed on this machine via brew)
 - `libMoltenVK.dylib`, `libvulkan.1.dylib` (loader), `libglfw.dylib`

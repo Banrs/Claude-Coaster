@@ -487,6 +487,8 @@ struct CapBucket {
 static std::vector<CapBucket> gCapBuckets;
 static int                    gCapCount = 0;
 static CapBucket             *gCapCur   = nullptr;
+static bool                   gNoDeco   = false;   // perf attribution knob (MC_NODECO=1)
+static int                    gUploadBudget = 4;   // chunks uploaded per frame (MC_UPLOAD_BUDGET; <=0 = all)
 
 static inline void capVert(float x, float y, float z, float u, float v,
                            float nx, float ny, float nz, Color c) {
@@ -601,13 +603,20 @@ struct TerrainField {
         c.live = true;
     }
 
+    int upIdx = 0;
     void finish() {
         if (!building) return;
         if (live && !done.load(std::memory_order_acquire)) return;
         if (worker.joinable()) worker.join();
-        for (int i = 0; i < pendCount; i++) uploadBucket(gCapBuckets[i]);
-        live = true;
-        building = false;
+        // Spread chunk uploads across frames. Crossing a 32 m chunk boundary at speed makes
+        // a whole new chunk row dirty (~20 chunks); uploading them all in one frame stalls
+        // the main thread for tens of ms (the 60-190 ms hitches in the bench). The first
+        // build (!live) must complete in one go so the world is whole before frame 1; after
+        // that, cap uploads per frame -- a few frames of lag at the far fog edge is invisible.
+        int budget = (live && gUploadBudget > 0) ? gUploadBudget : pendCount;
+        int end = upIdx + budget; if (end > pendCount) end = pendCount;
+        for (; upIdx < end; upIdx++) uploadBucket(gCapBuckets[upIdx]);
+        if (upIdx >= pendCount) { upIdx = 0; live = true; building = false; }
     }
 
     void evict(int ccx, int ccz, int R) {
@@ -1421,12 +1430,16 @@ int main(int argc, char **argv) {
     SetConfigFlags(benchMode ? FLAG_WINDOW_HIDDEN
                  : rttestMode ? (FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT)
                              : (FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT));
-    InitWindow(benchMode ? 2560 : 1280, benchMode ? 1440 : 720, "VOXELCOASTER");
+    int winW = benchMode ? 2560 : 1280, winH = benchMode ? 1440 : 720;
+    if (benchMode && getenv("MC_BENCH_W")) { winW = atoi(getenv("MC_BENCH_W")); winH = winW * 9 / 16; }
+    InitWindow(winW, winH, "VOXELCOASTER");
     SetExitKey(KEY_NULL);
     SetTargetFPS(120);
     InitAudioDevice();
     bool muteAudio = getenv("MC_MUTE") != nullptr;
     SetMasterVolume(muteAudio ? 0.0f : 0.55f);
+    gNoDeco = getenv("MC_NODECO") != nullptr;
+    if (getenv("MC_UPLOAD_BUDGET")) gUploadBudget = atoi(getenv("MC_UPLOAD_BUDGET"));
     gAtlas = makeAtlas();
     gTerrainMat = LoadMaterialDefault();
     gTerrainMat.maps[MATERIAL_MAP_DIFFUSE].texture = gAtlas;
@@ -1544,7 +1557,9 @@ int main(int argc, char **argv) {
     if (onFoot) placeOnFoot();
 
     while (true) {
-        if (benchMode) { if (frame >= (gForceSpeed < 0.0f ? 16000 : gForceElem >= 0 ? 1500 : 5000)) break; }
+        if (benchMode) { int cap = (gForceSpeed < 0.0f ? 16000 : gForceElem >= 0 ? 1500 : 5000);
+                         if (getenv("MC_BENCH_FRAMES")) cap = atoi(getenv("MC_BENCH_FRAMES"));
+                         if (frame >= cap) break; }
         else if (WindowShouldClose()) break;
 
         double tFrame0 = GetTime();
@@ -2206,6 +2221,7 @@ int main(int argc, char **argv) {
                 if (top < WATER_Y && !depthPass) gCapCur->water.push_back(Vector3{ wx, cellSz, wz });
 
                 if (carved) treeType = -1;  // no floating trees/flowers/pots/rocks over bored tunnels
+                if (gNoDeco) treeType = -1; // perf attribution: MC_NODECO disables all decorations
 
 	                float th = hashf(cx * 9 + 7, cz * 9 + 3);
 
