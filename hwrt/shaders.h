@@ -326,7 +326,7 @@ static float softSunShadow(float3 pos, float3 n, float3 L, thread float& rng,
                           instance_acceleration_structure accel) {
     float3 t, b; basis(L, t, b);
     float occ = 0.0;
-    const int S = 18;                            // shadow samples: 18 (up from 12) = cleaner soft penumbra; balanced against MetalFX-upscaled fps (60-120)
+    const int S = 22;                            // shadow samples: 22 = cleaner soft penumbra (the user saw '1-pass' grain); paired with a higher MetalFX internal res
     for (int i = 0; i < S; i++) {
         rng = fract(rng * 1.61803 + 0.31831);
         float a = rng * 6.2831853;
@@ -534,7 +534,7 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
 
         // --- Ray-traced AO + one GI bounce (shared cosine-hemisphere samples) ---
         float3 tt, bb; basis(n, tt, bb);
-        const int AO_SAMPLES = 36;                  // 36 (up from 30): cleaner AO/GI (the user perceives grain here); each sample casts a GI shade ray, so this is the fps-dominant loop -> balanced against the 60-120 fps target with MetalFX upscaling.
+        const int AO_SAMPLES = 64;                  // 64 (up from 36): the AO/GI Monte-Carlo loop is the dominant NOISE source ('1-pass' grain) AND the fps-dominant loop (each sample casts a GI ray). 64 at 0.66 internal is the cleanest that still holds >=60fps; fully-clean would need a temporal/demodulated denoiser.
         float aoSum = 0.0;
         float3 giSum = float3(0.0);
         // GI/reflection bleed tint: linearized to match the linear-space radiance the

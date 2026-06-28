@@ -872,10 +872,11 @@ struct FXUpscaler {
     bool make(Renderer& r, uint32_t W, uint32_t H, MTLStorageMode outStorage) {
         outW = W; outH = H;
         // MetalFX spatial upscaling: trace at a lower internal res, upscale to the window.
-        // 0.65 (internal ~832x468 -> 720p) keeps the steady median in the 60-120 target with
-        // the richer S=18/AO=36 sampling on the heavy 3M-tri streaming map; full-res (1.0)
-        // tanked it to ~35fps. RT_SCALE env overrides for higher-end GPUs / lower windows.
-        float sc = 0.65f;
+        // 0.66 internal -> 720p. Spending the fps headroom on AO/GI SAMPLES (which directly cut
+        // the Monte-Carlo grain the user saw) is more efficient than raising the internal res
+        // (pixel-count cost). S=22/AO=64 at 0.66 is the cleanest that holds >=60fps on the heavy
+        // 3M-tri streaming map. RT_SCALE env overrides for higher/lower-end GPUs.
+        float sc = 0.66f;
         if (const char* s = getenv("RT_SCALE")) { float v = atof(s); if (v > 0) sc = v; }
         if (sc < 0.4f) sc = 0.4f; if (sc > 1.0f) sc = 1.0f;
         inW = (uint32_t)(W * sc + 0.5f); if (inW < 16) inW = 16;
