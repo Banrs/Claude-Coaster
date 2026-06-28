@@ -720,6 +720,10 @@ void Renderer::rideAdvance(float dt) {
     // speed-sized, so (matching the SW loop where invRAt->brakeTo is usually 0) the
     // trim essentially never fires anyway.
     if (brakeHeld) rideSpeed = fmaxf(rideSpeed - 45.0f * dt, 20.0f);   // S: trim-brake (parity w/ SW)
+    // CLIMB MOMENTUM ASSIST (parity w/ src/main.cpp): an unpowered climb never crawls to the
+    // floor — gentle assist holds a brisk speed ONLY while climbing (not a global cruise pin).
+    if (!brakeHeld && slope > 0.06f && rideKind != M_LAUNCH && rideKind != M_BOOST && rideKind != M_CLIMB && rideSpeed < 36.0f)
+        rideSpeed = fminf(rideSpeed + 28.0f * dt, 36.0f);
     rideSpeed = fmaxf(rideSpeed, 20.0f); rideSpeed = fminf(rideSpeed, 135.0f);
     // boost meter recharges on powered sections
     if (rideKind == M_LAUNCH || rideKind == M_BOOST) rideBoost = fminf(rideBoost + dt*0.6f, 1.0f);

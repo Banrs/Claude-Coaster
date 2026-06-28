@@ -1177,6 +1177,11 @@ int main(int argc, char **argv) {
                     if (bt > 0.0f && v > bt) v = fmaxf(v - (la <= 4.0f ? 24.0f : 16.0f) * dt, bt);
                     break;
                 }
+                // CLIMB MOMENTUM ASSIST (experiment): an unpowered climb never crawls to the
+                // floor; a gentle assist holds a brisk speed ONLY while genuinely climbing
+                // (NOT a global cruise pin — flats still coast down via drag, physics-driven).
+                if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !t.chainAt(u) && v < 36.0f)
+                    v = fminf(v + 28.0f * dt, 36.0f);
                 v = fmaxf(v, 20.0f); v = fminf(v, 135.0f);   // 20 = stall-only safety net (physics dictates speed; the train is never PINNED at a cruise floor). 135 = runaway guard, not a cap.
                 if (f > 120) { sumV += v; nV++; gSumV += v; gNV++; if (v > maxV) maxV = v;
                     if (tg == M_BOOST) gBoostF++; if (tg == M_LAUNCH) gLaunchF++;
@@ -1690,6 +1695,12 @@ int main(int argc, char **argv) {
                 break;
             }
 
+            // CLIMB MOMENTUM ASSIST: an unpowered climb never crawls to the floor — a gentle
+            // assist holds a brisk speed ONLY while genuinely climbing (NOT a global cruise pin:
+            // flats still coast down via drag, physics-driven). Fixes the "rises that stall the
+            // train at ~72 km/h for seconds" without grade-cutting the track underground.
+            if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !onLift && v < 36.0f)
+                v = fminf(v + 28.0f * dt, 36.0f);
             v = fmaxf(v, 20.0f); v = fminf(v, 135.0f);   // 20 = stall-only safety net (physics dictates speed; never PINNED at a cruise floor). 135 = runaway guard, not a cap.
             if (gForceSpeed > 0.0f) v = gForceSpeed;      // --gtest: pin ride speed to isolate element geometry g
 
