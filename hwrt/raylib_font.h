@@ -95,12 +95,14 @@ static const RLGlyph* rlGlyphs() {
     if (built) return g;
     int divisor = 1, h = 10, line = 0, posX = divisor, testX = divisor;
     for (int i = 0; i < 224; i++) {
-        CGFloat rx = posX;
-        CGFloat ry = divisor + line*(h + divisor);
-        g[i] = { rx, (CGFloat)ry, (CGFloat)RL_CHAR_W[i], (CGFloat)h };  // natural top-down rect
+        g[i] = { (CGFloat)posX, (CGFloat)(divisor + line*(h + divisor)),
+                 (CGFloat)RL_CHAR_W[i], (CGFloat)h };                   // natural top-down rect
         testX += RL_CHAR_W[i] + divisor;
-        if (testX >= 128) { line++; posX = 2*divisor + RL_CHAR_W[i]; testX = posX; }
-        else              { posX += RL_CHAR_W[i] + divisor; }
+        if (testX >= 128) {     // glyph overflows the row -> wrap IT to the next line
+            line++; posX = 2*divisor + RL_CHAR_W[i]; testX = posX;
+            g[i].x = divisor;   // rtext.c rewrites the wrapped glyph onto the new line
+            g[i].y = divisor + line*(h + divisor);
+        } else              { posX += RL_CHAR_W[i] + divisor; }
     }
     built = true; return g;
 }

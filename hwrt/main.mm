@@ -1195,6 +1195,10 @@ static void rlPanel(CGContextRef c, CGFloat x, CGFloat y, CGFloat w, CGFloat h) 
     rlRoundRect(c, x+5,y+3,w-10,2, 1.0, 220/255.,232/255.,255/255., 36/255., true, 0);
 }
 
+// When set (only by runHudTest), the blinking station prompt is forced ON so the
+// headless --hudtest captures it deterministically (the live HUD still blinks).
+static bool g_hudForcePrompt = false;
+
 // The whole ride HUD, drawn into a flipped (top-left origin) CG context with raylib's
 // default font — a 1:1 port of the SW game's HUD block (src/main.cpp ~3197-3349):
 // SCORE chip, SPEED card (km/h + ALT + element chip), BOOST capsule, controls-hint
@@ -1296,7 +1300,7 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
 
     // station boarding prompt (1:1 with the SW "PRESS SPACE TO LAUNCH")
     if (!r->rideDispatched) {
-        if (((int)(CACurrentMediaTime() * 2)) & 1) {
+        if (g_hudForcePrompt || (((int)(CACurrentMediaTime() * 2)) & 1)) {
             const char* pr = "PRESS  SPACE  TO  LAUNCH";
             rlText(c, pr, W*0.5 - rlMeasureText(pr,34)*0.5, H*0.5 - 60, 34, 1.0,235/255.,120/255., 1);
         }
@@ -1309,6 +1313,14 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
 - (BOOL)isFlipped { return YES; }          // top-left origin, like the SW game's screen space
 - (BOOL)acceptsFirstResponder { return NO; }
 - (NSView*)hitTest:(NSPoint)p { return nil; }  // click-through to the MetalView below
+// Render the CG overlay at the display's BACKING scale (e.g. 2x Retina), not 1x, so the
+// pixel font/panels stay crisp on-screen instead of being drawn at 1x and scaled up blurry.
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    CGFloat s = self.window.backingScaleFactor; if (s < 1) s = 1;
+    self.layer.contentsScale = s;
+    [self setNeedsDisplay:YES];
+}
 - (void)drawRect:(NSRect)dirty {
     drawHUD([[NSGraphicsContext currentContext] CGContext], self.renderer,
             self.bounds.size.width, self.bounds.size.height);
@@ -1635,6 +1647,11 @@ static int runHudTest() {
     hr.rideScore = 4312; hr.rideSpeed = 64.0f; hr.rideAlt = 122.0f;
     hr.rideKind = 19;                     // COBRA ROLL (special -> amber chip)
     hr.rideBoost = 0.72f; hr.rideVertG = 3.4f; hr.rideLatG = -1.2f;
+    // Optional stress overrides so clipping can be verified headlessly:
+    //   HUDTEST_KIND=21 (HEARTLINE ROLL / longest name)  HUDTEST_KMH=486 (3-digit, top speed)
+    if (const char* k = getenv("HUDTEST_KIND")) hr.rideKind = atoi(k);
+    if (const char* s = getenv("HUDTEST_KMH"))  hr.rideSpeed = (float)atoi(s) / 3.6f;
+    g_hudForcePrompt = board;             // capture the blinking station prompt deterministically
 
     unsigned char* buf = (unsigned char*)calloc(W*H, 4);
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();

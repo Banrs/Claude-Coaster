@@ -24,7 +24,8 @@ struct RideAudio {
         __block double phase = 0.0;           // low rumble oscillator
         __block float  rng   = 0.0f;          // simple noise state
         __block float  lp    = 0.0f;          // low-pass state for wind
-        __block float  hp    = 0.0f;          // high-pass state (brightness)
+        __block float  hp    = 0.0f;          // residual-air state (brightness)
+        __block float  air   = 0.0f;          // band-limited "air" (the hiss, gently rolled off)
 
         src = [[AVAudioSourceNode alloc] initWithFormat:fmt
                 renderBlock:^OSStatus(BOOL* isSilence, const AudioTimeStamp* ts,
@@ -35,7 +36,7 @@ struct RideAudio {
             // map speed (8..120 m/s) to wind loudness + brightness
             float t  = fminf(fmaxf((v - 8.0f) / 100.0f, 0.0f), 1.0f);
             float windAmp = 0.05f + 0.26f * t * t;
-            float bright  = 0.04f + 0.18f * t;             // MUCH less high-freq content -> a smooth rush, not sandy hiss
+            float bright  = 0.03f + 0.13f * t;             // less high-freq content -> a smooth rush, not sandy hiss
             float rumbleAmp = (0.05f + 0.10f * t);
             float rumbleHz  = 38.0f + 26.0f * t;
             for (UInt32 b = 0; b < abl->mNumberBuffers; b++) {
@@ -46,8 +47,9 @@ struct RideAudio {
                     float white = ((float)((rand() & 0xffff) / 32768.0f) - 1.0f);
                     lp += (white - lp) * 0.018f;           // pole 1 (heavier smoothing)
                     rng += (lp - rng) * 0.10f;             // pole 2 (rng = smoothed wind body)
-                    hp = white - lp;                       // residual hiss (kept very low)
-                    float wind = (rng * (1.0f - bright) + hp * bright) * windAmp;
+                    hp = white - lp;                       // residual top-end (full-band: this was the grit)
+                    air += (hp - air) * 0.45f;             // band-limit it -> soft "air", not gritty Nyquist hiss
+                    float wind = (rng * (1.0f - bright) + air * bright) * windAmp;
                     // low engine rumble (sine + its octave)
                     phase += (rumbleHz / 44100.0) * 2.0 * M_PI;
                     if (phase > 2.0 * M_PI) phase -= 2.0 * M_PI;
@@ -55,8 +57,7 @@ struct RideAudio {
                     // launch whoosh: a swell of the SMOOTH wind body (not raw hiss) with ws
                     float whooshSig = rng * ws * 0.6f;
                     float s = wind + rumble + whooshSig;
-                    if (s > 1.0f) s = 1.0f; if (s < -1.0f) s = -1.0f;
-                    out[i] = s;
+                    out[i] = tanhf(s);                     // soft saturation (no harsh hard-clip on whoosh peaks)
                 }
             }
             return noErr;
