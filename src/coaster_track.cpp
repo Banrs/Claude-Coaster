@@ -313,7 +313,7 @@ struct Track {
         // the dense measure massively under-reported the real felt g (it was the source of the
         // ~20-50g cobras). The hood is clamped to a realistic size (~55m hood -> cbR<=27.5);
         // when even that busts the cap the train arrived too fast and invRAt's trim bleeds it.
-        const float GCAP = 8.8f;                          // small margin under +10g for the catmull/seam overshoot
+        const float GCAP = 6.8f;                          // margin under +10g: the emitted/ride felt g runs ~1.4x the resampled-chord measure here, so target ~6.8 to land the actual cobra dive-out <=10
         const float CBR_MAX = 27.5f;                      // hood Hcr=1.8R -> ~50m max real cobra hood
         cbR = fminf(cbR, CBR_MAX);
         // size for the SPEED REACHED at the worst-curvature point (the dive-out bottom), not the
@@ -453,11 +453,11 @@ struct Track {
     struct InvSpec { float gT, rMin, rMaxRec, gMul, hMul; };
     static InvSpec invSpec(SegMode m) {
         switch (m) {                                       //  gT   rMin  rMaxRec gMul  hMul   -> height cap (hMul*1.3*rMaxRec)
-            case M_LOOP:     return {5.5f, 14.0f, 19.0f, 1.6f, 2.6f}; // clothoid loop: 36-64m (<=1.30x the ~49m record), wide bottom keeps g sane
-            case M_IMMEL:    return {5.0f, 16.0f, 23.0f, 1.0f, 2.0f}; // Immelmann half-loop -> up to ~60m (lower gT + bigger rMax -> sizes wider so the discrete arc holds <=10g, was ~11g)
-            case M_DIVELOOP: return {4.6f, 16.0f, 24.0f, 1.0f, 2.0f}; // dive loop -> up to ~62m (lower gT + bigger rMax -> the discrete ring holds <=10g, was ~11g)
-            case M_COBRA:    return {4.6f, 13.5f, 18.0f, 1.0f, 2.2f}; // cobra hood ~2.2R -> ~39-51m (user cap: max 50-55m)
-            case M_PRETZEL:  return {5.5f, 19.0f, 23.0f, 1.0f, 2.0f}; // teardrop loop
+            case M_LOOP:     return {4.6f, 14.0f, 19.0f, 1.6f, 2.6f}; // clothoid loop: wide bottom keeps g sane (gT lowered so the EMITTED arc holds <=10g, not just the ideal circle)
+            case M_IMMEL:    return {4.0f, 16.0f, 23.0f, 1.0f, 2.0f}; // Immelmann half-loop -> sizes wider so the discrete arc holds <=10g
+            case M_DIVELOOP: return {3.7f, 16.0f, 24.0f, 1.0f, 2.0f}; // dive loop -> wider ring holds <=10g (was +12.4)
+            case M_COBRA:    return {3.7f, 13.5f, 18.0f, 1.0f, 2.2f}; // cobra hood (its own emitted-curvature sizing governs; this gT sets the trim target)
+            case M_PRETZEL:  return {4.3f, 19.0f, 23.0f, 1.0f, 2.0f}; // teardrop loop -> wider (was +11.5)
             default:         return {0.0f,  0.0f,  0.0f, 1.0f, 2.0f};
         }
     }
@@ -959,13 +959,25 @@ struct Track {
             // drop's pull-out (or a launch->top-hat pitch-up) eases in over several
             // points instead of spiking 30-38G in a single frame at the join.
             float dlim = Clamp(6.0f * SEG_LEN * SEG_LEN * GRAV / fmaxf(genV * genV, 100.0f), 1.5f, 18.0f);
-            // ANTICIPATORY clothoid pull-out: never descend faster than can ease back to level
-            // by the time we reach the ground-clearance floor. Without this, a fast drop/dive
-            // can't level off in time (the rate-limiter is tight at speed), so it plunges UNDER
-            // the floor and gets hard-snapped back up — an extreme-g kink at the recovery. With
-            // it, the descent eases out and settles smoothly onto flat (no dip-under, no snap).
+            // ANTICIPATORY clothoid pull-out: a descent must level off to MEET the height where
+            // the next element connects — never plunge UNDER it and snap back up (that V-valley
+            // between a descent and the following uphill is the +g spike the user reported). Two
+            // changes vs a naive "ease to the local floor": (1) LOOK AHEAD along the heading and
+            // take the MAX terrain over the next several segments, so a drop into RISING terrain
+            // levels off EARLY instead of diving into a spot it must climb steeply out of; (2)
+            // target the CONNECT height (~gt+9, where contour elements ride), not the gt+4.5
+            // clearance floor, so the drop bottom lines up with the next element with no V.
             if (dy < 0.0f && mode != M_DIP && mode != M_HELIX) {
-                float gap      = gpos.y - (gt + 4.5f);                       // room above the floor
+                // Look a LONG way ahead (16 segments ~ 220m) and take the MAX terrain: a descent
+                // into a dip that RECOVERS ahead must level off above the recovery height and
+                // BRIDGE the dip (on supports), not dive to the canyon floor and climb back out
+                // (the under-the-map V). Real coasters (e.g. Falcon's Flight) span terrain dips
+                // on tall supports rather than following every depression.
+                float gtLook = gt;
+                for (int la = 1; la <= 16; la++)
+                    gtLook = fmaxf(gtLook, groundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
+                                                       gpos.z + cosf(gyaw) * SEG_LEN * la));
+                float gap      = gpos.y - (gtLook + 9.0f);                   // room above the CONNECT/recovery height
                 float maxSteep = sqrtf(2.0f * dlim * fmaxf(gap, 0.0f));      // v=sqrt(2*a*d): clothoid descent budget
                 if (dy < -maxSteep) dy = -maxSteep;
             }
