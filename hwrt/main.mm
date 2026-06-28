@@ -6,6 +6,7 @@
 //   ./metalrt          interactive window (WASD + mouse-look)
 //   ./metalrt --shot   render one frame to out.png and exit (headless verify)
 #import <Metal/Metal.h>
+#import <MetalFX/MetalFX.h>
 #import <QuartzCore/QuartzCore.h>
 #import <Cocoa/Cocoa.h>
 #import <Foundation/Foundation.h>
@@ -854,6 +855,69 @@ void Renderer::render(id<MTLTexture> target, uint32_t w, uint32_t h) {
 }
 
 // ---------------------------------------------------------------------------
+// Headless MetalFX spatial upscaler used by --shot / --bench so the verification
+// paths exercise the SAME low-res-trace -> MetalFX-upscale pipeline the window uses.
+// Renders the path tracer into a low-res (RT_SCALE x) texture, then upscales it into
+// a full-res output texture. If MetalFX is unavailable, `scaler` is nil and callers
+// fall back to tracing the full-res texture directly (so the bench/shot still run).
+// ---------------------------------------------------------------------------
+struct FXUpscaler {
+    id<MTLFXSpatialScaler> scaler = nil;   // nil => unavailable
+    id<MTLTexture> low = nil;              // low-res trace target
+    id<MTLTexture> out = nil;             // full-res scaler output
+    uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
+
+    // outStorage: the readback path (--shot) needs Shared so getBytes works; --bench
+    // can use Private. MetalFX is fine writing either.
+    bool make(Renderer& r, uint32_t W, uint32_t H, MTLStorageMode outStorage) {
+        outW = W; outH = H;
+        float sc = 0.6f;
+        if (const char* s = getenv("RT_SCALE")) { float v = atof(s); if (v > 0) sc = v; }
+        if (sc < 0.4f) sc = 0.4f; if (sc > 1.0f) sc = 1.0f;
+        inW = (uint32_t)(W * sc + 0.5f); if (inW < 16) inW = 16;
+        inH = (uint32_t)(H * sc + 0.5f); if (inH < 16) inH = 16;
+
+        const MTLPixelFormat fmt = MTLPixelFormatRGBA8Unorm;
+        MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
+        desc.colorTextureFormat = fmt; desc.outputTextureFormat = fmt;
+        desc.inputWidth = inW; desc.inputHeight = inH;
+        desc.outputWidth = W;  desc.outputHeight = H;
+        desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+        if ([MTLFXSpatialScalerDescriptor supportsDevice:r.device])
+            scaler = [desc newSpatialScalerWithDevice:r.device];
+        if (!scaler) { fprintf(stderr, "[MetalFX] unavailable (headless) -> tracing full-res directly\n"); return false; }
+
+        MTLTextureUsage cu = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead | scaler.colorTextureUsage;
+        MTLTextureDescriptor* ltd =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:inW height:inH mipmapped:NO];
+        ltd.usage = cu; ltd.storageMode = MTLStorageModePrivate;
+        low = [r.device newTextureWithDescriptor:ltd];
+
+        MTLTextureDescriptor* otd =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:W height:H mipmapped:NO];
+        otd.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
+        otd.storageMode = outStorage;
+        out = [r.device newTextureWithDescriptor:otd];
+        fprintf(stderr, "[MetalFX] headless spatial scaler  internal %ux%u -> output %ux%u (RT_SCALE=%.2f)\n",
+                inW, inH, W, H, (double)sc);
+        return true;
+    }
+
+    // Trace low-res then upscale into `out`. render() commits+waits; the upscale runs on
+    // a second command buffer we also wait on so `out` is ready for readback/timing.
+    void frame(Renderer& r) {
+        r.render(low, inW, inH);
+        id<MTLCommandBuffer> cb = [r.queue commandBuffer];
+        scaler.colorTexture = low;
+        scaler.inputContentWidth = inW; scaler.inputContentHeight = inH;
+        scaler.outputTexture = out;
+        [scaler encodeToCommandBuffer:cb];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+};
+
+// ---------------------------------------------------------------------------
 // --shot: render one frame offscreen, read back, write out.png, exit.
 // ---------------------------------------------------------------------------
 static int runShot(Renderer& r) {
@@ -923,10 +987,17 @@ static int runShot(Renderer& r) {
     }
 
     r.forceSyncRebuild();   // tessellate + block-build at the final camera position
-    r.render(tex, W, H);
+
+    // Go through the SAME low-res-trace -> MetalFX-upscale path the window uses, so
+    // out.png verifies there's no upscaling corruption. Falls back to a direct full-res
+    // trace into `tex` if MetalFX isn't available.
+    FXUpscaler fx;
+    id<MTLTexture> readTex = tex;
+    if (fx.make(r, W, H, MTLStorageModeShared)) { fx.frame(r); readTex = fx.out; }
+    else                                         { r.render(tex, W, H); }
 
     std::vector<uint8_t> pixels(W * H * 4);
-    [tex getBytes:pixels.data()
+    [readTex getBytes:pixels.data()
       bytesPerRow:W * 4
        fromRegion:MTLRegionMake2D(0, 0, W, H)
       mipmapLevel:0];
@@ -960,12 +1031,18 @@ static int runBench(Renderer& r) {
     // wildly overstating the steady-state rebuild load. Realtime models the actual
     // ride pace -> honest steady-state fps. Set BENCH_REALTIME=1 to enable.
     bool realtime = getenv("BENCH_REALTIME") != nullptr;
+    // By default the bench times the SAME low-res-trace -> MetalFX-upscale pipeline the
+    // window uses (the real interactive cost). BENCH_NOFX=1 times the old direct full-res
+    // trace into `tex` instead, for a clean before/after comparison.
+    FXUpscaler fx;
+    bool useFX = !getenv("BENCH_NOFX") && fx.make(r, W, H, MTLStorageModePrivate);
+    auto renderFrame = [&]() { if (useFX) fx.frame(r); else r.render(tex, W, H); };
     // Warm-up: the GPU's clock (DVFS) takes ~60 frames to ramp from idle to full; if
     // the timed window starts before that, the first frames read 12-18ms purely from
     // the cold clock and pollute over120/p95. 72 warm-up frames let the clock fully
     // settle so the bench reports the HONEST steady-state moving-ride cost.
     r.stream.dispatch();   // headless bench: auto-launch so the moving-ride cost is measured
-    for (int i = 0; i < 72; i++) { r.rideAdvance(1.0f/120.0f); r.render(tex, W, H); }
+    for (int i = 0; i < 72; i++) { r.rideAdvance(1.0f/120.0f); renderFrame(); }
     double worst = 0.0; int over = 0;          // worst frame ms + frames slower than 1/120
     std::vector<double> fmsAll; fmsAll.reserve(N);
     double t0 = CACurrentMediaTime(), prev = t0;
@@ -977,7 +1054,7 @@ static int runBench(Renderer& r) {
         prev = now;
         r.rideAdvance(dt);
         double fa = CACurrentMediaTime();
-        r.render(tex, W, H);
+        renderFrame();
         double fms = (CACurrentMediaTime() - fa) * 1000.0;
         fmsAll.push_back(fms);
         if (fms > worst) worst = fms;
@@ -989,8 +1066,9 @@ static int runBench(Renderer& r) {
     // realtime mode, so the median is the honest steady-state number.
     std::vector<double> s = fmsAll; std::sort(s.begin(), s.end());
     double med = s[s.size()/2], p95 = s[(size_t)(s.size()*0.95)];
-    fprintf(stderr, "bench: %d frames in %.3fs -> mean %.1f fps (%.2f ms) | STEADY(median) %.1f fps (%.2f ms) | p95=%.1fms worst=%.1fms over120=%d/%d at %ux%u\n",
-            N, dt, N / dt, dt / N * 1000.0, 1000.0/med, med, p95, worst, over, N, W, H);
+    fprintf(stderr, "bench: %d frames in %.3fs -> mean %.1f fps (%.2f ms) | STEADY(median) %.1f fps (%.2f ms) | p95=%.1fms worst=%.1fms over120=%d/%d at %ux%u%s (internal %ux%u)\n",
+            N, dt, N / dt, dt / N * 1000.0, 1000.0/med, med, p95, worst, over, N, W, H,
+            useFX ? " MetalFX" : " direct", useFX ? fx.inW : W, useFX ? fx.inH : H);
     return 0;
 }
 
@@ -1250,7 +1328,24 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
 @property (nonatomic) NSView*      menu;       // START MENU overlay (Play / Benchmark / Quit)
 @property (nonatomic) RideAudio*   audio;     // procedural ride audio
 @property (nonatomic) BOOL         started;    // true once a mode is chosen + scene built
+
+// --- MetalFX spatial upscaling ---------------------------------------------
+// The path tracer renders into a LOW-res color texture (RT_SCALE x the output);
+// a MetalFX spatial scaler upscales it into a full-res texture; that is blitted
+// to the drawable and presented. This is a big fps win at near-native sharpness
+// vs. path-tracing the full drawable. Falls back to a bilinear-ish blit of the
+// low-res texture if MetalFX is unavailable on the GPU/SDK.
+@property (nonatomic) id<MTLFXSpatialScaler> fxScaler;   // nil => fallback path
+@property (nonatomic) id<MTLTexture> fxLowResTex;        // path tracer target (low res)
+@property (nonatomic) id<MTLTexture> fxOutTex;           // scaler output (full res, private)
+@property (nonatomic) uint32_t fxOutW;                   // output (drawable) size the scaler is built for
+@property (nonatomic) uint32_t fxOutH;
+@property (nonatomic) uint32_t fxInW;                    // low-res input size
+@property (nonatomic) uint32_t fxInH;
+@property (nonatomic) BOOL fxUnavailable;                // MetalFX won't create -> fallback blit
 - (void)startMode:(GameMode)m;                 // build the chosen scene + dismiss the menu
+// (Re)create the MetalFX scaler + textures for the given output (drawable) size.
+- (void)ensureFXForOutputW:(uint32_t)outW H:(uint32_t)outH;
 @end
 
 // --- START MENU buttons: each carries the GameMode it launches; clicks call -startMode:.
@@ -1356,6 +1451,77 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
     [self.window makeFirstResponder:self.view];
 }
 
+// (Re)create the MetalFX spatial scaler + its low-res input and full-res output
+// textures sized for the given drawable output. Cheap to call every frame: it is a
+// no-op unless the output size changed. RT_SCALE (default 0.6) sets the internal
+// render resolution as a fraction of the output. On the first failure we set
+// fxUnavailable and the frame loop uses the fallback (low-res render -> blit).
+- (void)ensureFXForOutputW:(uint32_t)outW H:(uint32_t)outH {
+    if (self.fxUnavailable) return;                 // already gave up: stay on fallback
+    if (self.fxScaler && self.fxOutW == outW && self.fxOutH == outH) return;  // up to date
+
+    // Internal render scale: 0.6 default, clamp to a sane 0.4..1.0.
+    float sc = 0.6f;
+    if (const char* s = getenv("RT_SCALE")) { float v = atof(s); if (v > 0) sc = v; }
+    if (sc < 0.4f) sc = 0.4f; if (sc > 1.0f) sc = 1.0f;
+    uint32_t inW = (uint32_t)(outW * sc + 0.5f); if (inW < 16) inW = 16;
+    uint32_t inH = (uint32_t)(outH * sc + 0.5f); if (inH < 16) inH = 16;
+
+    const MTLPixelFormat fmt = MTLPixelFormatRGBA8Unorm;   // matches the drawable + trace kernel
+
+    MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
+    desc.colorTextureFormat  = fmt;
+    desc.outputTextureFormat = fmt;
+    desc.inputWidth   = inW;  desc.inputHeight  = inH;
+    desc.outputWidth  = outW; desc.outputHeight = outH;
+    // Trace kernel writes already-tonemapped LDR display values (perceptual/sRGB-ish).
+    desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
+
+    id<MTLFXSpatialScaler> scaler = nil;
+    if ([MTLFXSpatialScalerDescriptor supportsDevice:self.renderer->device])
+        scaler = [desc newSpatialScalerWithDevice:self.renderer->device];
+    if (!scaler) {
+        if (!self.fxScaler) {   // only warn once, on first creation
+            fprintf(stderr, "[MetalFX] spatial scaler unavailable -> falling back to "
+                            "low-res render + blit (still an fps win)\n");
+        }
+        self.fxUnavailable = YES;
+        self.fxScaler = nil;
+        // keep fxLowResTex (re)created below so the fallback blit still upscales.
+    } else {
+        self.fxScaler = scaler;
+    }
+
+    // Low-res input texture: path tracer writes it (shaderWrite/read) AND MetalFX reads
+    // it (colorTextureUsage). When falling back it is the blit source.
+    MTLTextureUsage colorUsage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+    if (self.fxScaler) colorUsage |= self.fxScaler.colorTextureUsage;
+    MTLTextureDescriptor* ltd =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                                           width:inW height:inH mipmapped:NO];
+    ltd.usage = colorUsage;
+    ltd.storageMode = MTLStorageModePrivate;
+    self.fxLowResTex = [self.renderer->device newTextureWithDescriptor:ltd];
+
+    if (self.fxScaler) {
+        // Full-res scaler output: MetalFX writes it (outputTextureUsage, private), we
+        // blit it to the drawable. Must be private storage per the API contract.
+        MTLTextureDescriptor* otd =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt
+                                                               width:outW height:outH mipmapped:NO];
+        otd.usage = self.fxScaler.outputTextureUsage;
+        otd.storageMode = MTLStorageModePrivate;
+        self.fxOutTex = [self.renderer->device newTextureWithDescriptor:otd];
+    } else {
+        self.fxOutTex = nil;
+    }
+
+    self.fxOutW = outW; self.fxOutH = outH;
+    self.fxInW  = inW;  self.fxInH  = inH;
+    fprintf(stderr, "[MetalFX] %s  internal %ux%u -> output %ux%u (RT_SCALE=%.2f)\n",
+            self.fxScaler ? "spatial scaler" : "FALLBACK blit", inW, inH, outW, outH, (double)sc);
+}
+
 - (void)frame:(NSTimer*)t {
     double now0 = CACurrentMediaTime();
     float dt = (float)(now0 - self.lastTime);
@@ -1369,20 +1535,30 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
     // then snapped ("teleporting every ~N frames"). lastTime is committed only on a
     // frame we actually render, so skipped time is carried into the next real dt.
     CAMetalLayer* layer = self.view.metalLayer;
-    // Cap the INTERNAL render resolution. Path-traced cost scales with pixel count, and a
-    // Retina window backs at 2x (a 1280x720 window = 2560x1440 = 4x the pixels -> ~1/4 fps).
-    // Render at a capped size and let the CAMetalLayer upscale to the window, so high-DPI /
-    // large windows stay fast. RT_MAXW overrides the cap (default 1280, the bench's fast res).
-    CGFloat maxW = 1440.0;
+    // OUTPUT (drawable) resolution = the window's backing pixels, optionally hard-capped
+    // by RT_MAXW (default 2560 — high enough that the window is normally native; the real
+    // perf lever below is MetalFX, not this cap). The path tracer does NOT run at this
+    // size: MetalFX upscales a low-res (RT_SCALE x) internal render to it.
+    CGFloat maxW = 2560.0;
     if (const char* mw = getenv("RT_MAXW")) { int v = atoi(mw); if (v > 0) maxW = (CGFloat)v; }
     CGFloat scale = self.window.backingScaleFactor; if (scale < 1) scale = 1;
     CGFloat pxW = self.view.bounds.size.width  * scale;
     CGFloat pxH = self.view.bounds.size.height * scale;
     if (pxW < 1) { pxW = 1280; pxH = 720; }
     if (pxW > maxW) { CGFloat k = maxW / pxW; pxW = maxW; pxH = floorf(pxH * k); }
-    if (fabs(layer.drawableSize.width - pxW) > 1.0 || fabs(layer.drawableSize.height - pxH) > 1.0)
-        layer.drawableSize = CGSizeMake(pxW, pxH);
-    uint32_t w = (uint32_t)pxW, h = (uint32_t)pxH;
+    uint32_t outW = (uint32_t)pxW, outH = (uint32_t)pxH;
+
+    // (Re)build the MetalFX scaler + low-res/full-res textures for this output size.
+    [self ensureFXForOutputW:outW H:outH];
+
+    // Drawable size: full output when MetalFX upscales (we blit its full-res output to
+    // the drawable); the LOW-res size in the fallback path (the compositor bilinear-
+    // upscales it to the window — still a big fps win, just softer).
+    uint32_t dw = self.fxScaler ? outW : self.fxInW;
+    uint32_t dh = self.fxScaler ? outH : self.fxInH;
+    if (fabs(layer.drawableSize.width - dw) > 1.0 || fabs(layer.drawableSize.height - dh) > 1.0)
+        layer.drawableSize = CGSizeMake(dw, dh);
+
     id<CAMetalDrawable> drawable = [layer nextDrawable];
     if (!drawable) return;           // no advance, no clock commit -> no lurch
     self.lastTime = now0;
@@ -1400,9 +1576,35 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
     // HUD overlay redraws from the live ride state each frame (drawRect reads r).
     [self.hud setNeedsDisplay:YES];
 
-    // render() commits + waits, then a tiny command buffer presents the drawable.
-    self.renderer->render(drawable.texture, w, h);
+    // 1) Path-trace into the LOW-res color texture (render() commits + waits internally).
+    self.renderer->render(self.fxLowResTex, self.fxInW, self.fxInH);
+
+    // 2) Upscale + present. With MetalFX: scale low-res -> full-res output, blit to the
+    //    drawable, present. Fallback: the low-res render IS the drawable (the compositor
+    //    upscales it), so just present.
     id<MTLCommandBuffer> present = [self.renderer->queue commandBuffer];
+    if (self.fxScaler) {
+        self.fxScaler.colorTexture = self.fxLowResTex;
+        self.fxScaler.inputContentWidth  = self.fxInW;
+        self.fxScaler.inputContentHeight = self.fxInH;
+        self.fxScaler.outputTexture = self.fxOutTex;
+        [self.fxScaler encodeToCommandBuffer:present];
+        id<MTLBlitCommandEncoder> blit = [present blitCommandEncoder];
+        [blit copyFromTexture:self.fxOutTex sourceSlice:0 sourceLevel:0
+                  sourceOrigin:MTLOriginMake(0,0,0)
+                    sourceSize:MTLSizeMake(self.fxOutW, self.fxOutH, 1)
+                     toTexture:drawable.texture destinationSlice:0 destinationLevel:0
+             destinationOrigin:MTLOriginMake(0,0,0)];
+        [blit endEncoding];
+    } else {
+        id<MTLBlitCommandEncoder> blit = [present blitCommandEncoder];
+        [blit copyFromTexture:self.fxLowResTex sourceSlice:0 sourceLevel:0
+                  sourceOrigin:MTLOriginMake(0,0,0)
+                    sourceSize:MTLSizeMake(self.fxInW, self.fxInH, 1)
+                     toTexture:drawable.texture destinationSlice:0 destinationLevel:0
+             destinationOrigin:MTLOriginMake(0,0,0)];
+        [blit endEncoding];
+    }
     [present presentDrawable:drawable];
     [present commit];
 
@@ -1411,7 +1613,9 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
     double now = CACurrentMediaTime();
     if (now - self.fpsClock >= 0.5) {
         double fps = self.frameCount / (now - self.fpsClock);
-        [self.window setTitle:[NSString stringWithFormat:@"metal-rt  %.0f fps  (render %ux%u)", fps, w, h]];
+        [self.window setTitle:[NSString stringWithFormat:@"metal-rt  %.0f fps  (RT %ux%u -> %ux%u%s)",
+                               fps, self.fxInW, self.fxInH, outW, outH,
+                               self.fxScaler ? " MetalFX" : " blit"]];
         self.frameCount = 0;
         self.fpsClock = now;
     }

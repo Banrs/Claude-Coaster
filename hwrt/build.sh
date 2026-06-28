@@ -10,7 +10,7 @@
 set -e
 cd "$(dirname "$0")"
 
-FRAMEWORKS=(-framework Metal -framework QuartzCore -framework Cocoa \
+FRAMEWORKS=(-framework Metal -framework MetalFX -framework QuartzCore -framework Cocoa \
   -framework Foundation -framework AVFoundation -framework CoreAudio)
 
 echo "building minecoaster-rt (unified RT-only app: start menu -> Play / Benchmark)..."
