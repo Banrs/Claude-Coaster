@@ -308,8 +308,8 @@ static float softSunShadow(float3 pos, float3 n, float3 L, thread float& rng,
                           instance_acceleration_structure accel) {
     float3 t, b; basis(L, t, b);
     float occ = 0.0;
-    const int S = 6;                             // shadow samples: 6 keeps a soft penumbra at a touch less
-                                                 // primary-shadow ray cost than 8 (the moving-ride priority is fps)
+    const int S = 20;                            // shadow samples: raised 6->20 for a clean, soft RT penumbra
+                                                 // (the moving ride has large fps headroom: ~450fps median at 1280x720)
     for (int i = 0; i < S; i++) {
         rng = fract(rng * 1.61803 + 0.31831);
         float a = rng * 6.2831853;
@@ -418,7 +418,7 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
 
         // --- Ray-traced AO + one GI bounce (shared cosine-hemisphere samples) ---
         float3 tt, bb; basis(n, tt, bb);
-        const int AO_SAMPLES = 24;                  // more AO/GI samples -> less salt-and-pepper noise (balanced for fps)
+        const int AO_SAMPLES = 32;                  // raised 24->32: cleaner ray-traced AO/GI (more rays, ample fps headroom)
         float aoSum = 0.0;
         float3 giSum = float3(0.0);
         float3 surfAlb = voxelGrain(hit.albedo, hit.pos, n, hit.mat);

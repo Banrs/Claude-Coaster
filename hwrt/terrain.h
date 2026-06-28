@@ -174,23 +174,44 @@ static void pushVoxBox(std::vector<MeshVertex>& out, float cx, float cy, float c
 // ground top (cx, topY, cz). Type 0 oak, 1 birch, 2 spruce. Deliberately
 // tree-ONLY (no flowers/rocks/mushrooms) and only 3-4 boxes each so the RT
 // triangle load stays modest.
-static void pushTree(std::vector<MeshVertex>& out, float cx, float topY, float cz, int type, float s) {
-    if (type == 2) {                                   // spruce: stacked conical canopy
+static void pushTree(std::vector<MeshVertex>& out, float cx, float topY, float cz, int type, float vr) {
+    // Minecraft-style tree built ONLY from 1x1x1 grid-aligned blocks. cx,cz = cell
+    // CENTRE, topY = terrain top face (integer metres). Every block is a unit cube
+    // centred at (cx+dx, topY+0.5+dy, cz+dz) for INTEGER dx,dy,dz -> it snaps to the
+    // 1m grid, sits FLUSH on the ground (no half-block float), and never overlaps a
+    // neighbour (the trunk column is skipped wherever a leaf would sit on it).
+    auto blk = [&](int dx, int dy, int dz, float3 c) {
+        pushVoxBox(out, cx + (float)dx, topY + 0.5f + (float)dy, cz + (float)dz, 1.0f, 1.0f, 1.0f, c);
+    };
+    int hv = (vr > 0.5f) ? 1 : 0;                          // +1 block height variation
+    if (type == 2) {                                       // spruce: narrow conifer
         float3 bark = vec3(0.30f,0.22f,0.14f), lf = vec3(0.20f,0.37f,0.24f);
-        pushVoxBox(out, cx, topY+1.6f*s, cz, 0.7f*s, 3.4f*s, 0.7f*s, bark);
-        pushVoxBox(out, cx, topY+2.4f*s, cz, 3.0f*s, 1.1f*s, 3.0f*s, lf);
-        pushVoxBox(out, cx, topY+3.4f*s, cz, 2.1f*s, 1.0f*s, 2.1f*s, lf*1.06f);
-        pushVoxBox(out, cx, topY+4.3f*s, cz, 1.2f*s, 1.0f*s, 1.2f*s, lf*1.12f);
-    } else if (type == 1) {                            // birch: tall, pale trunk
-        float3 bark = vec3(0.80f,0.78f,0.72f), lf = vec3(0.42f,0.60f,0.30f);
-        pushVoxBox(out, cx, topY+1.9f*s, cz, 0.55f*s, 3.8f*s, 0.55f*s, bark);
-        pushVoxBox(out, cx, topY+4.2f*s, cz, 2.5f*s, 1.6f*s, 2.5f*s, lf);
-        pushVoxBox(out, cx, topY+5.3f*s, cz, 1.5f*s, 1.0f*s, 1.5f*s, lf*1.07f);
-    } else {                                           // oak: round bushy canopy
-        float3 bark = vec3(0.40f,0.27f,0.15f), lf = vec3(0.28f,0.50f,0.20f);
-        pushVoxBox(out, cx, topY+1.5f*s, cz, 0.75f*s, 3.0f*s, 0.75f*s, bark);
-        pushVoxBox(out, cx, topY+3.6f*s, cz, 3.3f*s, 1.7f*s, 3.3f*s, lf);
-        pushVoxBox(out, cx, topY+4.8f*s, cz, 2.0f*s, 1.2f*s, 2.0f*s, lf*1.08f);
+        int H = 6 + hv;
+        for (int i = 0; i < H; i++) blk(0, i, 0, bark);
+        int t = H - 1;
+        for (int d = -1; d <= 1; d += 2) { blk(d,t-3,0,lf); blk(0,t-3,d,lf);       // skirt (plus)
+                                           blk(d,t-2,0,lf); blk(0,t-2,d,lf); }      // mid  (plus)
+        for (int d = -1; d <= 1; d += 2) { blk(d,t-1,0,lf); blk(0,t-1,d,lf); }      // upper (plus)
+        blk(0, t,   0, lf);                                                          // tip above trunk
+        blk(0, t+1, 0, lf);
+    } else {                                               // oak / birch: column + bushy crown
+        bool birch = (type == 1);
+        float3 bark = birch ? vec3(0.80f,0.78f,0.72f) : vec3(0.40f,0.27f,0.15f);
+        float3 lf   = birch ? vec3(0.42f,0.60f,0.30f) : vec3(0.28f,0.50f,0.20f);
+        int H = (birch ? 5 : 4) + hv;
+        for (int i = 0; i < H; i++) blk(0, i, 0, bark);
+        int t = H - 1;
+        // 3x3 ring straddling the top trunk block (trunk holds the centre), then a
+        // 3x3-minus-corners layer, then a single cap -> compact crown, zero overlap.
+        for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
+            if (dx == 0 && dz == 0) continue;              // trunk occupies the centre here
+            blk(dx, t, dz, lf);
+        }
+        for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
+            if (abs(dx) == 1 && abs(dz) == 1) continue;    // clip corners -> round crown
+            blk(dx, t + 1, dz, lf);
+        }
+        blk(0, t + 2, 0, lf);                              // cap
     }
 }
 
@@ -344,7 +365,7 @@ static Terrain buildTerrain(float centerX, float centerZ, int N = 220, float cel
                 if (nb >= h) { z++; continue; }
                 int run = 1;
                 while (z + run < N && h_at(x, z + run) == h && h_at(x + sign, z + run) == nb) run++;
-                float y0 = nb * cell, y1 = h * cell;
+                float y0 = (float)(nb + 1) * cell, y1 = (float)(h + 1) * cell;
                 float zz0 = worldZ(z), zz1 = worldZ(z + run);
                 float wx = (sign < 0) ? worldX(x) : worldX(x + 1);
                 if (sign < 0)
@@ -364,7 +385,7 @@ static Terrain buildTerrain(float centerX, float centerZ, int N = 220, float cel
                 if (nb >= h) { x++; continue; }
                 int run = 1;
                 while (x + run < N && h_at(x + run, z) == h && h_at(x + run, z + sign) == nb) run++;
-                float y0 = nb * cell, y1 = h * cell;
+                float y0 = (float)(nb + 1) * cell, y1 = (float)(h + 1) * cell;
                 float xx0 = worldX(x), xx1 = worldX(x + run);
                 float wz = (sign < 0) ? worldZ(z) : worldZ(z + 1);
                 if (sign < 0)
@@ -594,30 +615,33 @@ static void buildTerrainChunk(std::vector<MeshVertex>& out,
             int tt = capTree[z * M + x];
             float den = capDen[z * M + x];
             if (cps && tt >= 0 && den > 0.0f && h < snowLvl && slope < 4 && !carved[z * M + x]) {
-                float wcx = worldX(x) + cell * 0.5f, wcz = worldZ(z) + cell * 0.5f;
-                float topY = h * cell;
                 int ax = cellX0 + x, az = cellZ0 + z;
-                // Coarse JITTERED grid (parity w/ src/main.cpp): one tree per TGxTG node, jittered
-                // within it, so canopies can't overlap (per-cell placement let adjacent trees touch)
-                // and the land reads as open grass with STANDS of trees, not wall-to-wall forest.
-                const int TG = 8;
-                float nodeDen = fminf(den * (float)(TG * TG), 0.90f);   // per-node prob from per-area biome density
+                // ONE tree per TGxTG node so canopies never touch (open grass + stands of trees).
+                const int TG = 11;
+                // per-node prob from per-area biome density, thinned HARD (dense biomes were
+                // carpeting wall-to-wall): 0.45 cap + 0.5 scale keeps biome variation but reads
+                // as open grassland dotted with stands, matching the SW reference.
+                float nodeDen = fminf(den * (float)(TG * TG), 0.45f) * 0.5f;
                 if (ax % TG == 0 && az % TG == 0 && hashf(ax * 7 + 1, az * 7 + 3) < nodeDen) {
-                    float jx = (hashf(ax*3+1, az*7+5) - 0.5f) * (float)(TG - 5);   // +-1.5m jitter, keeps spacing canopy-safe
-                    float jz = (hashf(ax*5+9, az*3+2) - 0.5f) * (float)(TG - 5);
-                    float twx = wcx + jx, twz = wcz + jz;
-                    bool clear = true;
-                    for (int k = 0; k < ncps; k++) {
-                        float dx = cps[k].x - twx, dz = cps[k].z - twz;
-                        if (dx*dx + dz*dz < 49.0f) { clear = false; break; }
-                    }
-                    if (clear) {
-                        // forest (birch) mixes in some oak; map acacia(3) -> oak look (no acacia mesh)
-                        int type = tt;
-                        if (type == 3) type = 0;
-                        if (type == 1 && hashf(ax*3+5, az*9+2) > 0.5f) type = 0;
-                        float s  = 1.3f + hashf(ax * 5 + 7, az * 5 + 1) * 0.9f;
-                        pushTree(out, twx, topY, twz, type, s);
+                    // scatter by an INTEGER cell offset (0..3), plant on the TARGET cell and read
+                    // ITS height -> the trunk lands on a whole 1m block, FLUSH, no fractional float.
+                    // surface = cell TOP = (h+1)*cell (matches groundTopAt + the SW renderer).
+                    int tx = x + (int)(hashf(ax*3+1, az*7+5) * 4.0f);
+                    int tz = z + (int)(hashf(ax*5+9, az*3+2) * 4.0f);
+                    if (tx < M && tz < M && !carved[tz*M + tx]) {
+                        float twx = worldX(tx) + cell * 0.5f, twz = worldZ(tz) + cell * 0.5f;
+                        float tTopY = (float)(h_at(tx, tz) + 1) * cell;
+                        bool clear = true;
+                        for (int k = 0; k < ncps; k++) {
+                            float dx = cps[k].x - twx, dz = cps[k].z - twz;
+                            if (dx*dx + dz*dz < 49.0f) { clear = false; break; }
+                        }
+                        if (clear) {
+                            int type = tt;                         // acacia(3) -> oak; some birch -> oak
+                            if (type == 3) type = 0;
+                            if (type == 1 && hashf(ax*3+5, az*9+2) > 0.5f) type = 0;
+                            pushTree(out, twx, tTopY, twz, type, hashf(ax*5+7, az*5+1));
+                        }
                     }
                 }
             }
@@ -642,7 +666,7 @@ static void buildTerrainChunk(std::vector<MeshVertex>& out,
             }
             for (int dz = 0; dz < d; dz++)
                 for (int dx = 0; dx < w; dx++) done[(z + dz) * M + x + dx] = 1;
-            float topY = h * cell;
+            float topY = (float)(h + 1) * cell;   // surface = cell TOP (matches groundTopAt + SW)
             float x0 = worldX(x), x1 = worldX(x + w), z0 = worldZ(z), z1 = worldZ(z + d);
             pushQuad(out, vec3(x0, topY, z0), vec3(x1, topY, z0),
                      vec3(x1, topY, z1), vec3(x0, topY, z1), vec3(0, 1, 0), capCol[z * M + x]);
@@ -656,7 +680,7 @@ static void buildTerrainChunk(std::vector<MeshVertex>& out,
                 if (nb >= h) { z++; continue; }
                 int run = 1;
                 while (z + run < M && h_at(x, z + run) == h && h_at(x + sign, z + run) == nb) run++;
-                float y0 = nb * cell, y1 = h * cell;
+                float y0 = (float)(nb + 1) * cell, y1 = (float)(h + 1) * cell;
                 float zz0 = worldZ(z), zz1 = worldZ(z + run);
                 float wx = (sign < 0) ? worldX(x) : worldX(x + 1);
                 float3 bc = colCol[z * M + x];
@@ -674,7 +698,7 @@ static void buildTerrainChunk(std::vector<MeshVertex>& out,
                 if (nb >= h) { x++; continue; }
                 int run = 1;
                 while (x + run < M && h_at(x + run, z) == h && h_at(x + run, z + sign) == nb) run++;
-                float y0 = nb * cell, y1 = h * cell;
+                float y0 = (float)(nb + 1) * cell, y1 = (float)(h + 1) * cell;
                 float xx0 = worldX(x), xx1 = worldX(x + run);
                 float wz = (sign < 0) ? worldZ(z) : worldZ(z + 1);
                 float3 bc = colCol[z * M + x];

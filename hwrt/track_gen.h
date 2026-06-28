@@ -24,6 +24,9 @@ static constexpr float TG_RING = 750.0f;   // half-extent meshed around the trai
                                            // moving ride holds a smooth 120fps (the
                                            // re-centre AS builds no longer spike).
 
+// raylib_shim Color (0-255) -> float3 albedo (0-1), for porting themed liveries.
+static inline float3 col2f3(Color c) { return vec3(c.r/255.f, c.g/255.f, c.b/255.f); }
+
 // ---------------------------------------------------------------------------
 // A self-contained, copyable snapshot of the spline window the meshing reads:
 // flat copies of the control-point arrays + the window params. It exposes the
@@ -41,6 +44,10 @@ struct TrackSnapshot {
     int   winLo = 4, buildAhead = 130;
     int   nptsv = 0;
     long  base  = 0;                    // absolute index of cp[0] (popFront-stable keying)
+    // themed livery (1:1 with the SW game) + launch-station anchor, copied from the
+    // generator so the meshing colours/builds match src/main.cpp exactly.
+    float3 trainBody{}, trainAccent{}, spineCol{}, railColT{};
+    float3 startPos{}; float startYaw = 0.0f;
 
     int npts() const { return nptsv; }
     // cp/up indexers (named to match StreamTrack's gen.cp[i]/gen.up[i] usage). They
@@ -62,6 +69,8 @@ struct TrackSnapshot {
         cpv=o.cpv; upv=o.upv; kindv=o.kindv; chainv=o.chainv; arcv=o.arcv;
         trainU=o.trainU; winLo=o.winLo; buildAhead=o.buildAhead; nptsv=o.nptsv;
         base=o.base;
+        trainBody=o.trainBody; trainAccent=o.trainAccent; spineCol=o.spineCol; railColT=o.railColT;
+        startPos=o.startPos; startYaw=o.startYaw;
         cp = {&TrackSnapshot::cpv, this}; up = {&TrackSnapshot::upv, this};
         return *this;
     }
@@ -244,6 +253,13 @@ struct StreamTrack {
         s.trainU = trainU; s.winLo = winLo; s.buildAhead = buildAhead;
         s.nptsv = npts();
         s.base  = gen.base;          // absolute index of cp[0] (for popFront-stable support keying)
+        // themed livery + launch-station anchor straight from the SW generator (1:1 colours).
+        s.trainBody   = col2f3(gen.trainBody);
+        s.trainAccent = col2f3(gen.trainAccent);
+        s.spineCol    = col2f3(gen.spineC);
+        s.railColT    = col2f3(gen.railC);
+        s.startPos    = vec3(gen.startPos.x, gen.startPos.y, gen.startPos.z);
+        s.startYaw    = gen.startYaw;
         int n = npts();
         s.cpv.resize(n); s.upv.resize(n); s.kindv.resize(n); s.chainv.resize(n); s.arcv.resize(n);
         for (int i = 0; i < n; i++) {
@@ -288,11 +304,10 @@ static void buildTerrainRingT(const Src& s, std::vector<MeshVertex>& out) {
 
 template<class Src>
 static void buildTrainT(const Src& s, std::vector<MeshVertex>& out) {
-    float3 bodyCol   = vec3(0.10f, 0.45f, 0.85f);
-    float3 accentCol = vec3(0.95f, 0.85f, 0.20f);
-    // Car scale matched to the SW game (1.40m-wide tub, ~3m long), riding just on the
-    // rails: half-extents (0.70 lat, 0.40 up, 1.55 fwd) -> fits the ~1.1m rail gauge.
-    const float CAR_HALF_LEN = 1.55f, CAR_PITCH = 4.2f;
+    // Full Formula-Rossa consist via the shared pushF1Car helper (chassis / tub / nose /
+    // riders / wheels), ported 1:1 from src/main.cpp drawCoasterCar. Themed livery from
+    // the generator (s.trainBody / s.trainAccent / s.railColT).
+    const float CAR_PITCH = 4.2f;
     float u = s.trainU;
     for (int car = 0; car < 5; car++) {
         if (u >= (float)(s.npts() - 4)) break;
@@ -300,9 +315,8 @@ static void buildTrainT(const Src& s, std::vector<MeshVertex>& out) {
         float3 fwd = s.tangent(u);
         float3 up  = orthoUp(fwd, s.upAt(u));
         float3 lat = normalize(cross(up, fwd));
-        float3 carC = c + up * 0.46f;        // sit just above the rail plane
-        pushBox(out, carC, lat, up, fwd, 0.70f, 0.40f, CAR_HALF_LEN, car == 0 ? accentCol : bodyCol);
-        pushBox(out, carC + up * 0.40f, lat, up, fwd, 0.52f, 0.16f, CAR_HALF_LEN * 0.82f, accentCol);
+        // c is the rail plane (software car origin y=0); pushF1Car offsets up from here.
+        pushF1Car(out, c, lat, up, fwd, s.trainBody, s.trainAccent, s.railColT, car == 0, car);
         float m = s.mpu(u);
         u -= CAR_PITCH / fmaxf(m, 1e-3f);   // cars trail BEHIND the lead (camera) car
         if (u < (float)s.winLo) break;
@@ -331,10 +345,14 @@ static void buildTrackT(const Src& s, std::vector<MeshVertex>& out) {
     const float RAIL_GAUGE = 0.55f;   // lateral half-spacing of running rails (~1.1m gauge)
     const float RAIL_R     = 0.09f;   // rail beam half-thickness (0.18 full)
     const float SPINE_DROP = 0.30f;   // spine centre below the rail plane
-    float3 railCol   = vec3(0.82f, 0.83f, 0.86f);  // light steel rails
-    float3 spineSteel= vec3(0.17f, 0.18f, 0.22f);  // dark structural box-beam tube (un-powered)
-    float3 spineHot  = vec3(1.00f, 0.45f, 0.10f);  // orange boost cue (LAUNCH/BOOST only)
-    float3 tieCol    = vec3(0.38f, 0.39f, 0.42f);  // steel cross ties
+    // Themed livery straight from the generator (1:1 with src/main.cpp: railC / spineC /
+    // trainAccent). The colored spine + LSM fins read with the SAME palette as the game.
+    float3 railCol   = s.railColT;                 // light steel rails (RAIL)
+    float3 spineSteel= col2f3(Color{44, 47, 55, 255});  // dark structural box-beam tube (un-powered)
+    float3 spineHot  = s.spineCol;                 // themed colored spine on powered sections
+    float3 finCol    = s.trainAccent;              // themed LSM stator fins
+    float3 chainCol  = col2f3(Color{108, 110, 118, 255});  // CHAINC: lift chain
+    float3 tieCol    = col2f3(Color{96, 99, 108, 255});    // steel cross ties
     float3 supCol    = vec3(0.46f, 0.48f, 0.52f);  // steel support bents
 
     const float STEP = 0.20f;
@@ -364,14 +382,27 @@ static void buildTrackT(const Src& s, std::vector<MeshVertex>& out) {
         prevL = railL; prevR = railR; havePrev = true;
 
         int kn = s.tagAt(u);
-        bool powered = (kn == M_LAUNCH || kn == M_BOOST);
+        bool chain = s.chainAt(u);
+        // powered = driven track: launch, mid-course booster, AND hydraulic (non-chain)
+        // top-hat climb (src/main.cpp:2592-2593) -> themed colored spine + LSM fins.
+        bool powered = (kn == M_LAUNCH || kn == M_BOOST || (kn == M_CLIMB && !chain));
         float spineHalfF = length(s.pos(u + STEP) - c) * 0.6f;
-        // box-beam spine under the rail plane; orange ONLY on powered sections.
+        // box-beam spine under the rail plane; themed colored ONLY on powered sections.
         float spW = powered ? 0.19f : 0.15f;   // half-width  (0.38 / 0.30 full)
         float spH = powered ? 0.27f : 0.23f;   // half-height (0.54 / 0.46 full)
         float3 spineC = c - up * SPINE_DROP;
         pushBox(out, spineC, lat, up, fwd, spW, spH, spineHalfF,
                 powered ? spineHot : spineSteel);
+        // every-other-step phase, popFront-stable (keyed to absolute u like the ties).
+        bool finPhase = (((long)floorf((u + (float)s.base) / STEP)) & 1) == 0;
+        // LSM stator fins on powered spine (src/main.cpp:2601-2603): {0,-0.18,0},
+        // 0.62 x 0.22 x rl*0.6, themed accent.
+        if (powered && finPhase)
+            pushBox(out, c - up * 0.18f, lat, up, fwd, 0.31f, 0.11f, spineHalfF * 0.6f, finCol);
+        // lift chain centred between the rails on chain segments (src/main.cpp:2618-2619):
+        // {0,-0.05,0}, 0.14 x 0.14 x rl, CHAINC.
+        if (chain)
+            pushBox(out, c - up * 0.05f, lat, up, fwd, 0.07f, 0.07f, spineHalfF, chainCol);
 
         // cross-tie spanning the two rails ~every 0.6u. Keyed to the ABSOLUTE spline
         // parameter (u + base), NOT a local segment counter: the deque pops its front as
@@ -446,6 +477,32 @@ static void buildTrackT(const Src& s, std::vector<MeshVertex>& out) {
         float3 fwd = s.tangent((float)i);
         float3 up  = orthoUp(fwd, vec3(cpU.x, cpU.y, cpU.z));
 
+        // Powered-section maintenance catwalk + handrails + access stair (src/main.cpp:
+        // 2538-2557). Per control point on LAUNCH / BOOST sections, in a horizontal frame
+        // (fwd flattened); pieces SEG_LEN(14m) long tile seamlessly along the straight.
+        if (kn == M_LAUNCH || kn == M_BOOST) {
+            float3 fwdH = normalize(vec3(fwd.x, 0.0f, fwd.z));
+            float3 upH  = vec3(0, 1, 0);
+            float3 latH = normalize(cross(upH, fwdH));
+            float3 base = p;
+            auto cbox = [&](float x, float y, float z, float w, float h, float l, float3 col) {
+                pushBox(out, base + latH*x + upH*y + fwdH*z, latH, upH, fwdH, w*0.5f, h*0.5f, l*0.5f, col);
+            };
+            float3 grate = col2f3(Color{150, 154, 162, 255});  // steel grating
+            float3 rail2 = col2f3(Color{236, 214,  96, 255});  // yellow safety handrail
+            cbox(2.0f, -0.55f, 0, 1.5f, 0.12f, SEG_LEN, grate);          // walkway grating
+            for (float ry : { 0.25f, 0.75f })                            // two handrail bars
+                cbox(2.7f, ry, 0, 0.08f, 0.08f, SEG_LEN, rail2);
+            for (float pz2 = -SEG_LEN*0.5f; pz2 < SEG_LEN*0.5f; pz2 += 3.5f)   // rail stanchions
+                cbox(2.7f, 0.35f, pz2, 0.08f, 0.9f, 0.08f, rail2);
+            if (p.y - gC > 2.0f && (i & 3) == 0) {                       // stepped access stair
+                int steps = (int)fminf((p.y - gC) / 0.8f, 14.0f);
+                for (int st = 0; st < steps; st++)
+                    // 1:1 with src/main.cpp: local-y literally p.y-0.55-st*0.8 in the frame at p.
+                    cbox(2.9f + st * 0.42f, p.y - 0.55f - st * 0.8f, 0, 0.5f, 0.16f, 1.1f, grate);
+            }
+        }
+
         // HELIX coils tie radially into the central tower (no individual legs).
         if (kn == M_HELIX && haveHx) {
             pushBox(out, vec3((p.x + hxAxis.x)*0.5f, p.y - 0.6f, (p.z + hxAxis.z)*0.5f),
@@ -514,6 +571,12 @@ static void buildTrackT(const Src& s, std::vector<MeshVertex>& out) {
         // node block where the legs converge, oriented to the rail frame
         pushBox(out, node, rRight, up, fwd, 0.28f, 0.28f, 0.50f, supCol);
     }
+
+    // Launch / boarding hall at the generator's start anchor (themed). Only built while
+    // the start anchor is still inside the streamed terrain ring (it pops from view once
+    // the train rides far enough away — matching the SW game's distance fade-out).
+    if (inRing(s.startPos))
+        buildStation(out, s.startPos, s.startYaw, s.spineCol, s.trainAccent);
 
     buildTrainT(s, out);   // train consist near the head (rides with the camera)
 }
