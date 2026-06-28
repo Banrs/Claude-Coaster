@@ -1,9 +1,7 @@
 src/vendor/
 minecoaster
+minecoaster_orbit
 *.png
 *.o
 track.txt
-out.png
-minecoaster-rt
-minecoaster_orbit
-minecoaster-rt-benchmark
+.DS_Store

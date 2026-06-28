@@ -1,12 +1,6 @@
 #ifndef MINECOASTER_RENDER_FX_CPP
 #define MINECOASTER_RENDER_FX_CPP
 
-// ============================================================================
-//  GLSL lighting + shadow mapping (real cast shadows, SEUS/Bedrock-RTX feel)
-//  Pass 1: render the world's depth from the sun's POV into a shadow map.
-//  Pass 2: render from the camera; the fragment shader does directional light
-//  (Lambert), soft PCF shadow lookup, sky/ground ambient, and a specular sheen.
-// ============================================================================
 static const char *SHADOW_VS =
     "#version 330\n"
     "in vec3 vertexPosition; in vec2 vertexTexCoord; in vec3 vertexNormal; in vec4 vertexColor;\n"
@@ -28,17 +22,11 @@ static const char *SHADOW_FS =
     "uniform sampler2D shadowMap; uniform vec2 shadowTexel;\n"
     "uniform vec3 lightDir; uniform vec3 viewPos;\n"
     "uniform vec3 sunCol; uniform vec3 skyCol; uniform vec3 groundCol;\n"
-    "uniform float uTime;\n"   // animates water ripples; harmless 0 if main never sets it
-    // distance fog for the cached terrain mesh (fog baked OUT of its vertex colours
-    // so the mesh can be reused across frames). fogEnd<=0 disables it, so the
-    // immediate-mode coaster/supports/stations — which still bake their own fog —
-    // are left untouched. fogCol is the SKY tint the terrain fades into.
+    "uniform float uTime;\n"
+
     "uniform float fogEnd; uniform vec3 fogCol;\n"
     "out vec4 finalColor;\n"
-    // Shadow lookup (returns 1 = fully lit, 0 = shadowed). A 12-tap rotated Poisson
-    // disk over a SMALL kernel (~1.4 texel): just wide enough to antialias the
-    // shadow-map texel jaggies into a thin clean edge, but tight enough that the
-    // shadow still hugs the voxel BLOCK shapes (not a wide soft penumbra).
+
     "const vec2 PD12[12] = vec2[12](\n"
     "  vec2(-0.326,-0.406),vec2(-0.840,-0.074),vec2(-0.696, 0.457),vec2(-0.203, 0.621),\n"
     "  vec2( 0.962,-0.195),vec2( 0.473,-0.480),vec2( 0.519, 0.767),vec2( 0.185,-0.893),\n"
@@ -48,11 +36,11 @@ static const char *SHADOW_FS =
     "  if(p.z<=0.0||p.z>1.0) return 1.0;\n"
     "  if(p.x<0.0||p.x>1.0||p.y<0.0||p.y>1.0) return 1.0;\n"
     "  float NoL = max(dot(N,lightDir),0.0);\n"
-    // slope-scaled bias: more depth slack on grazing faces to kill acne.
+
     "  float bias = clamp(0.00026 + 0.00120*(1.0-NoL),0.00026,0.00140);\n"
     "  float ang = fract(sin(dot(fragWorld.xz, vec2(12.9898,78.233)))*43758.5453)*6.2831853;\n"
     "  float ca=cos(ang), sa=sin(ang); mat2 rot=mat2(ca,-sa,sa,ca);\n"
-    "  vec2 o = shadowTexel*1.4;\n"                  // small kernel -> crisp but anti-aliased edge
+    "  vec2 o = shadowTexel*1.4;\n"
     "  float s=0.0;\n"
     "  for(int i=0; i<12; i++){\n"
     "    vec2 tap = p.xy + rot*PD12[i]*o;\n"
@@ -61,66 +49,52 @@ static const char *SHADOW_FS =
     "  }\n"
     "  return s*(1.0/12.0);\n"
     "}\n"
-    // ACES filmic tonemap (Narkowicz fit)
+
     "vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }\n"
     "vec3 toLinear(vec3 c){ return pow(c, vec3(2.2)); }\n"
-    // ---- WATER: fresnel sky reflection + sun glint + depth tint + ripple normal --
-    // The raster water slab arrives here as an up-facing TRANSLUCENT quad (alpha<0.72
-    // from the vertex colour). We replace the flat-slab look with a proper liquid:
-    // a small animated ripple normal, a Schlick fresnel that fades the body toward a
-    // bright sky-tinted reflection at grazing angles, depth-darkening from the body
-    // tint, and a tight specular sun highlight. Returns the linear-HDR water colour.
-    // small hash + value noise for fine ripple detail / foam fizz (cheap 2D)
+
     "float wh2(vec2 p){ return fract(sin(dot(p,vec2(41.3,289.1)))*43758.5453); }\n"
     "float wvn(vec2 p){ vec2 i=floor(p),f=fract(p); f=f*f*(3.0-2.0*f);\n"
     "  return mix(mix(wh2(i),wh2(i+vec2(1,0)),f.x), mix(wh2(i+vec2(0,1)),wh2(i+vec2(1,1)),f.x), f.y); }\n"
-    // foam>0 marks the shoreline ring (passed from the vertex alpha tag).
+
     "vec3 waterShade(vec3 baseCol, float rawSh, float foam){\n"
     "  vec3 V = normalize(viewPos - fragWorld);\n"
     "  vec2 w = fragWorld.xz;\n"
-    // crossing low-freq sine ripples + a finer noise-driven wrinkle for sparkle.
-    // Amplitude is kept SMALL: large ripple normals make the fresnel term oscillate
-    // across the foreground and tear into concentric bullseye rings. We also fade the
-    // ripple toward the horizon (where the surface should read as a calm mirror) using
-    // 1/(1+dist) so the far water stays smooth and doesn't shimmer/alias.
+
     "  float t = uTime;\n"
     "  float wdist = length(viewPos.xz - w);\n"
-    "  float amp = 1.0 / (1.0 + wdist*0.018);\n"  // ~1 up close -> calmer far away
+    "  float amp = 1.0 / (1.0 + wdist*0.018);\n"
     "  float nx = 0.032*sin(w.x*0.55 + w.y*0.31 + t*1.3)\n"
     "           + 0.022*sin(w.y*1.07 - t*0.9)\n"
     "           + 0.014*sin((w.x+w.y)*0.83 + t*1.7);\n"
     "  float nz = 0.032*sin(w.y*0.55 + w.x*0.31 - t*1.1)\n"
     "           + 0.022*sin(w.x*1.07 + t*0.8)\n"
     "           + 0.014*sin((w.x-w.y)*0.83 - t*1.5);\n"
-    "  nx += (wvn(w*1.6 + t*0.25)-0.5)*0.028;\n"             // fine high-freq wrinkle
+    "  nx += (wvn(w*1.6 + t*0.25)-0.5)*0.028;\n"
     "  nz += (wvn(w*1.6 - t*0.21)-0.5)*0.028;\n"
     "  vec3 N = normalize(vec3(nx*amp, 1.0, nz*amp));\n"
     "  float NoV = max(dot(N, V), 0.0);\n"
-    // crisper Schlick fresnel; shoreline foam suppresses the mirror so shallows stay matte
+
     "  float fres = clamp(0.02 + 0.98*pow(1.0 - NoV, 5.0), 0.02, 0.62);\n"
     "  fres *= (1.0 - foam*0.65);\n"
-    // body: depth/shadow-darkened tint of the incoming (shallow->deep) water colour,
-    // lifted where the sun lights it so shallows read warmer/brighter than the deep.
+
     "  vec3 body = toLinear(baseCol);\n"
     "  float ndlW = max(dot(N, lightDir), 0.0);\n"
     "  vec3 deep = body * (0.62 + 0.46*ndlW*mix(0.4,1.0,rawSh)) + groundCol*0.04;\n"
-    // reflection: reflect a BRIGHT sky gradient (deep zenith blue -> pale luminous
-    // horizon) along the reflected ray, warmed toward the sun.
+
     "  vec3 R = reflect(-V, N);\n"
     "  float ry = clamp(R.y, 0.0, 1.0);\n"
-    "  vec3 skyZen  = vec3(0.24, 0.46, 0.86);\n"      // deep zenith blue (linear-ish)
-    "  vec3 skyHorz = vec3(0.52, 0.70, 0.92);\n"      // luminous but still blue horizon
+    "  vec3 skyZen  = vec3(0.24, 0.46, 0.86);\n"
+    "  vec3 skyHorz = vec3(0.52, 0.70, 0.92);\n"
     "  vec3 sky = mix(skyHorz, skyZen, pow(ry, 0.45));\n"
-    "  float sunGlow = pow(max(dot(R, lightDir), 0.0), 8.0);\n"  // warm reflected-sun smear
+    "  float sunGlow = pow(max(dot(R, lightDir), 0.0), 8.0);\n"
     "  vec3 refl = mix(sky, sunCol*0.55, 0.30*sunGlow);\n"
     "  vec3 col = mix(deep, refl, fres);\n"
-    // tight sun specular glint on the rippled surface (only where lit)
+
     "  vec3 H = normalize(lightDir + V);\n"
     "  float glint = pow(max(dot(N,H),0.0), 200.0)*rawSh;\n"
     "  col += sunCol*glint*1.6;\n"
-    // ---- shoreline foam: a soft animated white band on the shallowest ring. A
-    // noise lace (two octaves, drifting) breaks the band into lacy froth, fading
-    // out as the water deepens. Kept subtle so it reads as foam, not snow.
+
     "  if(foam > 0.001){\n"
     "    float lace = wvn(w*2.3 + t*0.6)*0.6 + wvn(w*5.1 - t*0.4)*0.4;\n"
     "    float froth = smoothstep(0.45, 0.95, lace) * foam;\n"
@@ -131,20 +105,16 @@ static const char *SHADOW_FS =
     "void main(){\n"
     "  vec4 tex = texture(texture0, fragTexCoord);\n"
     "  vec3 base = tex.rgb*fragColor.rgb*colDiffuse.rgb;\n"
-    // water = up-facing translucent BLUE slab (vertex alpha < 0.72, cyan-dominant).
-    // The blue test keeps the bright-white splash spray on the land path. Shade it
-    // as a real liquid surface and skip the diffuse land path entirely.
+
     "  if(fragColor.a < 0.72 && normalize(fragNormal).y > 0.80 && base.b > base.r*1.15){\n"
     "    float rawShW = shadow(vec3(0.0,1.0,0.0));\n"
-    // shoreline cells are tagged with a raised alpha (~0.70 vs ~0.59) -> foam factor.
+
     "    float foam = smoothstep(0.62, 0.70, fragColor.a);\n"
     "    vec3 wcol = waterShade(base, rawShW, foam);\n"
     "    wcol = aces(wcol*0.94);\n"
     "    wcol = pow(wcol, vec3(1.0/2.2));\n"
     "    float wa = mix(0.90, 0.96, foam);\n"
-    // same distance fog the terrain uses: the continuous water sheet fades to the
-    // sky tint (and its alpha drops) toward the cull radius, so there's no hard
-    // circular edge where the water disc ends — it dissolves into the horizon.
+
     "    if(fogEnd > 0.0){\n"
     "      float d = length(viewPos.xz - fragWorld.xz);\n"
     "      float fog = clamp((d - fogEnd*0.70)/(fogEnd*0.27), 0.0, 1.0);\n"
@@ -167,16 +137,11 @@ static const char *SHADOW_FS =
     "  float rawSh = shadow(N);\n"
     "  float sh = mix(0.18, 1.0, rawSh);\n"
     "  vec3 direct = sunCol*1.02*ndl*sh;\n"
-    // ---- richer hemisphere ambient so shadowed faces aren't flat/dead. -------
-    // Cool sky fill pours from ABOVE (up-facing faces read in shaded sky blue),
-    // a warmer bounce comes from BELOW (down-facing faces pick up a warm ground
-    // glow), and a small fill term keeps deep-shadow faces alive. The whole
-    // ambient is gently lifted in light and dropped in shadow so cast shadows
-    // still bite without crushing to black.
+
     "  float up   = clamp( N.y*0.5+0.5, 0.0, 1.0);\n"
     "  float down = clamp(-N.y, 0.0, 1.0);\n"
-    "  vec3 skyFill   = skyCol   * (0.62 + 0.55*up);\n"        // sky pours from above
-    "  vec3 bounce    = groundCol* (0.50 + 1.40*down);\n"      // warm bounce from below
+    "  vec3 skyFill   = skyCol   * (0.62 + 0.55*up);\n"
+    "  vec3 bounce    = groundCol* (0.50 + 1.40*down);\n"
     "  vec3 ambient   = (skyFill + bounce) * (0.52 + 0.22*rawSh);\n"
     "  vec3 V = normalize(viewPos-fragWorld);\n"
     "  vec3 H = normalize(lightDir+V);\n"
@@ -186,12 +151,10 @@ static const char *SHADOW_FS =
     "  vec3 col = albedo*(ambient + direct) + sunCol*spec + skyCol*rim;\n"
     "  col = aces(col*0.94);\n"
     "  col = pow(col, vec3(1.0/2.2));\n"
-    // gentle color grade: small saturation lift for richer voxel colours without
-    // looking neon, matched to the path tracer's resolve so raster<->RT views agree.
+
     "  float lum = dot(col, vec3(0.299,0.587,0.114));\n"
     "  col = mix(vec3(lum), col, 1.10);\n"
-    // distance fog (terrain mesh only): fade to the sky tint with the same curve
-    // the CPU used to bake per column. fogCol is already display-space sRGB.
+
     "  if(fogEnd > 0.0){\n"
     "    float d = length(viewPos.xz - fragWorld.xz);\n"
     "    float fog = clamp((d - fogEnd*0.70)/(fogEnd*0.27), 0.0, 1.0);\n"
@@ -211,7 +174,7 @@ static const char *DEPTH_FS =
 struct ShadowSys {
     Shader lit{}, depth{};
     unsigned int fbo = 0, depthTex = 0;
-    int SM = 2048;   // resolves thin rails / pillars while staying cheap; soft PCF hides the steps
+    int SM = 2048;
     int locLightVP=-1, locShadowMap=-1, locShadowTexel=-1, locLightDir=-1, locViewPos=-1;
     int locSun=-1, locSky=-1, locGround=-1, locDepthMVP=-1, locTime=-1;
     int locFogEnd=-1, locFogCol=-1;
@@ -240,8 +203,7 @@ struct ShadowSys {
     }
 
     Matrix computeLightVP(Vector3 focus) {
-        // wider half-extent so distant terrain (now drawn whole in the depth pass via
-        // the cached mesh) casts shadows further out; SM=2048 keeps it crisp enough.
+
         float R = 110.0f;
         Vector3 ctr = focus;
         Vector3 eye = Vector3Add(ctr, Vector3Scale(g_sunDir, 240.0f));
@@ -253,9 +215,6 @@ struct ShadowSys {
 };
 static ShadowSys gShadow;
 
-// ============================================================================
-//  World-space atmospheric fullscreen sky background.
-// ============================================================================
 static const char *SKY_VS =
     "#version 330\n"
     "in vec3 vertexPosition; in vec2 vertexTexCoord;\n"
@@ -271,17 +230,12 @@ static const char *SKY_FS =
     "uniform vec3 sunDir; uniform vec3 camPos;\n"
     "const vec3 ZENITH  = vec3(0.045, 0.26, 0.74);\n"
     "const vec3 MIDSKY  = vec3(0.16, 0.50, 0.95);\n"
-    "const vec3 HORIZON = vec3(0.52, 0.74, 1.00);\n"   // vibrant saturated horizon (was pale near-white)
+    "const vec3 HORIZON = vec3(0.52, 0.74, 1.00);\n"
     "const vec3 HAZE    = vec3(1.00, 0.78, 0.50);\n"
-    // luminous atmospheric haze band that the lower view ray / distant land melts
-    // into — a soft warm-tinted pale blue, NOT a dead slate grey. This is what fills
-    // the strip below the clouds and behind the faded far terrain.
+
     "const vec3 GROUND  = vec3(0.64, 0.72, 0.80);\n"
     "vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }\n"
-    // --- 3D value noise -> raymarched VOLUMETRIC clouds (ported verbatim from the
-    // path tracer's skyCol): a real cloud slab the view ray marches through, a
-    // smooth low-coverage fbm base lit by a short 2-tap march toward the sun for
-    // self-shadow. World-anchored via camPos so the clouds hold still as the train moves.
+
     "float h13(vec3 p){ p=fract(p*0.1031); p+=dot(p,p.yzx+33.33); return fract((p.x+p.y)*p.z); }\n"
     "float vn3(vec3 x){ vec3 i=floor(x), f=fract(x); f=f*f*(3.0-2.0*f);\n"
     "  return mix(mix(mix(h13(i+vec3(0,0,0)),h13(i+vec3(1,0,0)),f.x), mix(h13(i+vec3(0,1,0)),h13(i+vec3(1,1,0)),f.x),f.y),\n"
@@ -289,38 +243,33 @@ static const char *SKY_FS =
     "float cloudDens(vec3 p){\n"
     "  float cb=300.0, ct=470.0; float hf=(p.y-cb)/(ct-cb);\n"
     "  if(hf<0.0||hf>1.0) return 0.0;\n"
-    "  hf = smoothstep(0.0,0.32,hf)*smoothstep(1.0,0.5,hf);\n"              // soft top & base
+    "  hf = smoothstep(0.0,0.32,hf)*smoothstep(1.0,0.5,hf);\n"
     "  vec3 q=p*0.0013;\n"
     "  float base = vn3(q*4.0+3.1)*0.6 + vn3(q*8.0)*0.3 + vn3(q*16.0)*0.15;\n"
-    "  return smoothstep(0.62,0.95, base) * hf;\n"                          // high threshold -> sparse, wispy
+    "  return smoothstep(0.62,0.95, base) * hf;\n"
     "}\n"
     "vec4 cloudVolume(vec3 ro, vec3 rd, vec3 sun, float lift){\n"
-    // The cloud slab (y=300..470) is entered farther and farther away as the view
-    // ray flattens toward the horizon. Past a few km the noise hash sample coords
-    // (thousands of metres) overflow float precision in floor()/fract() and the
-    // volume breaks into a tiled black/white blotch band. So we hard-cap the march
-    // entry distance: beyond DMAX the clouds are sub-pixel horizon haze anyway, so
-    // we fade them out (smoothly, no hard line) rather than sampling the garbage.
+
     "  float cb=300.0, ct=470.0;\n"
     "  float t0=(cb-ro.y)/rd.y, t1=(ct-ro.y)/rd.y;\n"
     "  float tn=max(min(t0,t1),0.0), tf=max(t0,t1);\n"
     "  if(tf<=tn) return vec4(0.0);\n"
-    "  const float DMAX=4200.0;\n"                                            // last distance the hash stays stable
-    "  float distFade = 1.0 - smoothstep(DMAX*0.72, DMAX, tn);\n"            // fade clouds out before the band
+    "  const float DMAX=4200.0;\n"
+    "  float distFade = 1.0 - smoothstep(DMAX*0.72, DMAX, tn);\n"
     "  if(distFade <= 0.0) return vec4(0.0);\n"
     "  tf=min(tf,tn+1500.0);\n"
-    "  const int N=14; float dt=(tf-tn)/float(N);\n"                         // more steps -> smoother volume
-    "  float t=tn+dt*h13(vec3(gl_FragCoord.xy,1.0));\n"                       // jitter -> no banding
+    "  const int N=14; float dt=(tf-tn)/float(N);\n"
+    "  float t=tn+dt*h13(vec3(gl_FragCoord.xy,1.0));\n"
     "  float trans=1.0; vec3 acc=vec3(0.0);\n"
     "  vec3 sunC=mix(vec3(1.0,0.85,0.70), vec3(1.0,0.97,0.92), lift);\n"
     "  vec3 ambC=vec3(0.60,0.67,0.80);\n"
     "  for(int i=0;i<N;i++){\n"
     "    vec3 p=ro+rd*t; float d=cloudDens(p);\n"
     "    if(d>0.01){\n"
-    "      float ld=cloudDens(p+sun*42.0)+cloudDens(p+sun*95.0)*0.6;\n"       // 2-tap light march
+    "      float ld=cloudDens(p+sun*42.0)+cloudDens(p+sun*95.0)*0.6;\n"
     "      float sh=exp(-ld*1.5);\n"
     "      vec3 cc=ambC + sunC*sh*1.6;\n"
-    "      float a=clamp(d*0.9,0.0,1.0);\n"                                   // softer per-step opacity
+    "      float a=clamp(d*0.9,0.0,1.0);\n"
     "      acc+=trans*a*cc; trans*=(1.0-a);\n"
     "      if(trans<0.03) break;\n"
     "    }\n"
@@ -333,44 +282,37 @@ static const char *SKY_FS =
     "  vec3 dir = normalize(camDir + camRight*ndc.x*tanHalfFovY*aspect + camUp*(-ndc.y)*tanHalfFovY);\n"
     "  vec3 sun = normalize(sunDir);\n"
     "  float sunLift = smoothstep(-0.12, 0.55, sun.y);\n"
-    // ---- base sky: zenith->mid->horizon gradient with a Rayleigh-ish optical
-    // depth: looking toward the horizon means a longer air column, so it washes
-    // pale; the zenith stays deep blue. ---------------------------------------
+
     "  float h = clamp(dir.y*0.5+0.5, 0.0, 1.0);\n"
     "  float skyT = smoothstep(0.03, 0.92, h);\n"
     "  vec3 col = mix(HORIZON, MIDSKY, smoothstep(0.0, 0.55, skyT));\n"
     "  col = mix(col, ZENITH, smoothstep(0.34, 1.0, skyT));\n"
-    // optical-depth horizon wash (long air path scatters blue out -> pale band)
+
     "  float airMass = exp(-max(dir.y,0.0)*2.6);\n"
-    "  col = mix(col, HORIZON, airMass*0.22);\n"   // lighter wash -> horizon stays vibrant, not pale
+    "  col = mix(col, HORIZON, airMass*0.22);\n"
     "  float horizon = exp(-abs(dir.y)*4.2);\n"
     "  col += HORIZON*horizon*0.22;\n"
     "  col += HAZE*horizon*(0.10 + 0.20*(1.0-sunLift));\n"
-    // soft, wide fade into the luminous haze band below the horizon (slightly warmed)
-    // so there's no hard slate-grey wall under the clouds.
+
     "  float sunAz = clamp(dot(normalize(dir.xz), normalize(sun.xz)), 0.0, 1.0);\n"
     "  vec3 lowHaze = mix(GROUND, GROUND*vec3(1.05,1.0,0.93), sunAz*0.6);\n"
     "  col = mix(lowHaze, col, smoothstep(-0.16, 0.06, dir.y));\n"
-    // ---- in-scattering toward the sun ---------------------------------------
+
     "  float mu = clamp(dot(dir, sun), -1.0, 1.0);\n"
     "  float forward = max(mu, 0.0);\n"
-    // Rayleigh phase (1+cos^2) modulates overall brightness; warmer near the sun.
+
     "  float rayleigh = 0.55 + 0.45*mu*mu;\n"
     "  col *= rayleigh;\n"
     "  vec3 sunTint = mix(vec3(1.0,0.62,0.32), vec3(1.0,0.90,0.70), sunLift);\n"
-    // two-lobe Mie: a tight forward glow + a broad warm halo that sells the
-    // 'sun direction' even far from the disc (stronger when sun is low/hazy).
+
     "  float mieSharp = pow(forward, 22.0);\n"
     "  float mieBroad = pow(forward, 5.0);\n"
     "  col += sunTint*mieSharp*(0.42 + 0.36*horizon);\n"
     "  col += sunTint*mieBroad*(0.10 + 0.16*(1.0-sunLift));\n"
-    // ---- VIEW-DEPENDENT lens flare / god-rays -------------------------------
-    // viewSun = how directly the CAMERA AXIS (not just this pixel) points at the
-    // sun. Flare/rays scale with this, so they bloom in only when you actually
-    // look toward the sun and fade to nothing as it leaves the centre of view.
+
     "  float viewSun = max(dot(camDir, sun), 0.0);\n"
     "  float lookGate = smoothstep(0.55, 0.96, viewSun);\n"
-    // radial streaks around the sun, falling off with angular distance r
+
     "  vec3 ref = (abs(sun.y) > 0.94) ? vec3(1.0,0.0,0.0) : vec3(0.0,1.0,0.0);\n"
     "  vec3 sr = normalize(cross(ref, sun));\n"
     "  vec3 su = cross(sun, sr);\n"
@@ -380,19 +322,18 @@ static const char *SKY_FS =
     "  float streaks = pow(0.5+0.5*sin(a*13.0 + sin(a*5.0)*1.7), 4.0);\n"
     "  float shafts = streaks*smoothstep(0.72, 0.995, forward)*smoothstep(0.68, 0.08, r);\n"
     "  col += sunTint*shafts*(0.26 + 0.30*horizon)*sunLift*lookGate;\n"
-    // anamorphic-ish horizontal flare bar + a couple of ghost spots along the
-    // sun->screen-centre axis, all gated by lookGate so they vanish off-axis.
+
     "  float bar = exp(-pow(sunPlane.y*9.0,2.0)) * smoothstep(0.5,0.0,r);\n"
     "  col += sunTint*bar*0.22*lookGate;\n"
     "  float ghost = exp(-pow((r-0.16)*10.0,2.0)) + 0.6*exp(-pow((r-0.34)*7.0,2.0));\n"
     "  col += sunTint*ghost*0.05*lookGate;\n"
-    // ---- sun disc + corona (also view-gated so it doesn't bleed when off-axis)
+
     "  float disc = smoothstep(0.99950, 0.99986, mu);\n"
     "  float corona = pow(forward, 96.0);\n"
     "  col += vec3(1.0,0.93,0.74)*corona*0.58*sunLift*mix(0.4,1.0,lookGate);\n"
     "  col = mix(col, vec3(1.0,0.94,0.78), disc*0.78*sunLift);\n"
     "  col += vec3(1.0,0.97,0.84)*disc*1.15*sunLift;\n"
-    // composite raymarched volumetric clouds over the sky along the world view ray
+
     "  vec4 cl = cloudVolume(camPos, dir, sun, sunLift);\n"
     "  col = col*(1.0-cl.a) + cl.rgb;\n"
     "  col = aces(col*1.08);\n"
