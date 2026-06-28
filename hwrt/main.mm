@@ -33,6 +33,7 @@ static std::string g_baseDir;
 #include "shaders.h"
 #include "track_gen.h"     // infinite streaming generator (struct StreamTrack)
 #include "audio.h"         // simple procedural ride audio (wind/rumble/launch whoosh)
+#include "raylib_font.h"   // raylib default font (pixel-exact 1:1 with the SW game's DrawText)
 
 // Runtime mode (chosen from the START MENU): infinite streaming generator vs the
 // pre-generated benchmark demo map. This used to be the -DRT_STREAM COMPILE flag;
@@ -1099,142 +1100,140 @@ static bool kindSpecial(int k) {
 @property (nonatomic, assign) Renderer* renderer;
 @end
 
+// --- CG shape helpers matching raylib's DrawRectangleRounded etc. ---
+static void rlRoundRect(CGContextRef c, CGFloat x, CGFloat y, CGFloat w, CGFloat h, CGFloat rad,
+                        CGFloat r, CGFloat g, CGFloat b, CGFloat a, bool fill, CGFloat lw) {
+    NSBezierPath* bp = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x,y,w,h) xRadius:rad yRadius:rad];
+    CGContextAddPath(c, [bp CGPath]);
+    if (fill) { CGContextSetRGBFillColor(c, r,g,b,a); CGContextFillPath(c); }
+    else      { CGContextSetRGBStrokeColor(c, r,g,b,a); CGContextSetLineWidth(c, lw); CGContextStrokePath(c); }
+}
+// frosted-glass panel — 1:1 with the SW game's hudPanel (fill {18,22,34,168},
+// rounded line {150,168,200,70}, and a 1px top sheen {220,232,255,36}).
+static void rlPanel(CGContextRef c, CGFloat x, CGFloat y, CGFloat w, CGFloat h) {
+    CGFloat rad = 0.32f * fmin(w,h) * 0.5f;
+    rlRoundRect(c, x,y,w,h, rad, 18/255.,22/255.,34/255., 168/255., true, 0);
+    rlRoundRect(c, x,y,w,h, rad, 150/255.,168/255.,200/255., 70/255., false, 1);
+    rlRoundRect(c, x+5,y+3,w-10,2, 1.0, 220/255.,232/255.,255/255., 36/255., true, 0);
+}
+
+// The whole ride HUD, drawn into a flipped (top-left origin) CG context with raylib's
+// default font — a 1:1 port of the SW game's HUD block (src/main.cpp ~3197-3349):
+// SCORE chip, SPEED card (km/h + ALT + element chip), BOOST capsule, controls-hint
+// line, the accelerometer g-meter dial, and the station boarding prompt.
+static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
+    if (!r || !r->rideMode) return;
+
+    // SCORE — compact frosted chip, top-left
+    { char sc[16]; snprintf(sc, sizeof sc, "%06ld", r->rideScore);
+      CGFloat vw = rlMeasureText(sc, 26);
+      rlPanel(c, 18, 14, 78 + vw, 40);
+      rlText(c, "SCORE", 32, 22, 16, 150/255.,168/255.,200/255., 235/255.);
+      rlText(c, sc, 92, 19, 26, 1,1,1, 1); }
+
+    // SPEED — headline card, top-right: big km/h + unit, ALT underneath
+    int kmh = (int)(r->rideSpeed * 3.6f);
+    { char num[16]; snprintf(num, sizeof num, "%d", kmh);
+      CGFloat nw = rlMeasureText(num, 44);
+      CGFloat cardW = nw + 92.0f, cardX = W - cardW - 18.0f;
+      rlPanel(c, cardX, 14, cardW, 62);
+      CGFloat sr=1,sg=1,sb=1;
+      if      (kmh > 250) { sr=1.0; sg=120/255.; sb=90/255.; }
+      else if (kmh > 150) { sr=120/255.; sg=230/255.; sb=170/255.; }
+      rlText(c, num, cardX + 18, 18, 44, sr,sg,sb, 1);
+      rlText(c, "KM/H", cardX + 26 + nw, 26, 18, 168/255.,184/255.,214/255., 235/255.);
+      char alt[24]; snprintf(alt, sizeof alt, "ALT %dm", (int)r->rideAlt);
+      rlText(c, alt, (cardX + cardW) - rlMeasureText(alt,16) - 16, 53, 16, 150/255.,168/255.,200/255., 220/255.); }
+
+    // element name chip, under the ALT readout (pink/amber on inversions)
+    if (r->rideDispatched) {
+        const char* en = kindName(r->rideKind);
+        bool special = kindSpecial(r->rideKind);
+        CGFloat tw = rlMeasureText(en, 18);
+        CGFloat pw = tw + 28.0f, px = W - pw - 18.0f, py = 84.0f;
+        CGFloat ar = special?1.0:150/255., ag = special?200/255.:184/255., ab = special?110/255.:230/255.;
+        rlPanel(c, px, py, pw, 30);
+        CGContextSetRGBFillColor(c, ar,ag,ab, 1);                       // accent tick
+        CGContextFillRect(c, CGRectMake(px+8, py+9, 4, 12));
+        if (special) rlText(c, en, px+18, py+7, 18, ar,ag,ab, 1);
+        else         rlText(c, en, px+18, py+7, 18, 214/255.,224/255.,240/255., 235/255.);
+    }
+
+    // BOOST — rounded capsule (bottom-left)
+    { CGFloat bx = 20, by = H - 44, bw = 228, bh = 22;
+      rlText(c, "BOOST", bx, by - 22, 16, 150/255.,168/255.,200/255., 235/255.);
+      rlRoundRect(c, bx,by,bw,bh, bh*0.5, 14/255.,18/255.,28/255., 190/255., true, 0);
+      CGFloat fillW = (bw - 6) * r->rideBoost;          // rideBoost is 0..1
+      if (fillW > 4) {
+          CGFloat fr,fg,fb;
+          if      (r->rideBoost > 0.6f) { fr=120/255.; fg=230/255.; fb=170/255.; }
+          else if (r->rideBoost > 0.3f) { fr=1.0;      fg=180/255.; fb=70/255.; }
+          else                          { fr=235/255.; fg=90/255.;  fb=70/255.; }
+          rlRoundRect(c, bx+3,by+3,fillW,bh-6, (bh-6)*0.5, fr,fg,fb, 1, true, 0);
+      }
+      rlRoundRect(c, bx,by,bw,bh, bh*0.5, 150/255.,168/255.,200/255., 90/255., false, 1); }
+
+    // controls-hint line (bottom-right) — the ride variant (metal-rt has no on-foot mode)
+    { const char* hint = "SPACE boost/launch   S brake   C camera   P pause";
+      rlText(c, hint, W - rlMeasureText(hint,16) - 20, H - 30, 16, 235/255.,235/255.,235/255., 200/255.); }
+
+    // accelerometer g-meter dial (bottom-right) — SW coords gc=(W-96, H-150), R=48
+    if (r->rideDispatched) {
+        CGFloat gx = W - 96, gy = H - 150, R = 48.0f, scale = R / 4.5f;
+        CGContextSetRGBFillColor(c, 12/255.,15/255.,24/255., 150/255.);
+        CGContextFillEllipseInRect(c, CGRectMake(gx-R-6, gy-R-6, 2*(R+6), 2*(R+6)));
+        CGContextSetRGBStrokeColor(c, 80/255.,90/255.,110/255., 210/255.); CGContextSetLineWidth(c, 3);
+        CGContextStrokeEllipseInRect(c, CGRectMake(gx-R-2, gy-R-2, 2*(R+2), 2*(R+2)));
+        for (int gg = 1; gg <= 4; gg++) {
+            if (gg == 1) CGContextSetRGBStrokeColor(c, 110/255.,170/255.,140/255., 150/255.);
+            else         CGContextSetRGBStrokeColor(c, 78/255.,86/255.,104/255., 90/255.);
+            CGContextSetLineWidth(c, 1); CGFloat rr = gg * scale;
+            CGContextStrokeEllipseInRect(c, CGRectMake(gx-rr, gy-rr, 2*rr, 2*rr));
+        }
+        CGContextSetRGBStrokeColor(c, 78/255.,86/255.,104/255., 70/255.); CGContextSetLineWidth(c, 1);
+        CGContextMoveToPoint(c, gx-R, gy); CGContextAddLineToPoint(c, gx+R, gy);
+        CGContextMoveToPoint(c, gx, gy-R); CGContextAddLineToPoint(c, gx, gy+R);
+        CGContextStrokePath(c);
+        CGFloat gv = r->rideVertG, gl = r->rideLatG;
+        CGFloat cgv = gv < -4.5 ? -4.5 : (gv > 4.5 ? 4.5 : gv);
+        CGFloat cgl = gl < -4.5 ? -4.5 : (gl > 4.5 ? 4.5 : gl);
+        CGFloat ox = -cgl * scale, oy = cgv * scale;   // +g sinks DOWN (flipped: +y is down)
+        CGFloat ol = sqrt(ox*ox + oy*oy);
+        if (ol > R - 8) { ox *= (R-8)/ol; oy *= (R-8)/ol; }
+        CGFloat bxp = gx + ox, byp = gy + oy, br,bg,bb;
+        if      (gv < -0.1) { br=80/255.;  bg=220/255.; bb=1.0; }
+        else if (gv <  0.5) { br=96/255.;  bg=204/255.; bb=1.0; }
+        else if (gv <  2.0) { br=124/255.; bg=230/255.; bb=140/255.; }
+        else if (gv <  3.5) { br=1.0;      bg=200/255.; bb=84/255.; }
+        else                { br=1.0;      bg=96/255.;  bb=84/255.; }
+        CGContextSetRGBFillColor(c, 10/255.,12/255.,20/255., 210/255.);
+        CGContextFillEllipseInRect(c, CGRectMake(bxp-8, byp-8, 16, 16));
+        CGContextSetRGBFillColor(c, br,bg,bb, 1.0);
+        CGContextFillEllipseInRect(c, CGRectMake(bxp-6.5, byp-6.5, 13, 13));
+        char gtxt[16]; snprintf(gtxt, sizeof gtxt, "%+.1f", r->rideVertG);  // TRUE felt g
+        CGFloat gw = rlMeasureText(gtxt, 28);
+        rlText(c, gtxt, gx - gw/2, gy - R - 34, 28, 1,1,1, 1);
+        rlText(c, "G", gx + gw/2 + 3, gy - R - 26, 16, 185/255.,195/255.,214/255., 230/255.);
+    }
+
+    // station boarding prompt (1:1 with the SW "PRESS SPACE TO LAUNCH")
+    if (!r->rideDispatched) {
+        if (((int)(CACurrentMediaTime() * 2)) & 1) {
+            const char* pr = "PRESS  SPACE  TO  LAUNCH";
+            rlText(c, pr, W*0.5 - rlMeasureText(pr,34)*0.5, H*0.5 - 60, 34, 1.0,235/255.,120/255., 1);
+        }
+        const char* sub = "the hydraulic launch fires the moment you hit SPACE";
+        rlText(c, sub, W*0.5 - rlMeasureText(sub,20)*0.5, H*0.5 - 16, 20, 225/255.,230/255.,245/255., 220/255.);
+    }
+}
+
 @implementation HUDView
 - (BOOL)isFlipped { return YES; }          // top-left origin, like the SW game's screen space
 - (BOOL)acceptsFirstResponder { return NO; }
 - (NSView*)hitTest:(NSPoint)p { return nil; }  // click-through to the MetalView below
-
-static void hudPanel(CGContextRef c, CGFloat x, CGFloat y, CGFloat w, CGFloat h, CGFloat a) {
-    CGContextSetRGBFillColor(c, 0.07f, 0.085f, 0.13f, a);
-    NSBezierPath* bp = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x,y,w,h) xRadius:7 yRadius:7];
-    CGContextAddPath(c, [bp CGPath]); CGContextFillPath(c);
-}
-static void hudText(const char* s, CGFloat x, CGFloat y, CGFloat sz,
-                    CGFloat r, CGFloat g, CGFloat b, NSTextAlignment al) {
-    NSMutableParagraphStyle* ps = [[NSMutableParagraphStyle alloc] init];
-    ps.alignment = al;
-    NSDictionary* at = @{
-        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:sz weight:NSFontWeightBold],
-        NSForegroundColorAttributeName: [NSColor colorWithRed:r green:g blue:b alpha:1.0],
-        NSParagraphStyleAttributeName: ps,
-    };
-    NSString* str = [NSString stringWithUTF8String:s];
-    // a soft shadow for legibility over bright terrain
-    NSDictionary* sh = @{
-        NSFontAttributeName: [NSFont monospacedSystemFontOfSize:sz weight:NSFontWeightBold],
-        NSForegroundColorAttributeName: [NSColor colorWithRed:0 green:0 blue:0 alpha:0.55],
-        NSParagraphStyleAttributeName: ps,
-    };
-    [str drawAtPoint:NSMakePoint(x+1.5, y+1.5) withAttributes:sh];
-    [str drawAtPoint:NSMakePoint(x, y) withAttributes:at];
-}
-
 - (void)drawRect:(NSRect)dirty {
-    Renderer* r = self.renderer;
-    if (!r || !r->rideMode) return;
-    CGContextRef c = [[NSGraphicsContext currentContext] CGContext];
-    CGFloat W = self.bounds.size.width, H = self.bounds.size.height;
-
-    // --- SCORE chip (top-left) ---
-    { char s[32]; snprintf(s, sizeof s, "%06ld", r->rideScore);
-      hudPanel(c, 16, 14, 150, 40, 0.66f);
-      hudText("SCORE", 28, 24, 15, 0.59f,0.66f,0.78f, NSTextAlignmentLeft);
-      hudText(s, 86, 20, 24, 1,1,1, NSTextAlignmentLeft); }
-
-    // --- SPEED card (top-right): big km/h + unit, ALT under it, element name under that ---
-    {
-        int kmh = (int)(r->rideSpeed * 3.6f);
-        char num[16]; snprintf(num, sizeof num, "%d", kmh);
-        CGFloat cardW = 200, cardX = W - cardW - 16;
-        hudPanel(c, cardX, 14, cardW, 62, 0.66f);
-        CGFloat sr=1,sg=1,sb=1;
-        if      (kmh > 250) { sr=1.0f; sg=0.47f; sb=0.35f; }
-        else if (kmh > 150) { sr=0.47f; sg=0.90f; sb=0.66f; }
-        hudText(num, cardX + 18, 18, 42, sr,sg,sb, NSTextAlignmentLeft);
-        hudText("KM/H", cardX + cardW - 70, 30, 17, 0.66f,0.72f,0.84f, NSTextAlignmentLeft);
-        char alt[24]; snprintf(alt, sizeof alt, "ALT %dm", (int)r->rideAlt);
-        hudText(alt, cardX, 52, 15, 0.59f,0.66f,0.78f, NSTextAlignmentRight);
-        // element name chip, just under the speed card (pink/amber on inversions)
-        const char* en = kindName(r->rideKind);
-        bool special = kindSpecial(r->rideKind);
-        CGFloat py = 84;
-        hudPanel(c, cardX, py, cardW, 28, 0.62f);
-        CGFloat er = special?1.0f:0.59f, eg = special?0.78f:0.72f, eb = special?0.43f:0.90f;
-        hudText(en, cardX + 14, py + 6, 16, er,eg,eb, NSTextAlignmentLeft);
-    }
-
-    // --- BOOST bar + felt-g (bottom-left), matching the SW capsule ---
-    {
-        CGFloat bx = 20, bw = 228, bh = 20, by = H - 40;
-        hudText("BOOST", bx, by - 22, 15, 0.59f,0.66f,0.78f, NSTextAlignmentLeft);
-        CGContextSetRGBFillColor(c, 0.05f,0.07f,0.11f, 0.78f);
-        NSBezierPath* cap = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(bx,by,bw,bh) xRadius:bh*0.5 yRadius:bh*0.5];
-        CGContextAddPath(c, [cap CGPath]); CGContextFillPath(c);
-        CGFloat fillW = (bw - 6) * r->rideBoost;
-        if (fillW > 4) {
-            CGFloat fr,fg,fb;
-            if      (r->rideBoost > 0.6f) { fr=0.47f; fg=0.90f; fb=0.66f; }
-            else if (r->rideBoost > 0.3f) { fr=1.0f;  fg=0.70f; fb=0.27f; }
-            else                          { fr=0.92f; fg=0.35f; fb=0.27f; }
-            CGContextSetRGBFillColor(c, fr,fg,fb, 1.0f);
-            NSBezierPath* fp = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(bx+3,by+3,fillW,bh-6) xRadius:(bh-6)*0.5 yRadius:(bh-6)*0.5];
-            CGContextAddPath(c, [fp CGPath]); CGContextFillPath(c);
-        }
-    }
-
-    // --- circular accelerometer g-meter (bottom-right), ported from the SW gauge ---
-    {
-        CGFloat gx = W - 96, gy = H - 110, R = 48.0f, scale = R / 4.5f;
-        // backdrop + rim
-        CGContextSetRGBFillColor(c, 0.05f,0.06f,0.10f, 0.6f);
-        CGContextFillEllipseInRect(c, CGRectMake(gx-R-6, gy-R-6, 2*(R+6), 2*(R+6)));
-        CGContextSetRGBStrokeColor(c, 0.31f,0.35f,0.43f, 0.85f);
-        CGContextSetLineWidth(c, 3);
-        CGContextStrokeEllipseInRect(c, CGRectMake(gx-R-2, gy-R-2, 2*(R+2), 2*(R+2)));
-        // 1..4 g guide rings (the 1g rest ring reads brighter)
-        for (int gg = 1; gg <= 4; gg++) {
-            if (gg == 1) CGContextSetRGBStrokeColor(c, 0.43f,0.66f,0.55f, 0.6f);
-            else         CGContextSetRGBStrokeColor(c, 0.31f,0.34f,0.41f, 0.35f);
-            CGContextSetLineWidth(c, 1);
-            CGFloat rr = gg * scale;
-            CGContextStrokeEllipseInRect(c, CGRectMake(gx-rr, gy-rr, 2*rr, 2*rr));
-        }
-        CGContextSetRGBStrokeColor(c, 0.31f,0.34f,0.41f, 0.28f);
-        CGContextMoveToPoint(c, gx-R, gy); CGContextAddLineToPoint(c, gx+R, gy);
-        CGContextMoveToPoint(c, gx, gy-R); CGContextAddLineToPoint(c, gx, gy+R);
-        CGContextStrokePath(c);
-        // accelerometer ball: vertical = full felt g (hangs at 1g rest, floats to 0g in
-        // airtime, sinks under +g); lateral = swings to the OUTSIDE of a turn.
-        CGFloat gv = r->rideVertG, gl = r->rideLatG;
-        gv = gv < -4.5f ? -4.5f : (gv > 4.5f ? 4.5f : gv);
-        gl = gl < -4.5f ? -4.5f : (gl > 4.5f ? 4.5f : gl);
-        CGFloat ox = -gl * scale, oy = gv * scale;   // +gv sinks DOWN (this view is flipped: +y is down)
-        CGFloat ol = sqrt(ox*ox + oy*oy);
-        if (ol > R - 8) { ox *= (R-8)/ol; oy *= (R-8)/ol; }
-        CGFloat bxp = gx + ox, byp = gy + oy;
-        CGFloat br,bg,bb;
-        if      (gv < -0.1f) { br=0.31f; bg=0.86f; bb=1.0f; }   // ejector airtime
-        else if (gv <  0.5f) { br=0.38f; bg=0.80f; bb=1.0f; }   // floater airtime
-        else if (gv <  2.0f) { br=0.49f; bg=0.90f; bb=0.55f; }
-        else if (gv <  3.5f) { br=1.0f;  bg=0.78f; bb=0.33f; }
-        else                 { br=1.0f;  bg=0.38f; bb=0.33f; }  // heavy g
-        CGContextSetRGBFillColor(c, 0.04f,0.05f,0.08f, 0.85f);
-        CGContextFillEllipseInRect(c, CGRectMake(bxp-8, byp-8, 16, 16));
-        CGContextSetRGBFillColor(c, br,bg,bb, 1.0f);
-        CGContextFillEllipseInRect(c, CGRectMake(bxp-6.5, byp-6.5, 13, 13));
-        // signed vertical-g readout above the dial
-        char gt[16]; snprintf(gt, sizeof gt, "%+.1f G", r->rideVertG);  // TRUE felt g (the ball clamps to the rim, the readout does not)
-        hudText(gt, gx - 40, gy - R - 30, 22, 1,1,1, NSTextAlignmentCenter);
-    }
-
-    // --- station boarding prompt (parity w/ SW "PRESS SPACE TO LAUNCH") ---
-    if (!r->rideDispatched) {
-        const char* pr = "PRESS  SPACE  TO  LAUNCH";
-        if (((int)(CACurrentMediaTime() * 2)) & 1)        // blink, like the SW prompt
-            hudText(pr, W*0.5 - 220, H*0.5 - 60, 34, 1.0f, 0.92f, 0.47f, NSTextAlignmentCenter);
-        const char* sub = "the train is waiting at the station";
-        hudText(sub, W*0.5 - 220, H*0.5 - 16, 20, 0.88f, 0.90f, 0.96f, NSTextAlignmentCenter);
-    }
+    drawHUD([[NSGraphicsContext currentContext] CGContext], self.renderer,
+            self.bounds.size.width, self.bounds.size.height);
 }
 @end
 
@@ -1420,6 +1419,35 @@ static void hudText(const char* s, CGFloat x, CGFloat y, CGFloat sz,
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)a { return YES; }
 @end
 
+// --hudtest: render the HUD (no Metal) to out.png so the pixel-exact raylib-font
+// port can be verified headlessly (the live HUD is an NSView overlay, absent from
+// --shot). HUDTEST_BOARD=1 renders the station-boarding prompt state instead.
+static int runHudTest() {
+    const int W = 1280, H = 720;
+    Renderer hr;                          // scalar HUD fields only; no Metal init
+    hr.rideMode = true;
+    bool board = getenv("HUDTEST_BOARD") != nullptr;
+    hr.rideDispatched = !board;
+    hr.rideScore = 4312; hr.rideSpeed = 64.0f; hr.rideAlt = 122.0f;
+    hr.rideKind = 19;                     // COBRA ROLL (special -> amber chip)
+    hr.rideBoost = 0.72f; hr.rideVertG = 3.4f; hr.rideLatG = -1.2f;
+
+    unsigned char* buf = (unsigned char*)calloc(W*H, 4);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef c = CGBitmapContextCreate(buf, W, H, 8, W*4, cs,
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGContextSetRGBFillColor(c, 0.46, 0.55, 0.62, 1.0);   // mid sky-ish bg for legibility
+    CGContextFillRect(c, CGRectMake(0, 0, W, H));
+    CGContextTranslateCTM(c, 0, H); CGContextScaleCTM(c, 1, -1);   // top-left origin (HUDView is flipped)
+    drawHUD(c, &hr, W, H);
+    CGContextFlush(c);
+    if (!stbi_write_png("out.png", W, H, 4, buf, W*4))
+        fprintf(stderr, "hudtest: write failed\n");
+    else printf("hudtest: wrote out.png (%dx%d) %s\n", W, H, board ? "[boarding]" : "[dispatched]");
+    CGContextRelease(c); CGColorSpaceRelease(cs); free(buf);
+    return 0;
+}
+
 int main(int argc, const char** argv) {
     @autoreleasepool {
         // Resolve the executable's directory so assets load regardless of cwd.
@@ -1431,6 +1459,7 @@ int main(int argc, const char** argv) {
             if (strcmp(argv[i], "--shot") == 0)     shot = true;
             if (strcmp(argv[i], "--bench") == 0)    bench = true;
             if (strcmp(argv[i], "--benchmap") == 0) benchMap = true;   // headless: use the pre-gen demo map
+            if (strcmp(argv[i], "--hudtest") == 0)  return runHudTest();  // headless HUD -> out.png (no Metal)
         }
 
         static Renderer r;

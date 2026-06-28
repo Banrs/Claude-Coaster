@@ -89,26 +89,7 @@ static const int RL_CHAR_W[224] = {
 
 struct RLGlyph { CGFloat x, y, w, h; };   // rect in the 128x128 atlas
 
-static CGImageRef rlFontMask() {
-    static CGImageRef img = NULL;
-    if (img) return img;
-    // alpha mask: 255 where a glyph bit is set, else 0. Row-flipped (atlas y is
-    // top-down; we store bottom-up so it draws upright via ClipToMask).
-    unsigned char* a = (unsigned char*)malloc(128*128);
-    for (int p = 0; p < 128*128; p++) {
-        bool on = (RL_FONT_DATA[p >> 5] & (1u << (p & 31))) != 0;
-        int x = p & 127, y = p >> 7;
-        a[(127 - y)*128 + x] = on ? 255 : 0;
-    }
-    CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
-    CGContextRef bc = CGBitmapContextCreate(a, 128, 128, 8, 128, gray, (CGBitmapInfo)kCGImageAlphaNone);
-    img = CGBitmapContextCreateImage(bc);
-    CGContextRelease(bc); CGColorSpaceRelease(gray); free(a);
-    return img;
-}
-
-// Glyph rects, reconstructed EXACTLY as rtext.c LoadFontDefault() (1px divisor,
-// wrap at 128). y is flipped to match the bottom-up mask above.
+// Glyph rects, reconstructed EXACTLY as rtext.c LoadFontDefault() (1px divisor, wrap at 128).
 static const RLGlyph* rlGlyphs() {
     static RLGlyph g[224]; static bool built = false;
     if (built) return g;
@@ -116,7 +97,7 @@ static const RLGlyph* rlGlyphs() {
     for (int i = 0; i < 224; i++) {
         CGFloat rx = posX;
         CGFloat ry = divisor + line*(h + divisor);
-        g[i] = { rx, 128.0 - ry - h, (CGFloat)RL_CHAR_W[i], (CGFloat)h };  // flip y
+        g[i] = { rx, (CGFloat)ry, (CGFloat)RL_CHAR_W[i], (CGFloat)h };  // natural top-down rect
         testX += RL_CHAR_W[i] + divisor;
         if (testX >= 128) { line++; posX = 2*divisor + RL_CHAR_W[i]; testX = posX; }
         else              { posX += RL_CHAR_W[i] + divisor; }
@@ -137,13 +118,37 @@ static CGFloat rlMeasureText(const char* s, CGFloat fontSize) {
     return w > 0 ? w - spacing : 0;
 }
 
+// Per-glyph mask image, built DIRECTLY from the font bits (no CGImage cropping, which
+// has its own coordinate quirks). X is pre-mirrored because CGContextClipToMask maps the
+// mask to the rect's bbox and reflects X; Y is left top-down (renders upright in the
+// flipped HUD context). Cached per glyph.
+static CGImageRef rlGlyphImg(int idx) {
+    static CGImageRef cache[224] = {0};
+    if (idx < 0 || idx >= 224) idx = 0;
+    if (cache[idx]) return cache[idx];
+    RLGlyph gg = rlGlyphs()[idx];
+    int gw = (int)gg.w, gh = (int)gg.h, gx = (int)gg.x, gy = (int)gg.y;
+    if (gw < 1) gw = 1;
+    unsigned char* b = (unsigned char*)calloc(gw*gh, 1);
+    for (int ly = 0; ly < gh; ly++)
+        for (int lx = 0; lx < gw; lx++) {
+            int pp = (gy + ly)*128 + (gx + lx);
+            bool on = (RL_FONT_DATA[pp >> 5] & (1u << (pp & 31))) != 0;
+            b[(gh - 1 - ly)*gw + lx] = on ? 255 : 0;   // flip Y (CGImage is bottom-up; the HUD context is isFlipped)
+        }
+    CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
+    CGContextRef bc = CGBitmapContextCreate(b, gw, gh, 8, gw, gray, (CGBitmapInfo)kCGImageAlphaNone);
+    cache[idx] = CGBitmapContextCreateImage(bc);
+    CGContextRelease(bc); CGColorSpaceRelease(gray); free(b);
+    return cache[idx];
+}
+
 // Draw text with raylib's default font into a flipped (top-left origin) CG context,
 // matching DrawText(s, x, y, fontSize, color) glyph-for-glyph.
 static void rlDrawText(CGContextRef c, const char* s, CGFloat x, CGFloat y,
                        CGFloat fontSize, CGFloat r, CGFloat g_, CGFloat b, CGFloat a) {
     if (fontSize < 10) fontSize = 10;
     CGFloat scale = fontSize / 10.0, spacing = floorf(fontSize / 10.0);
-    CGImageRef atlas = rlFontMask();
     const RLGlyph* gl = rlGlyphs();
     CGFloat cx = x;
     for (const char* p = s; *p; p++) {
@@ -151,15 +156,12 @@ static void rlDrawText(CGContextRef c, const char* s, CGFloat x, CGFloat y,
         RLGlyph gg = gl[idx];
         CGFloat gw = gg.w * scale, gh = gg.h * scale;
         if (*p != ' ') {
-            CGImageRef glyph = CGImageCreateWithImageInRect(atlas,
-                CGRectMake(gg.x, 128.0 - gg.y - gg.h, gg.w, gg.h));   // crop (atlas is bottom-up)
             CGRect dst = CGRectMake(cx, y, gw, gh);
             CGContextSaveGState(c);
-            CGContextClipToMask(c, dst, glyph);
+            CGContextClipToMask(c, dst, rlGlyphImg(idx));
             CGContextSetRGBFillColor(c, r, g_, b, a);
             CGContextFillRect(c, dst);
             CGContextRestoreGState(c);
-            CGImageRelease(glyph);
         }
         cx += gw + spacing;
     }
