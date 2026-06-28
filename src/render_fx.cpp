@@ -249,9 +249,12 @@ static const char *SKY_FS =
     "uniform vec3 sunDir; uniform vec3 camPos;\n"
     "const vec3 ZENITH  = vec3(0.045, 0.26, 0.74);\n"
     "const vec3 MIDSKY  = vec3(0.16, 0.50, 0.95);\n"
-    "const vec3 HORIZON = vec3(0.40, 0.70, 1.02);\n"   // vibrant saturated horizon (was pale near-white)
-    "const vec3 HAZE    = vec3(1.00, 0.74, 0.42);\n"
-    "const vec3 GROUND  = vec3(0.30, 0.38, 0.47);\n"
+    "const vec3 HORIZON = vec3(0.52, 0.74, 1.00);\n"   // vibrant saturated horizon (was pale near-white)
+    "const vec3 HAZE    = vec3(1.00, 0.78, 0.50);\n"
+    // luminous atmospheric haze band that the lower view ray / distant land melts
+    // into — a soft warm-tinted pale blue, NOT a dead slate grey. This is what fills
+    // the strip below the clouds and behind the faded far terrain.
+    "const vec3 GROUND  = vec3(0.64, 0.72, 0.80);\n"
     "vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }\n"
     // --- 3D value noise -> raymarched VOLUMETRIC clouds (ported verbatim from the
     // path tracer's skyCol): a real cloud slab the view ray marches through, a
@@ -319,9 +322,13 @@ static const char *SKY_FS =
     "  float airMass = exp(-max(dir.y,0.0)*2.6);\n"
     "  col = mix(col, HORIZON, airMass*0.22);\n"   // lighter wash -> horizon stays vibrant, not pale
     "  float horizon = exp(-abs(dir.y)*4.2);\n"
-    "  col += HORIZON*horizon*0.20;\n"
-    "  col += HAZE*horizon*(0.08 + 0.18*(1.0-sunLift));\n"
-    "  col = mix(GROUND, col, smoothstep(-0.10, 0.04, dir.y));\n"
+    "  col += HORIZON*horizon*0.22;\n"
+    "  col += HAZE*horizon*(0.10 + 0.20*(1.0-sunLift));\n"
+    // soft, wide fade into the luminous haze band below the horizon (slightly warmed)
+    // so there's no hard slate-grey wall under the clouds.
+    "  float sunAz = clamp(dot(normalize(dir.xz), normalize(sun.xz)), 0.0, 1.0);\n"
+    "  vec3 lowHaze = mix(GROUND, GROUND*vec3(1.05,1.0,0.93), sunAz*0.6);\n"
+    "  col = mix(lowHaze, col, smoothstep(-0.16, 0.06, dir.y));\n"
     // ---- in-scattering toward the sun ---------------------------------------
     "  float mu = clamp(dot(dir, sun), -1.0, 1.0);\n"
     "  float forward = max(mu, 0.0);\n"
