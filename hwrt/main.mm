@@ -44,6 +44,19 @@ enum class GameMode { Streaming, Benchmark };
 // ---------------------------------------------------------------------------
 // Renderer: owns Metal objects, terrain, acceleration structure, pipelines.
 // ---------------------------------------------------------------------------
+// Host mirror of the shader's TemporalUniforms (shaders.h). Padded the same way as the
+// CameraUniforms mirror in math.h: each Metal `float3` is 16-byte aligned, so each
+// float[3] member is followed by one pad float. Layout MUST match the shader struct.
+struct TemporalUniforms {
+    float prevOrigin[3];  float _p0;
+    float prevForward[3]; float _p1;
+    float prevRight[3];   float _p2;
+    float prevUp[3];      float _p3;
+    float jitterX;
+    float jitterY;
+    float _p4[2];
+};
+
 struct Renderer {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;        // render command queue
@@ -51,6 +64,7 @@ struct Renderer {
                                       // don't serialise ahead of render frames on the GPU)
     id<MTLComputePipelineState> tracePSO;
     id<MTLBuffer> camBuffer;
+    id<MTLBuffer> tempBuffer;         // TemporalUniforms (prev-camera + jitter for MTLFX temporal)
 
     // --- Chunked instance AS (INCREMENTAL terrain) ---
     // The static terrain is a grid of fixed CHUNK-sized voxel chunks, each its OWN
@@ -113,6 +127,12 @@ struct Renderer {
     float yaw   = 0.0f;   // radians
     float pitch = 0.0f;
     float3 sunDir;
+    // PREVIOUS frame's camera basis (for MTLFXTemporalScaler motion-vector reprojection).
+    // Seeded on the first updateCamera so the first frame has zero motion.
+    float3 prevCamPos, prevFwd, prevRight, prevUp;
+    bool   havePrevCam = false;
+    bool   camCut = false;   // set when the camera teleports / the ride loops -> tell the scaler to reset (avoid ghost trails on the cut)
+    float  lastJitterX = 0.0f, lastJitterY = 0.0f;  // jitter the last trace used (fed to scaler.jitterOffset)
 
     // ride camera: follow the train along the spline in interactive mode.
     Coaster coaster;          // loaded spline (kept for the ride camera)
@@ -167,7 +187,9 @@ struct Renderer {
     void pollAsyncBuild();                   // commit a finished worker chunk build
     void forceSyncRebuild();                 // rebuild current geometry into FRONT, blocking (--shot)
     void updateCamera(CameraUniforms& cam, uint32_t w, uint32_t h);
-    void render(id<MTLTexture> target, uint32_t w, uint32_t h);
+    // `depth`/`motion` are the MTLFXTemporalScaler auxiliary buffers (same size as target).
+    void render(id<MTLTexture> target, id<MTLTexture> depth, id<MTLTexture> motion,
+                uint32_t w, uint32_t h);
 };
 
 static id<MTLComputePipelineState> makePSO(id<MTLDevice> dev, const char* fn) {
@@ -209,6 +231,8 @@ void Renderer::init() {
     tracePSO = makePSO(device, "traceKernel");
     camBuffer = [device newBufferWithLength:sizeof(CameraUniforms)
                                     options:MTLResourceStorageModeShared];
+    tempBuffer = [device newBufferWithLength:sizeof(TemporalUniforms)
+                                     options:MTLResourceStorageModeShared];
     // Lower, raking afternoon sun: long hardware ray-traced shadows of the track,
     // supports and trees stretch dramatically across the terrain (leaning into the RT
     // advantage the user asked for — clearly stronger shadows than the software raster).
@@ -755,7 +779,7 @@ void Renderer::rideAdvance(float dt) {
 
     rideU += (rideSpeed / mpu) * dt;
     float uMax = (float)(nRender - 1);
-    if (rideU > uMax) { rideU = 6.0f; rideSpeed = LAUNCH_V * 0.6f; }   // loop the lap
+    if (rideU > uMax) { rideU = 6.0f; rideSpeed = LAUNCH_V * 0.6f; camCut = true; }   // loop the lap -> reset temporal history (no ghost trail across the cut)
 
     // --- track + train: rebuild when the camera has moved ~a car length so the
     // train stays under it (not every frame; re-meshing the clipped circuit is not
@@ -821,6 +845,11 @@ void Renderer::updateCamera(CameraUniforms& cam, uint32_t w, uint32_t h) {
         up = cross(right, forward);
     }
 
+    // On the very first frame there is no valid history: use the current basis as `prev`
+    // (zero motion). Otherwise feed last frame's saved basis as `prev` so hits reproject
+    // into the previous frame for the temporal scaler's motion vectors.
+    if (!havePrevCam) { prevCamPos = camPos; prevFwd = forward; prevRight = right; prevUp = up; havePrevCam = true; }
+
     cam.origin[0]=camPos.x; cam.origin[1]=camPos.y; cam.origin[2]=camPos.z;
     cam.forward[0]=forward.x; cam.forward[1]=forward.y; cam.forward[2]=forward.z;
     cam.right[0]=right.x; cam.right[1]=right.y; cam.right[2]=right.z;
@@ -831,24 +860,49 @@ void Renderer::updateCamera(CameraUniforms& cam, uint32_t w, uint32_t h) {
     cam.width = w;
     cam.height = h;
     cam.frame = frameIdx++;
+
+    // --- TemporalUniforms (prev-camera + jitter), written into tempBuffer for MTLFX ---
+    TemporalUniforms* tc = (TemporalUniforms*)[tempBuffer contents];
+    tc->prevOrigin[0]=prevCamPos.x; tc->prevOrigin[1]=prevCamPos.y; tc->prevOrigin[2]=prevCamPos.z;
+    tc->prevForward[0]=prevFwd.x; tc->prevForward[1]=prevFwd.y; tc->prevForward[2]=prevFwd.z;
+    tc->prevRight[0]=prevRight.x; tc->prevRight[1]=prevRight.y; tc->prevRight[2]=prevRight.z;
+    tc->prevUp[0]=prevUp.x; tc->prevUp[1]=prevUp.y; tc->prevUp[2]=prevUp.z;
+    // Halton(2,3) sub-pixel jitter in [-0.5,0.5] px so the temporal scaler accumulates
+    // sub-pixel-distinct samples each frame -> full-res reconstruction.
+    {
+        uint32_t i = cam.frame + 1;                 // skip index 0 (Halton[0] = 0)
+        float h2 = 0.0f, f = 0.5f; for (uint32_t k=i; k; k/=2) { h2 += f * (k & 1); f *= 0.5f; }
+        float h3 = 0.0f; f = 1.0f/3.0f; for (uint32_t k=i; k; k/=3) { h3 += f * (k % 3); f /= 3.0f; }
+        tc->jitterX = h2 - 0.5f;
+        tc->jitterY = h3 - 0.5f;
+        lastJitterX = tc->jitterX;
+        lastJitterY = tc->jitterY;
+    }
+
+    // Save THIS frame's basis to become next frame's `prev`.
+    prevCamPos = camPos; prevFwd = forward; prevRight = right; prevUp = up;
 }
 
-void Renderer::render(id<MTLTexture> target, uint32_t w, uint32_t h) {
+void Renderer::render(id<MTLTexture> target, id<MTLTexture> depth, id<MTLTexture> motion,
+                      uint32_t w, uint32_t h) {
     pollAsyncBuild();                  // swap in a finished back build before rendering
     CameraUniforms cam;
-    updateCamera(cam, w, h);
+    updateCamera(cam, w, h);           // also fills tempBuffer (prev-camera + jitter)
     memcpy([camBuffer contents], &cam, sizeof(cam));
 
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:tracePSO];
     [enc setTexture:target atIndex:0];
+    [enc setTexture:depth  atIndex:1];
+    [enc setTexture:motion atIndex:2];
     [enc setBuffer:camBuffer offset:0 atIndex:0];
     [enc setAccelerationStructure:accel atBufferIndex:1];
     [enc setBuffer:vertexBufferT offset:0 atIndex:2];     // terrain chunk verts (shared)
     [enc setBuffer:vertexBufferK offset:0 atIndex:3];     // track+train verts (last instance)
     [enc setBuffer:chunkVertOffBuf offset:0 atIndex:4];   // per-instance base offset in vertsT
     [enc setBuffer:trackInstBuf offset:0 atIndex:5];      // track instance id (= #chunks)
+    [enc setBuffer:tempBuffer offset:0 atIndex:6];        // TemporalUniforms (prev-cam + jitter)
     // the instance AS references the child prim-AS; make them all resident for the trace
     // in ONE batched call (instAS already lists chunks... + track, kept fresh by buildInstanceAS).
     if (!instAS.empty())
@@ -863,43 +917,54 @@ void Renderer::render(id<MTLTexture> target, uint32_t w, uint32_t h) {
 }
 
 // ---------------------------------------------------------------------------
-// Headless MetalFX spatial upscaler used by --shot / --bench so the verification
-// paths exercise the SAME low-res-trace -> MetalFX-upscale pipeline the window uses.
-// Renders the path tracer into a low-res (RT_SCALE x) texture, then upscales it into
-// a full-res output texture. If MetalFX is unavailable, `scaler` is nil and callers
-// fall back to tracing the full-res texture directly (so the bench/shot still run).
+// Headless MetalFX TEMPORAL scaler/denoiser used by --shot / --bench so the
+// verification paths exercise the SAME low-res-trace -> MetalFX-temporal pipeline the
+// window uses. Renders the path tracer into a low-res (RT_SCALE x) color+depth+motion
+// set, then the temporal scaler ACCUMULATES jittered samples across frames (with
+// motion-vector reprojection) into a full-res output -> denoised, not just upscaled.
+// If MetalFX is unavailable, `scaler` is nil and callers fall back to a direct full-res
+// trace (so the bench/shot still run).
 // ---------------------------------------------------------------------------
 struct FXUpscaler {
-    id<MTLFXSpatialScaler> scaler = nil;   // nil => unavailable
-    id<MTLTexture> low = nil;              // low-res trace target
-    id<MTLTexture> out = nil;             // full-res scaler output
+    id<MTLFXTemporalScaler> scaler = nil;  // nil => unavailable
+    id<MTLTexture> low = nil;              // low-res color trace target
+    id<MTLTexture> depth = nil;            // low-res depth (disocclusion)
+    id<MTLTexture> motion = nil;           // low-res motion vectors (RG16Float, input pixels)
+    id<MTLTexture> out = nil;              // full-res scaler output
     uint32_t inW = 0, inH = 0, outW = 0, outH = 0;
+    bool firstFrame = true;                // first frame after creation -> reset history
 
     // outStorage: the readback path (--shot) needs Shared so getBytes works; --bench
-    // can use Private. MetalFX is fine writing either.
+    // can use Private. The temporal scaler output must be Private, so --shot copies it
+    // out via a Shared staging texture if needed (see runShot).
     bool make(Renderer& r, uint32_t W, uint32_t H, MTLStorageMode outStorage) {
+        (void)outStorage;
         outW = W; outH = H;
-        // MetalFX spatial upscaling: trace at a lower internal res, upscale to the window.
-        // FULL-RES by default (sc=1.0): the user found MetalFX UPSCALING turned the fine path-
-        // trace grain into blocky noise ("screw upscaling"). Render native and claw fps back the
-        // OTHER way -- a CLOSER render horizon (TG_RING 500->380: fewer tris => faster rays AND
-        // smaller/faster chunk rebuilds => fewer hitches) + a moderate sample count. RT_SCALE env
-        // still forces upscaling for lower-end GPUs if ever needed.
-        float sc = 1.0f;
+        // Internal render scale: TEMPORAL reconstructs from accumulated real samples, so
+        // moderate upscaling stays CLEAN (unlike the old spatial upscaler that just
+        // sharpened noise). Default 0.75 = a healthy fps win at near-native sharpness.
+        float sc = 0.75f;
         if (const char* s = getenv("RT_SCALE")) { float v = atof(s); if (v > 0) sc = v; }
         if (sc < 0.4f) sc = 0.4f; if (sc > 1.0f) sc = 1.0f;
         inW = (uint32_t)(W * sc + 0.5f); if (inW < 16) inW = 16;
         inH = (uint32_t)(H * sc + 0.5f); if (inH < 16) inH = 16;
 
         const MTLPixelFormat fmt = MTLPixelFormatRGBA8Unorm;
-        MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
-        desc.colorTextureFormat = fmt; desc.outputTextureFormat = fmt;
+        const MTLPixelFormat dfmt = MTLPixelFormatR16Float;     // monotonic recon depth
+        const MTLPixelFormat mfmt = MTLPixelFormatRG16Float;    // motion (input pixels)
+        MTLFXTemporalScalerDescriptor* desc = [MTLFXTemporalScalerDescriptor new];
+        desc.colorTextureFormat  = fmt;
+        desc.depthTextureFormat  = dfmt;
+        desc.motionTextureFormat = mfmt;
+        desc.outputTextureFormat = fmt;
         desc.inputWidth = inW; desc.inputHeight = inH;
         desc.outputWidth = W;  desc.outputHeight = H;
-        desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
-        if ([MTLFXSpatialScalerDescriptor supportsDevice:r.device])
-            scaler = [desc newSpatialScalerWithDevice:r.device];
-        if (!scaler) { fprintf(stderr, "[MetalFX] unavailable (headless) -> tracing full-res directly\n"); return false; }
+        if ([MTLFXTemporalScalerDescriptor supportsDevice:r.device])
+            scaler = [desc newTemporalScalerWithDevice:r.device];
+        if (!scaler) { fprintf(stderr, "[MetalFX] temporal unavailable (headless) -> tracing full-res directly\n"); return false; }
+        scaler.motionVectorScaleX = 1.0f;          // motion stored in INPUT pixels
+        scaler.motionVectorScaleY = 1.0f;
+        scaler.depthReversed = YES;                 // depth: near=1 -> far=0 (see shader)
 
         MTLTextureUsage cu = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead | scaler.colorTextureUsage;
         MTLTextureDescriptor* ltd =
@@ -907,29 +972,63 @@ struct FXUpscaler {
         ltd.usage = cu; ltd.storageMode = MTLStorageModePrivate;
         low = [r.device newTextureWithDescriptor:ltd];
 
+        MTLTextureDescriptor* dtd =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dfmt width:inW height:inH mipmapped:NO];
+        dtd.usage = MTLTextureUsageShaderWrite | scaler.depthTextureUsage; dtd.storageMode = MTLStorageModePrivate;
+        depth = [r.device newTextureWithDescriptor:dtd];
+
+        MTLTextureDescriptor* mtd =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mfmt width:inW height:inH mipmapped:NO];
+        mtd.usage = MTLTextureUsageShaderWrite | scaler.motionTextureUsage; mtd.storageMode = MTLStorageModePrivate;
+        motion = [r.device newTextureWithDescriptor:mtd];
+
         MTLTextureDescriptor* otd =
             [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:W height:H mipmapped:NO];
         otd.usage = scaler.outputTextureUsage | MTLTextureUsageShaderRead;
-        otd.storageMode = outStorage;
+        otd.storageMode = MTLStorageModePrivate;    // temporal output must be Private
         out = [r.device newTextureWithDescriptor:otd];
-        fprintf(stderr, "[MetalFX] headless spatial scaler  internal %ux%u -> output %ux%u (RT_SCALE=%.2f)\n",
+        fprintf(stderr, "[MetalFX] headless TEMPORAL scaler  internal %ux%u -> output %ux%u (RT_SCALE=%.2f)\n",
                 inW, inH, W, H, (double)sc);
         return true;
     }
 
-    // Trace low-res then upscale into `out`. render() commits+waits; the upscale runs on
-    // a second command buffer we also wait on so `out` is ready for readback/timing.
+    // Trace low-res (color+depth+motion) then temporally upscale into `out`. render()
+    // commits+waits; the upscale runs on a second command buffer we also wait on so
+    // `out` is ready for readback/timing.
     void frame(Renderer& r) {
-        r.render(low, inW, inH);
+        r.render(low, depth, motion, inW, inH);
         id<MTLCommandBuffer> cb = [r.queue commandBuffer];
         scaler.colorTexture = low;
+        scaler.depthTexture = depth;
+        scaler.motionTexture = motion;
         scaler.inputContentWidth = inW; scaler.inputContentHeight = inH;
+        // The temporal scaler subtracts the jitter using jitterOffset; feed the SAME
+        // sub-pixel offset the trace kernel used (cam.frame was bumped inside render()).
+        scaler.jitterOffsetX = -r.lastJitterX;     // sign tuned for no smearing (see report)
+        scaler.jitterOffsetY = -r.lastJitterY;
+        scaler.reset = (firstFrame || r.camCut);   // drop history on creation / camera cut
         scaler.outputTexture = out;
         [scaler encodeToCommandBuffer:cb];
         [cb commit];
         [cb waitUntilCompleted];
+        firstFrame = false;
+        r.camCut = false;
     }
 };
+
+// Allocate throwaway depth+motion textures so the direct full-res fallback (MetalFX
+// unavailable) can still satisfy the trace kernel's three required textures.
+static void makeScratchAux(Renderer& r, uint32_t W, uint32_t H,
+                           id<MTLTexture>* depth, id<MTLTexture>* motion) {
+    MTLTextureDescriptor* dtd =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR16Float width:W height:H mipmapped:NO];
+    dtd.usage = MTLTextureUsageShaderWrite; dtd.storageMode = MTLStorageModePrivate;
+    *depth = [r.device newTextureWithDescriptor:dtd];
+    MTLTextureDescriptor* mtd =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float width:W height:H mipmapped:NO];
+    mtd.usage = MTLTextureUsageShaderWrite; mtd.storageMode = MTLStorageModePrivate;
+    *motion = [r.device newTextureWithDescriptor:mtd];
+}
 
 // ---------------------------------------------------------------------------
 // --shot: render one frame offscreen, read back, write out.png, exit.
@@ -1002,13 +1101,39 @@ static int runShot(Renderer& r) {
 
     r.forceSyncRebuild();   // tessellate + block-build at the final camera position
 
-    // Go through the SAME low-res-trace -> MetalFX-upscale path the window uses, so
-    // out.png verifies there's no upscaling corruption. Falls back to a direct full-res
-    // trace into `tex` if MetalFX isn't available.
+    // TEMPORAL verify: one --shot is a single frame, which would show NO temporal
+    // convergence and (worse) cannot reveal ghost trails. So render N CONSECUTIVE frames
+    // advancing the ride through the temporal scaler and save the FINAL frame. The final
+    // image must be CLEAN (grain converged) and GHOST-FREE behind the moving train.
+    // SHOT_FRAMES overrides N (default 90). SHOT_STILL=1 holds the camera still (pure
+    // convergence test, no motion vectors exercised).
+    int shotFrames = 90; if (const char* sf = getenv("SHOT_FRAMES")) { int v = atoi(sf); if (v > 0) shotFrames = v; }
+    bool shotStill = getenv("SHOT_STILL") != nullptr;
+
     FXUpscaler fx;
     id<MTLTexture> readTex = tex;
-    if (fx.make(r, W, H, MTLStorageModeShared)) { fx.frame(r); readTex = fx.out; }
-    else                                         { r.render(tex, W, H); }
+    if (fx.make(r, W, H, MTLStorageModePrivate)) {
+        for (int i = 0; i < shotFrames; i++) {
+            if (!shotStill) r.rideAdvance(1.0f / 60.0f);
+            fx.frame(r);
+        }
+        // Temporal output is Private; blit it to the Shared `tex` for getBytes readback.
+        id<MTLCommandBuffer> bcb = [r.queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [bcb blitCommandEncoder];
+        [blit copyFromTexture:fx.out sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0)
+                   sourceSize:MTLSizeMake(W, H, 1)
+                    toTexture:tex destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0,0,0)];
+        [blit endEncoding]; [bcb commit]; [bcb waitUntilCompleted];
+        readTex = tex;
+    } else {
+        // Direct full-res fallback (no MetalFX): still advance + trace N frames so the
+        // ride lands the same place; the final trace lands in the Shared `tex`.
+        id<MTLTexture> sd, sm; makeScratchAux(r, W, H, &sd, &sm);
+        for (int i = 0; i < shotFrames; i++) {
+            if (!shotStill) r.rideAdvance(1.0f / 60.0f);
+            r.render(tex, sd, sm, W, H);
+        }
+    }
 
     std::vector<uint8_t> pixels(W * H * 4);
     [readTex getBytes:pixels.data()
@@ -1020,7 +1145,8 @@ static int runShot(Renderer& r) {
         fprintf(stderr, "failed to write out.png\n");
         return 1;
     }
-    fprintf(stderr, "wrote out.png (%ux%u)\n", W, H);
+    fprintf(stderr, "wrote out.png (%ux%u) — final of %d temporal frames%s\n",
+            W, H, shotFrames, shotStill ? " (still)" : " (moving ride)");
     return 0;
 }
 
@@ -1050,7 +1176,9 @@ static int runBench(Renderer& r) {
     // trace into `tex` instead, for a clean before/after comparison.
     FXUpscaler fx;
     bool useFX = !getenv("BENCH_NOFX") && fx.make(r, W, H, MTLStorageModePrivate);
-    auto renderFrame = [&]() { if (useFX) fx.frame(r); else r.render(tex, W, H); };
+    id<MTLTexture> benchDepth = nil, benchMotion = nil;
+    if (!useFX) makeScratchAux(r, W, H, &benchDepth, &benchMotion);
+    auto renderFrame = [&]() { if (useFX) fx.frame(r); else r.render(tex, benchDepth, benchMotion, W, H); };
     // Warm-up: the GPU's clock (DVFS) takes ~60 frames to ramp from idle to full; if
     // the timed window starts before that, the first frames read 12-18ms purely from
     // the cold clock and pollute over120/p95. 72 warm-up frames let the clock fully
@@ -1109,6 +1237,7 @@ static int runBench(Renderer& r) {
         Renderer* r = self.renderer;
         r->rideMode = !r->rideMode;
         r->useExplicitFrame = false;     // free-fly resumes from current pos/orientation
+        r->camCut = true;                // viewpoint jumps -> reset temporal history (no ghost trail)
     }
     if (c == ' ') {                      // SPACE: boost / launch
         Renderer* r = self.renderer;
@@ -1116,8 +1245,10 @@ static int runBench(Renderer& r) {
         r->boostHeld = true;
     }
     if (c == 's' && self.renderer->rideMode) self.renderer->brakeHeld = true;  // S: brake (held)
-    if (c == 'c' && self.renderer->rideMode)                                   // C: cycle camera
+    if (c == 'c' && self.renderer->rideMode) {                                 // C: cycle camera
         self.renderer->camMode = (self.renderer->camMode + 1) % 3;
+        self.renderer->camCut = true;     // camera jumps to a new vantage -> reset temporal history
+    }
 }
 - (void)keyUp:(NSEvent*)e {
     unichar c = [[e charactersIgnoringModifiers] characterAtIndex:0];
@@ -1355,20 +1486,25 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
 @property (nonatomic) RideAudio*   audio;     // procedural ride audio
 @property (nonatomic) BOOL         started;    // true once a mode is chosen + scene built
 
-// --- MetalFX spatial upscaling ---------------------------------------------
-// The path tracer renders into a LOW-res color texture (RT_SCALE x the output);
-// a MetalFX spatial scaler upscales it into a full-res texture; that is blitted
-// to the drawable and presented. This is a big fps win at near-native sharpness
-// vs. path-tracing the full drawable. Falls back to a bilinear-ish blit of the
-// low-res texture if MetalFX is unavailable on the GPU/SDK.
-@property (nonatomic) id<MTLFXSpatialScaler> fxScaler;   // nil => fallback path
-@property (nonatomic) id<MTLTexture> fxLowResTex;        // path tracer target (low res)
+// --- MetalFX TEMPORAL scaling / denoising ----------------------------------
+// The path tracer renders into a LOW-res color+depth+motion set (RT_SCALE x the
+// output); a MetalFX TEMPORAL scaler ACCUMULATES jittered samples across frames (with
+// motion-vector reprojection) into a full-res texture; that is blitted to the drawable
+// and presented. Unlike the old SPATIAL scaler (which just sharpened the Monte-Carlo
+// noise), the temporal scaler actually DENOISES — it averages the per-frame-varying
+// samples over time. Falls back to a bilinear-ish blit of the low-res color texture if
+// MetalFX is unavailable on the GPU/SDK.
+@property (nonatomic) id<MTLFXTemporalScaler> fxScaler;  // nil => fallback path
+@property (nonatomic) id<MTLTexture> fxLowResTex;        // path tracer color target (low res)
+@property (nonatomic) id<MTLTexture> fxDepthTex;         // path tracer depth (low res)
+@property (nonatomic) id<MTLTexture> fxMotionTex;        // path tracer motion vectors (low res)
 @property (nonatomic) id<MTLTexture> fxOutTex;           // scaler output (full res, private)
 @property (nonatomic) uint32_t fxOutW;                   // output (drawable) size the scaler is built for
 @property (nonatomic) uint32_t fxOutH;
 @property (nonatomic) uint32_t fxInW;                    // low-res input size
 @property (nonatomic) uint32_t fxInH;
 @property (nonatomic) BOOL fxUnavailable;                // MetalFX won't create -> fallback blit
+@property (nonatomic) BOOL fxFirstFrame;                 // first frame after (re)create -> reset history
 - (void)startMode:(GameMode)m;                 // build the chosen scene + dismiss the menu
 // (Re)create the MetalFX scaler + textures for the given output (drawable) size.
 - (void)ensureFXForOutputW:(uint32_t)outW H:(uint32_t)outH;
@@ -1486,40 +1622,47 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
     if (self.fxUnavailable) return;                 // already gave up: stay on fallback
     if (self.fxScaler && self.fxOutW == outW && self.fxOutH == outH) return;  // up to date
 
-    // Internal render scale: 0.6 default, clamp to a sane 0.4..1.0.
-    float sc = 0.6f;
+    // Internal render scale: TEMPORAL reconstructs detail from accumulated real samples,
+    // so moderate upscaling stays clean. 0.75 default, clamp to a sane 0.4..1.0.
+    float sc = 0.75f;
     if (const char* s = getenv("RT_SCALE")) { float v = atof(s); if (v > 0) sc = v; }
     if (sc < 0.4f) sc = 0.4f; if (sc > 1.0f) sc = 1.0f;
     uint32_t inW = (uint32_t)(outW * sc + 0.5f); if (inW < 16) inW = 16;
     uint32_t inH = (uint32_t)(outH * sc + 0.5f); if (inH < 16) inH = 16;
 
-    const MTLPixelFormat fmt = MTLPixelFormatRGBA8Unorm;   // matches the drawable + trace kernel
+    const MTLPixelFormat fmt  = MTLPixelFormatRGBA8Unorm;   // matches the drawable + trace kernel
+    const MTLPixelFormat dfmt = MTLPixelFormatR16Float;     // monotonic recon depth
+    const MTLPixelFormat mfmt = MTLPixelFormatRG16Float;    // motion vectors (input pixels)
 
-    MTLFXSpatialScalerDescriptor* desc = [MTLFXSpatialScalerDescriptor new];
+    MTLFXTemporalScalerDescriptor* desc = [MTLFXTemporalScalerDescriptor new];
     desc.colorTextureFormat  = fmt;
+    desc.depthTextureFormat  = dfmt;
+    desc.motionTextureFormat = mfmt;
     desc.outputTextureFormat = fmt;
     desc.inputWidth   = inW;  desc.inputHeight  = inH;
     desc.outputWidth  = outW; desc.outputHeight = outH;
-    // Trace kernel writes already-tonemapped LDR display values (perceptual/sRGB-ish).
-    desc.colorProcessingMode = MTLFXSpatialScalerColorProcessingModePerceptual;
 
-    id<MTLFXSpatialScaler> scaler = nil;
-    if ([MTLFXSpatialScalerDescriptor supportsDevice:self.renderer->device])
-        scaler = [desc newSpatialScalerWithDevice:self.renderer->device];
+    id<MTLFXTemporalScaler> scaler = nil;
+    if ([MTLFXTemporalScalerDescriptor supportsDevice:self.renderer->device])
+        scaler = [desc newTemporalScalerWithDevice:self.renderer->device];
     if (!scaler) {
         if (!self.fxScaler) {   // only warn once, on first creation
-            fprintf(stderr, "[MetalFX] spatial scaler unavailable -> falling back to "
-                            "low-res render + blit (still an fps win)\n");
+            fprintf(stderr, "[MetalFX] temporal scaler unavailable -> falling back to "
+                            "low-res render + blit (still an fps win, no denoise)\n");
         }
         self.fxUnavailable = YES;
         self.fxScaler = nil;
         // keep fxLowResTex (re)created below so the fallback blit still upscales.
     } else {
+        scaler.motionVectorScaleX = 1.0f;           // motion stored in INPUT pixels
+        scaler.motionVectorScaleY = 1.0f;
+        scaler.depthReversed = YES;                 // depth: near=1 -> far=0 (see shader)
         self.fxScaler = scaler;
     }
+    self.fxFirstFrame = YES;                         // (re)created -> reset history next frame
 
-    // Low-res input texture: path tracer writes it (shaderWrite/read) AND MetalFX reads
-    // it (colorTextureUsage). When falling back it is the blit source.
+    // Low-res color input: path tracer writes it (shaderWrite/read) AND MetalFX reads it
+    // (colorTextureUsage). When falling back it is the blit source.
     MTLTextureUsage colorUsage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
     if (self.fxScaler) colorUsage |= self.fxScaler.colorTextureUsage;
     MTLTextureDescriptor* ltd =
@@ -1530,6 +1673,19 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
     self.fxLowResTex = [self.renderer->device newTextureWithDescriptor:ltd];
 
     if (self.fxScaler) {
+        // Depth + motion auxiliary inputs (path tracer writes them; scaler reads them).
+        MTLTextureDescriptor* dtd =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dfmt width:inW height:inH mipmapped:NO];
+        dtd.usage = MTLTextureUsageShaderWrite | self.fxScaler.depthTextureUsage;
+        dtd.storageMode = MTLStorageModePrivate;
+        self.fxDepthTex = [self.renderer->device newTextureWithDescriptor:dtd];
+
+        MTLTextureDescriptor* mtd =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mfmt width:inW height:inH mipmapped:NO];
+        mtd.usage = MTLTextureUsageShaderWrite | self.fxScaler.motionTextureUsage;
+        mtd.storageMode = MTLStorageModePrivate;
+        self.fxMotionTex = [self.renderer->device newTextureWithDescriptor:mtd];
+
         // Full-res scaler output: MetalFX writes it (outputTextureUsage, private), we
         // blit it to the drawable. Must be private storage per the API contract.
         MTLTextureDescriptor* otd =
@@ -1539,13 +1695,23 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
         otd.storageMode = MTLStorageModePrivate;
         self.fxOutTex = [self.renderer->device newTextureWithDescriptor:otd];
     } else {
+        // Fallback path: still need scratch depth/motion so the trace kernel's three
+        // required textures are satisfied (the scaler is gone but the kernel writes them).
+        MTLTextureDescriptor* dtd =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:dfmt width:inW height:inH mipmapped:NO];
+        dtd.usage = MTLTextureUsageShaderWrite; dtd.storageMode = MTLStorageModePrivate;
+        self.fxDepthTex = [self.renderer->device newTextureWithDescriptor:dtd];
+        MTLTextureDescriptor* mtd =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:mfmt width:inW height:inH mipmapped:NO];
+        mtd.usage = MTLTextureUsageShaderWrite; mtd.storageMode = MTLStorageModePrivate;
+        self.fxMotionTex = [self.renderer->device newTextureWithDescriptor:mtd];
         self.fxOutTex = nil;
     }
 
     self.fxOutW = outW; self.fxOutH = outH;
     self.fxInW  = inW;  self.fxInH  = inH;
     fprintf(stderr, "[MetalFX] %s  internal %ux%u -> output %ux%u (RT_SCALE=%.2f)\n",
-            self.fxScaler ? "spatial scaler" : "FALLBACK blit", inW, inH, outW, outH, (double)sc);
+            self.fxScaler ? "TEMPORAL scaler" : "FALLBACK blit", inW, inH, outW, outH, (double)sc);
 }
 
 - (void)frame:(NSTimer*)t {
@@ -1602,17 +1768,28 @@ static void drawHUD(CGContextRef c, Renderer* r, CGFloat W, CGFloat H) {
     // HUD overlay redraws from the live ride state each frame (drawRect reads r).
     [self.hud setNeedsDisplay:YES];
 
-    // 1) Path-trace into the LOW-res color texture (render() commits + waits internally).
-    self.renderer->render(self.fxLowResTex, self.fxInW, self.fxInH);
+    // 1) Path-trace into the LOW-res color+depth+motion textures (render() commits +
+    //    waits internally; it also advances cam.frame -> the jitter the scaler subtracts).
+    self.renderer->render(self.fxLowResTex, self.fxDepthTex, self.fxMotionTex,
+                          self.fxInW, self.fxInH);
 
-    // 2) Upscale + present. With MetalFX: scale low-res -> full-res output, blit to the
-    //    drawable, present. Fallback: the low-res render IS the drawable (the compositor
-    //    upscales it), so just present.
+    // 2) Temporal upscale/denoise + present. With MetalFX: accumulate jittered samples
+    //    (motion-reprojected) low-res -> full-res output, blit to the drawable, present.
+    //    Fallback: the low-res render IS the drawable (the compositor upscales it).
     id<MTLCommandBuffer> present = [self.renderer->queue commandBuffer];
     if (self.fxScaler) {
-        self.fxScaler.colorTexture = self.fxLowResTex;
+        self.fxScaler.colorTexture  = self.fxLowResTex;
+        self.fxScaler.depthTexture  = self.fxDepthTex;
+        self.fxScaler.motionTexture = self.fxMotionTex;
         self.fxScaler.inputContentWidth  = self.fxInW;
         self.fxScaler.inputContentHeight = self.fxInH;
+        self.fxScaler.jitterOffsetX = -r->lastJitterX;   // same offset the trace used (sign tuned)
+        self.fxScaler.jitterOffsetY = -r->lastJitterY;
+        // Reset history on the first frame after (re)creation AND on a camera cut (ride
+        // loop / teleport) so a cut doesn't drag a ghost trail of the previous vantage.
+        self.fxScaler.reset = (self.fxFirstFrame || r->camCut);
+        self.fxFirstFrame = NO;
+        r->camCut = NO;
         self.fxScaler.outputTexture = self.fxOutTex;
         [self.fxScaler encodeToCommandBuffer:present];
         id<MTLBlitCommandEncoder> blit = [present blitCommandEncoder];

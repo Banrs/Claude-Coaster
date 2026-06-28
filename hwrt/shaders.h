@@ -18,7 +18,20 @@ struct CameraUniforms {
     float  aspect;
     uint   width;
     uint   height;
-    uint   frame;       // animates cloud drift / sampling
+    uint   frame;       // animates cloud drift / sampling AND varies the MC sample set per frame (temporal accumulation averages the noise down)
+};
+
+// MTLFXTemporalScaler support, passed as a SEPARATE buffer so the shared CameraUniforms
+// layout (mirrored in math.h) stays untouched. Holds the PREVIOUS frame's camera basis
+// (for motion-vector reprojection) + this frame's sub-pixel jitter. The host mirror of
+// this struct lives in main.mm (TemporalUniforms) and must keep the same layout.
+struct TemporalUniforms {
+    float3 prevOrigin;
+    float3 prevForward;
+    float3 prevRight;
+    float3 prevUp;
+    float  jitterX;     // sub-pixel primary-ray jitter (pixels, [-0.5,0.5]) for temporal AA
+    float  jitterY;
 };
 
 // ===========================================================================
@@ -490,19 +503,40 @@ static float3 shadeSurface(float3 pos, float3 n, float3 albedo, int mat, int til
     return diff + spec + amb;
 }
 
+// Reproject a world position P into camera C's screen pixel. Returns (pixelX, pixelY)
+// in C's INPUT resolution; sets `behind` when P is behind C (no valid motion).
+static float2 reproject(float3 P, float3 origin, float3 forward, float3 right, float3 up,
+                        float tanHalfFov, float aspect, float w, float h, thread bool& behind) {
+    float3 d = P - origin;
+    float fc = dot(d, forward);
+    behind = (fc <= 1e-4);
+    float rc = dot(d, right);
+    float uc = dot(d, up);
+    float uvx = rc / (fc * tanHalfFov * aspect);
+    float uvy = uc / (fc * tanHalfFov);
+    float ndcx = (uvx + 1.0) * 0.5;
+    float ndcy = (1.0 - uvy) * 0.5;            // undo the uv.y=-uv.y of the primary ray
+    return float2(ndcx * w, ndcy * h);
+}
+
 kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
+                        texture2d<float, access::write> depthOut [[texture(1)]],
+                        texture2d<float, access::write> motionOut [[texture(2)]],
                         constant CameraUniforms& cam [[buffer(0)]],
                         instance_acceleration_structure accel [[buffer(1)]],
                         device const Vertex* vertsT [[buffer(2)]],   // terrain chunks (shared)
                         device const Vertex* vertsK [[buffer(3)]],   // track+train (last instance)
                         device const uint*   vertOff [[buffer(4)]],  // per-instance base offset in vertsT
                         constant uint&       trackInst [[buffer(5)]],// instance id of the track
+                        constant TemporalUniforms& tcam [[buffer(6)]],// prev-camera + jitter (MTLFX temporal)
                         uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= cam.width || gid.y >= cam.height) return;
 
-    float2 ndc = float2((float(gid.x) + 0.5) / float(cam.width),
-                        (float(gid.y) + 0.5) / float(cam.height));
+    // Sub-pixel jitter for the temporal scaler: each frame samples a different point
+    // inside the pixel (Halton on the host) so MetalFX reconstructs full-res detail.
+    float2 ndc = float2((float(gid.x) + 0.5 + tcam.jitterX) / float(cam.width),
+                        (float(gid.y) + 0.5 + tcam.jitterY) / float(cam.height));
     float2 uv = ndc * 2.0 - 1.0;
     uv.y = -uv.y;
     float3 dir = normalize(cam.forward
@@ -510,10 +544,11 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
                            + cam.up    * (uv.y * cam.tanHalfFov));
 
     float t = float(cam.frame);
-    // Frame-INDEPENDENT per-pixel seed: the Monte-Carlo dither is fixed in screen
-    // space instead of being reseeded every frame, so shadows/AO don't crawl
-    // (that temporal shimmer read as the whole scene "moving").
-    float rng = hash12(float2(gid)) + 0.0001;
+    // Per-FRAME varying per-pixel seed: temporal accumulation needs each frame to draw
+    // a DIFFERENT Monte-Carlo sample set so the scaler averages the grain down over
+    // frames (a frame-frozen seed would just re-show the same noise forever). Folding
+    // cam.frame in decorrelates frames; the temporal reproject re-aligns the history.
+    float rng = fract(hash12(float2(gid)) + float(cam.frame) * 0.6180339887) + 0.0001;
 
     ray r;
     r.origin = cam.origin;
@@ -530,18 +565,17 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
         color = sampleSky(cam.origin, dir, L, t);
     } else {
         float3 n = hit.n;
-        // FREEZE the stochastic shadow/AO/GI noise to the WORLD SURFACE: seed the RNG from the
-        // world hit position (not the screen pixel). The same surface point then draws the same
-        // sample directions every frame, so as the camera RIDES past, the grain sticks to the
-        // ground like a texture instead of shimmering/crawling across the screen -- this is the
-        // bulk of the perceived "so much grain" in motion (a still screenshot hides it). The
-        // *4.0 scale decorrelates neighbouring points so it still reads as fine grain.
-        rng = hash13(hit.pos * 4.0) + 0.0001;
+        // Temporal denoise needs the samples to VARY per frame so MTLFXTemporalScaler can
+        // accumulate jittered samples across frames and average the Monte-Carlo grain down.
+        // (The old world-frozen seed `hash13(hit.pos*4.0)` froze the same noise every frame,
+        // which the temporal scaler cannot reduce.) Decorrelate by world pos AND frame so each
+        // frame draws a fresh sample set that history accumulation then cleans up.
+        rng = fract(hash13(hit.pos * 4.0) + float(cam.frame) * 0.6180339887) + 0.0001;
         color = shadeSurface(hit.pos, n, hit.albedo, hit.mat, hit.tile, L, V, rng, accel, 2);
 
         // --- Ray-traced AO + one GI bounce (shared cosine-hemisphere samples) ---
         float3 tt, bb; basis(n, tt, bb);
-        const int AO_SAMPLES = 48;                  // 48: AO/GI Monte-Carlo loop is the dominant noise source AND the fps-dominant loop. At FULL-RES (no upscale) the grain is per-pixel/finer, so fewer samples read cleaner than 64-at-0.66-upscaled; 48 + the closer horizon holds >=60fps native.
+        const int AO_SAMPLES = 32;                  // 32: the MTLFXTemporalScaler ACCUMULATES per-frame-varying samples across frames, so the image converges cleaner over time AND each frame is cheap. 32 (vs the old 48 single-pass) keeps per-frame noise low enough that FAST motion converges quickly while leaving fps headroom; the surplus over the 60-120 target buys cleaner motion, not idle fps.
         float aoSum = 0.0;
         float3 giSum = float3(0.0);
         // GI/reflection bleed tint: linearized to match the linear-space radiance the
@@ -678,5 +712,26 @@ kernel void traceKernel(texture2d<float, access::write> out [[texture(0)]],
     color = clamp(mix(color, color * color * (3.0 - 2.0 * color), 0.12), 0.0, 1.0);
     color = pow(color, float3(1.0/2.2));
     out.write(float4(color, 1.0), gid);
+
+    // --- Temporal scaler auxiliary buffers: depth + motion vectors --------------
+    // DEPTH: monotonic near=1 -> far~0 reconstruction depth for disocclusion. The host
+    // sets scaler.isDepthReversed = YES to match this (0 = farthest). Sky writes far (0).
+    // MOTION: where did THIS pixel's surface sit in the PREVIOUS frame? Reproject the
+    // world hit position through the previous camera basis and store
+    // motion = prevPixel - curPixel (input pixels; motionVectorScale = 1.0). Per the
+    // MTLFX header, that vector points to the pixel's location in the previous frame.
+    if (hit.valid) {
+        depthOut.write(float4(saturate(1.0 / (1.0 + hit.dist * 0.02)), 0, 0, 0), gid);
+        bool behind = false;
+        float2 prevPix = reproject(hit.pos, tcam.prevOrigin, tcam.prevForward,
+                                   tcam.prevRight, tcam.prevUp, cam.tanHalfFov, cam.aspect,
+                                   float(cam.width), float(cam.height), behind);
+        float2 curPix = float2(gid) + 0.5;          // un-jittered pixel centre
+        float2 motion = behind ? float2(0.0) : (prevPix - curPix);
+        motionOut.write(float4(motion, 0.0, 0.0), gid);
+    } else {
+        depthOut.write(float4(0.0), gid);           // sky: far depth
+        motionOut.write(float4(0.0), gid);          // sky: no motion (history follows the static sky reasonably)
+    }
 }
 )METAL";
