@@ -65,6 +65,7 @@ struct Renderer {
     id<MTLComputePipelineState> tracePSO;
     id<MTLBuffer> camBuffer;
     id<MTLBuffer> tempBuffer;         // TemporalUniforms (prev-camera + jitter for MTLFX temporal)
+    id<MTLTexture> atlasTex;          // baked 16x16 block atlas (mipmapped texture2d_array, port of makeAtlas)
 
     // --- Chunked instance AS (INCREMENTAL terrain) ---
     // The static terrain is a grid of fixed CHUNK-sized voxel chunks, each its OWN
@@ -210,6 +211,99 @@ static id<MTLComputePipelineState> makePSO(id<MTLDevice> dev, const char* fn) {
     return pso;
 }
 
+// Bake the software game's 16x16 block tiles (src/main.cpp makeAtlas) into a MIPMAPPED
+// texture2d_array — one slice per RT tile class (terrain.h TileClass order). Sampled in
+// the kernel as a mean-1 brightness MULTIPLIER (encoded /2). This is the literal port the
+// procedural in-shader pattern replaced: every block of a type is now IDENTICAL (no more
+// per-block random "two-tone grain"), and real mipmaps average distant blocks to a flat
+// colour (no texel sparkle). One slice per tile keeps mips from bleeding across tiles.
+static id<MTLTexture> buildBlockAtlas(id<MTLDevice> dev, id<MTLCommandQueue> q) {
+    const int TW = 16, SLICES = 8, MIPS = 5;   // 16->8->4->2->1
+    // hashf + wrapped value noise ported verbatim from src/main.cpp (makeAtlas).
+    auto hashf = [](int x, int z) -> float {
+        uint32_t h = (uint32_t)x * 374761393u + (uint32_t)z * 668265263u;
+        h = (h ^ (h >> 13)) * 1274126177u; h ^= h >> 16;
+        return (h & 0xffffff) / 16777215.0f;
+    };
+    auto tnoise = [&](int seed, float fx, float fy, float fr) -> float {
+        float gx = fx*fr, gy = fy*fr;
+        int x0 = (int)floorf(gx), y0 = (int)floorf(gy);
+        float sx = gx-x0, sy = gy-y0; sx = sx*sx*(3-2*sx); sy = sy*sy*(3-2*sy);
+        int fri = (int)fr;
+        int xa = ((x0%fri)+fri)%fri, xb = (xa+1)%fri;
+        int ya = ((y0%fri)+fri)%fri, yb = (ya+1)%fri;
+        float a = hashf(seed*97+xa, ya), b = hashf(seed*97+xb, ya);
+        float c = hashf(seed*97+xa, yb), d = hashf(seed*97+xb, yb);
+        return a + (b-a)*sx + (c-a)*sy + (a-b-c+d)*sx*sy;
+    };
+    // Grayscale luminance v/255 for RT tile class `tile` at texel (x,y).
+    // 0 GRASS,1 DIRT,2 SAND,3 ROCK,4 SNOW,5 LEAF,6 WOOD,7 WATER(flat).
+    auto lum = [&](int tile, int x, int y) -> float {
+        float fx = x/16.0f, fy = y/16.0f;
+        float r1 = hashf(tile*131+x, y*3+1);
+        float r2 = hashf(tile*131+(x/2)*2, ((y/2)*2)*3+1);
+        float v = 210.0f;
+        if (tile == 0) {                       // GRASS (T_GRASS): clumps + upright blades + tips
+            float clump = tnoise(2, fx, fy, 4.0f); v = 198 + 46*clump;
+            float blade = hashf(x*7+13, (y/3)*5);
+            if (blade > 0.82f) v += 22 + 16*r1; else if (r1 < 0.22f) v -= 30;
+            if (y > 11 && r1 < 0.40f) v -= 12;
+        } else if (tile == 5) {                // LEAF (T_LEAF): clumpy foliage with dark gaps
+            float clump = tnoise(11, fx, fy, 4.0f), fine = tnoise(12, fx, fy, 16.0f);
+            v = 196 + 54*clump + 18*fine;
+            if (clump < 0.30f) v -= 36; else if (clump > 0.82f) v += 14;
+        } else if (tile == 6) {                // WOOD (T_LOG): vertical bark fibre + knot
+            float bark = tnoise(4, fx, fy*0.4f, 8.0f); v = 190 + 54*bark + 12*r1 - 6;
+            float kx = fx-0.62f, ky = fy-0.34f; if (kx*kx+ky*ky < 0.010f) v -= 40;
+        } else if (tile == 7) {                // WATER: flat (water returns early in the shader)
+            v = 255;
+        } else {                               // GRAIN family (T_GRAIN) — per-material contrast
+            float con = (tile==3) ? 1.35f : (tile==2) ? 0.55f : (tile==4) ? 0.35f : 1.0f;
+            float grain = tnoise(1, fx, fy, 8.0f), fine = tnoise(51, fx, fy, 16.0f);
+            float base = 210 + 40*grain + 14*fine - 7;
+            if (r2 < 0.16f) base -= 34; else if (r1 > 0.93f) base += 14;
+            float crack = fabsf((fx + 0.18f*sinf(fy*9.0f)) - 0.5f);
+            if (tile != 2 && crack < 0.045f && fine > 0.35f) base -= 26;   // no crack on smooth sand
+            v = 210 + (base - 210)*con;        // contrast around the neutral grey
+            if (tile == 4) v += 24;            // snow: brighter base
+        }
+        return (v < 0 ? 0 : (v > 255 ? 255 : v)) / 255.0f;
+    };
+
+    MTLTextureDescriptor* td = [[MTLTextureDescriptor alloc] init];
+    td.textureType = MTLTextureType2DArray;
+    td.pixelFormat = MTLPixelFormatRGBA8Unorm;
+    td.width = TW; td.height = TW; td.arrayLength = SLICES;
+    td.mipmapLevelCount = MIPS;
+    td.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> tex = [dev newTextureWithDescriptor:td];
+
+    for (int s = 0; s < SLICES; s++) {
+        // mean-1 normalize the slice so the multiply preserves the tuned average albedo
+        // (and the coarsest mip -> flat 1.0). Encode mult/2 into the byte; shader x2.
+        float mean = 0.0f;
+        for (int y = 0; y < TW; y++) for (int x = 0; x < TW; x++) mean += lum(s, x, y);
+        mean /= (float)(TW*TW);
+        if (mean < 1e-4f) mean = 1.0f;
+        uint8_t buf[16*16*4];
+        for (int y = 0; y < TW; y++) for (int x = 0; x < TW; x++) {
+            float mult = lum(s, x, y) / mean;          // mean ~1.0
+            float enc  = mult * 0.5f;                   // /2 to fit [0,1] (mult up to ~1.5)
+            uint8_t b  = (uint8_t)(enc < 0 ? 0 : (enc > 1 ? 255 : enc*255.0f + 0.5f));
+            int i = (y*TW + x)*4; buf[i]=b; buf[i+1]=b; buf[i+2]=b; buf[i+3]=255;
+        }
+        [tex replaceRegion:MTLRegionMake2D(0,0,TW,TW) mipmapLevel:0 slice:s
+                 withBytes:buf bytesPerRow:TW*4 bytesPerImage:TW*TW*4];
+    }
+    // GPU-generate the mip chain (trilinear minification = the anti-grain at distance).
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit generateMipmapsForTexture:tex];
+    [blit endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+    return tex;
+}
+
 void Renderer::init() {
     device = MTLCreateSystemDefaultDevice();
     if (!device) { fprintf(stderr, "no Metal device\n"); exit(1); }
@@ -233,6 +327,7 @@ void Renderer::init() {
                                     options:MTLResourceStorageModeShared];
     tempBuffer = [device newBufferWithLength:sizeof(TemporalUniforms)
                                      options:MTLResourceStorageModeShared];
+    atlasTex = buildBlockAtlas(device, queue);   // baked 16x16 block tiles (mipmapped)
     // Lower, raking afternoon sun: long hardware ray-traced shadows of the track,
     // supports and trees stretch dramatically across the terrain (leaning into the RT
     // advantage the user asked for — clearly stronger shadows than the software raster).
@@ -896,6 +991,7 @@ void Renderer::render(id<MTLTexture> target, id<MTLTexture> depth, id<MTLTexture
     [enc setTexture:target atIndex:0];
     [enc setTexture:depth  atIndex:1];
     [enc setTexture:motion atIndex:2];
+    [enc setTexture:atlasTex atIndex:3];     // baked block atlas (mipmapped texture2d_array)
     [enc setBuffer:camBuffer offset:0 atIndex:0];
     [enc setAccelerationStructure:accel atBufferIndex:1];
     [enc setBuffer:vertexBufferT offset:0 atIndex:2];     // terrain chunk verts (shared)
