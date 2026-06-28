@@ -159,7 +159,7 @@ struct Track {
         lf     = headingVec();
         lside  = Vector3Normalize(Vector3CrossProduct(WUP, lf));
         lcenter = { gpos.x, gpos.y + lR, gpos.z };
-        ltheta = 0; lsteps = irnd(26, 32);
+        ltheta = 0; lsteps = irnd(40, 48);
         ldrift = lR * frnd(0.9f, 1.4f);
         llat   = lR * frnd(0.6f, 1.2f) * (rnd01() < 0.5f ? -1.0f : 1.0f);
         remain = lsteps;
@@ -171,7 +171,7 @@ struct Track {
         lf      = headingVec();
         lside   = Vector3Normalize(Vector3CrossProduct(WUP, lf));
         lcenter = { gpos.x, gpos.y + lR, gpos.z };
-        ltheta  = 0; lsteps = 30;
+        ltheta  = 0; lsteps = 44;
         immelDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
         remain  = lsteps / 2 + 3;
     }
@@ -191,7 +191,7 @@ struct Track {
         rtheta   = 0; rfwd = 0; rfwdStep = SEG_LEN * stretch * 0.5f;
 
         {
-            const float GCAP = 8.8f;
+            const float GCAP = 6.0f;
             float v = fmaxf(genV, 30.0f);
             float rBase = rR, stepBase = rfwdStep;
             for (int it = 0; it < 10; it++) {
@@ -240,8 +240,8 @@ struct Track {
         dlf      = headingVec();
         dlside   = Vector3Normalize(Vector3CrossProduct(WUP, dlf));
         dlcenter = { gpos.x, gpos.y + dlR, gpos.z };
-        dltheta  = 0; dlsteps = irnd(26, 30);
-        dlturn   = (rnd01() < 0.5f ? 1.0f : -1.0f) * frnd(1.2f, 1.7f);
+        dltheta  = 0; dlsteps = irnd(40, 46);
+        dlturn   = (rnd01() < 0.5f ? 1.0f : -1.0f) * frnd(0.8f, 1.2f);
         remain   = dlsteps;
     }
 
@@ -274,8 +274,8 @@ struct Track {
         cbSide  = Vector3Scale(Vector3Normalize(Vector3CrossProduct(WUP, cbF)), side);
         cbBase  = gpos;
 
-        const float GCAP = 7.5f;
-        const float CBR_MAX = 27.5f;
+        const float GCAP = 5.5f;
+        const float CBR_MAX = 34.0f;
         cbR = fminf(cbR, CBR_MAX);
 
         float v = fmaxf(genV, 30.0f) * 1.12f;
@@ -287,7 +287,7 @@ struct Track {
             dl[0] = 0.0f;
             for (int k = 1; k <= DENSE; k++) dl[k] = dl[k-1] + Vector3Distance(dp[k], dp[k-1]);
             total = dl[DENSE];
-            cbSteps = Clamp((int)(total / 4.0f), 28, 80);
+            cbSteps = Clamp((int)(total / 3.0f), 28, 110);
             cbPts.clear(); cbUps.clear();
             int j = 0;
             for (int i = 0; i < cbSteps; i++) {
@@ -300,14 +300,20 @@ struct Track {
             }
 
             float kmax = 0.0f;
-            for (int k = 1; k < (int)cbPts.size() - 1; k++) {
-                Vector3 a = Vector3Subtract(cbPts[k], cbPts[k-1]);
-                Vector3 b = Vector3Subtract(cbPts[k+1], cbPts[k]);
-                float la = Vector3Length(a), lb = Vector3Length(b);
-                if (la < 1e-4f || lb < 1e-4f) continue;
-                float kk = Vector3Length(Vector3Subtract(Vector3Scale(b, 1.0f/lb),
-                                                         Vector3Scale(a, 1.0f/la))) / (0.5f*(la+lb));
-                if (kk > kmax) kmax = kk;
+            int np = (int)cbPts.size();
+            for (int k = 1; k < np - 2; k++) {
+                Vector3 p0 = cbPts[k-1], p1 = cbPts[k], p2 = cbPts[k+1], p3 = cbPts[k+2];
+                for (float t = 0.2f; t <= 0.81f; t += 0.3f) {
+                    Vector3 c0 = catmull(p0,p1,p2,p3, t-0.06f);
+                    Vector3 c1 = catmull(p0,p1,p2,p3, t);
+                    Vector3 c2 = catmull(p0,p1,p2,p3, t+0.06f);
+                    Vector3 a = Vector3Subtract(c1,c0), b = Vector3Subtract(c2,c1);
+                    float la = Vector3Length(a), lb = Vector3Length(b);
+                    if (la < 1e-4f || lb < 1e-4f) continue;
+                    float kk = Vector3Length(Vector3Subtract(Vector3Scale(b, 1.0f/lb),
+                                                             Vector3Scale(a, 1.0f/la))) / (0.5f*(la+lb));
+                    if (kk > kmax) kmax = kk;
+                }
             }
             float gMax = 1.0f + v*v*kmax/GRAV;
             if (gMax <= GCAP || cbR >= CBR_MAX - 0.01f) break;
@@ -382,11 +388,11 @@ struct Track {
     struct InvSpec { float gT, rMin, rMaxRec, gMul, hMul; };
     static InvSpec invSpec(SegMode m) {
         switch (m) {
-            case M_LOOP:     return {4.6f, 14.0f, 19.0f, 1.6f, 2.6f};
-            case M_IMMEL:    return {4.0f, 16.0f, 23.0f, 1.0f, 2.0f};
-            case M_DIVELOOP: return {3.5f, 16.0f, 24.0f, 1.0f, 2.0f};
-            case M_COBRA:    return {3.7f, 13.5f, 18.0f, 1.0f, 2.2f};
-            case M_PRETZEL:  return {4.3f, 19.0f, 23.0f, 1.0f, 2.0f};
+            case M_LOOP:     return {4.0f, 15.0f, 22.0f, 1.6f, 2.6f};
+            case M_IMMEL:    return {3.2f, 17.0f, 26.0f, 1.0f, 2.0f};
+            case M_DIVELOOP: return {2.6f, 18.0f, 28.0f, 1.0f, 2.0f};
+            case M_COBRA:    return {3.0f, 15.0f, 24.0f, 1.0f, 2.2f};
+            case M_PRETZEL:  return {3.6f, 20.0f, 26.0f, 1.0f, 2.0f};
             default:         return {0.0f,  0.0f,  0.0f, 1.0f, 2.0f};
         }
     }
