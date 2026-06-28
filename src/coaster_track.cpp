@@ -4,6 +4,7 @@ struct Track {
     std::deque<unsigned char> kind;   // SegMode tag per control point
     std::deque<unsigned char> chainf;  // 1 = chain-lift here (not a launched climb)
     std::deque<float>         arc;    // cumulative world arc length per control point (popFront-stable)
+    std::deque<float>         gvlog;  // forward-sim ride speed at each control point (g-sizing diagnostics)
     std::deque<Coin>          coins;
     long base = 0;                    // absolute index of cp[0]
 
@@ -106,13 +107,16 @@ struct Track {
     void pushCP(Vector3 p, Vector3 upv, unsigned char tag, unsigned char ch = 0) {
         float a = arc.empty() ? 0.0f : arc.back() + Vector3Length(Vector3Subtract(p, cp.back()));
         cp.push_back(p); up.push_back(upv); kind.push_back(tag); chainf.push_back(ch); arc.push_back(a);
+        gvlog.push_back(genV);   // speed entering this point (gen-time forward-sim)
     }
     void popFront() {
-        cp.pop_front(); up.pop_front(); kind.pop_front(); chainf.pop_front(); arc.pop_front(); base++;
+        cp.pop_front(); up.pop_front(); kind.pop_front(); chainf.pop_front(); arc.pop_front();
+        if (!gvlog.empty()) gvlog.pop_front();
+        base++;
     }
 
     void reset() {
-        cp.clear(); up.clear(); kind.clear(); chainf.clear(); arc.clear(); coins.clear(); base = 0;
+        cp.clear(); up.clear(); kind.clear(); chainf.clear(); arc.clear(); gvlog.clear(); coins.clear(); base = 0;
         chainMode = false; stationPending = false; stationActive = false; stationRamping = false;
         // vibrant coaster livery: colored spine + steel rails, soft modern look
         Theme th    = THEMES[irnd(0, THEME_N - 1)];
@@ -994,6 +998,30 @@ struct Track {
         }
         if (gpos.y > ceilY) { gpos.y = ceilY; if (mode == M_CLIMB) { mode = M_DROP; remain = irnd(3, 4); } }
 
+        // HARD per-point vertical curvature clamp — the authoritative launch->element /
+        // top-hat-base / seam g guarantee that the tangled dlim/jlim limiter was missing.
+        // Bound the felt vertical g at the JUST-COMPLETED point cp.back() by easing the NEW
+        // point's height toward the straight-line continuation of the last two points. It only
+        // ever REDUCES curvature (nudges gpos.y toward the extrapolation 2*p1-p0), so a climb
+        // base is eased DOWN (off the ceiling) and a drop bottom eased UP (off the floor) —
+        // never fighting the clearance clamps above. Speed-aware via genV (== the ride speed at
+        // cp.back(): the forward-sim ran last call). Skips the flat powered deck (must stay
+        // level) and any inverted/banked point where the upright .y model is invalid.
+        if ((int)cp.size() >= 2 && mode != M_STATION && mode != M_LAUNCH && mode != M_BOOST &&
+            !isHardInversion((SegMode)kind.back()) && genPrevUp.y >= 0.55f) {
+            Vector3 p0 = cp[cp.size() - 2], p1 = cp.back();
+            // HORIZONTAL span only (~SEG_LEN): the felt-g chord curvature scales with the
+            // horizontal point spacing; using the 3D span here would inflate with the new
+            // point's own steep rise and UNDER-clamp the very spike we're bounding.
+            float dxz0 = sqrtf((p1.x-p0.x)*(p1.x-p0.x) + (p1.z-p0.z)*(p1.z-p0.z));
+            float dxz1 = sqrtf((gpos.x-p1.x)*(gpos.x-p1.x) + (gpos.z-p1.z)*(gpos.z-p1.z));
+            float span = fmaxf(0.5f * (dxz0 + dxz1), 1.0f);
+            float k   = span * span * GRAV / fmaxf(genV * genV, 100.0f);  // sd per 1g at this speed
+            float sd  = gpos.y - 2.0f * p1.y + p0.y;                      // curvature at p1 (>0 valley, <0 crest)
+            float clamped = Clamp(sd, -7.5f * k, 8.5f * k);              // hold p1 within ~ -6.5g .. +9.5g
+            gpos.y += (clamped - sd);                                     // ease the new point toward the g-safe continuation
+        }
+
         // banked up-vector. turns/helices/twisted hills tilt toward the curve;
         // overbanked hairpins push the bank past vertical for a real thrill.
         Vector3 upv = WUP;
@@ -1235,30 +1263,51 @@ struct Track {
             up[m] = Vector3Normalize(Vector3Lerp(up[m],
                         Vector3Scale(Vector3Add(up[m - 1], up[m + 1]), 0.5f), w));
         }
-        // VERTICAL valley/crest g-cap: a sharp contour-follow V-valley (track dives a
-        // terrain dip and snaps back up) leaves the interior control point sagging well
-        // off its neighbours' midpoint; the Catmull-Rom spline then overshoots that dip
-        // into a tight bottom whose felt vertical g (~1 + v^2*kappa/GRAV, kappa=2*sag/span^2)
-        // spikes past the design envelope. Pull the point's HEIGHT toward the midpoint just
-        // enough to hold the implied bottom/crest g inside +10g / -7.5g, widening only sharp
-        // contour bends (gentle contours barely exceed the cap so barely move). The hard
-        // inversions and the dramatic vertical elements (drops/climbs/dips/helix/powered) are
-        // EXEMPT so their designed shapes + big airtime drops stay intact. Speed-aware via
-        // genV. Lifting a valley raises the track (never buries it under the map).
-        if ((int)cp.size() >= 3) {
-            int m = (int)cp.size() - 2;
-            unsigned char km = kind[m];
-            bool exempt = isHardInversion((SegMode)km) || km == M_DROP || km == M_CLIMB ||
-                          km == M_DIP   || km == M_HELIX || km == M_LAUNCH ||
-                          km == M_BOOST || km == M_STATION;
-            if (!exempt) {
-                float sag  = 0.5f * (cp[m - 1].y + cp[m + 1].y) - cp[m].y;   // >0 valley, <0 crest
-                float span = 0.5f * (Vector3Length(Vector3Subtract(cp[m], cp[m - 1])) +
-                                     Vector3Length(Vector3Subtract(cp[m + 1], cp[m])));
-                float kc   = GRAV * span * span / (2.0f * fmaxf(genV * genV, 100.0f)); // sag per 1g (g = 1 + sag/kc)
-                float clamped = Clamp(sag, -8.5f * kc, 9.0f * kc);          // -7.5g crest .. +10g valley
-                cp[m].y += (sag - clamped);                                 // hold the bottom/crest at the envelope
-            }
+        // VERTICAL felt-g ENVELOPE ENFORCEMENT (geometry-only, the user's hard rule: hold
+        // +10g/-7.5g by RESHAPING the track, never by capping speed). The per-element sizing +
+        // slope limiter handle most of it, but element SEAMS and contour V-valleys still spike
+        // — e.g. a big drop plunging into RISING terrain gets floor-snapped into a tight bottom
+        // (+26g), or a top-hat crest ceiling-snapped into an ejector (-20g). This pass is the
+        // authoritative guarantee: a short Gauss-Seidel relaxation over the trailing window
+        // that RAISES valleys / LOWERS crests just enough to hold the felt vertical g (chord
+        // curvature ~ 1 + v^2 * sd/(span^2*GRAV), sd = the height 2nd-difference) inside the
+        // envelope at each point's ACTUAL ride speed (gvlog == the gen-time forward-sim, which
+        // tracks the real ride to within ~2 m/s). Sweeping distributes each correction so no
+        // single move kinks a neighbour. It only ever moves a point to a SAFER height (a valley
+        // UP off the terrain, a crest DOWN off the ceiling) so it never buries the track or
+        // fights the clearance clamps. Speed-aware (faster -> wider, "speed dictates size").
+        // SKIPPED where the upright sd->g model is invalid: hard inversions + the station, and
+        // any strongly-banked/inverted point (up.y < 0.55) whose felt g runs along a tilted
+        // axis and is governed by that element's own sizing instead.
+        {
+            const float Gmax = 9.0f, Gmin = -6.5f;   // margin under +10/-7.5 for Catmull-Rom spline overshoot
+            int n = (int)cp.size();
+            int lo = n - 14; if (lo < 1) lo = 1;
+            for (int sweep = 0; sweep < 4; sweep++)
+                for (int i = lo; i < n - 1; i++) {
+                    unsigned char ki = kind[i];
+                    // EXEMPT the elements whose steep vertical profile is INTENTIONAL and already
+                    // governed by their own clothoid limiter / sizing, so the relaxer doesn't
+                    // "smooth" them by dragging their points toward the surrounding heights:
+                    //  - LAUNCH/BOOST/STATION: flat powered deck (must stay dead-level; pinning
+                    //    also stops the low deck beside a tall top-hat reading as a "valley").
+                    //  - CLIMB: the top-hat. The slope limiter already eases its base entry to a
+                    //    gentle clothoid; left unpinned, the relaxer RAISES the early climb points
+                    //    ~60m toward the tall crest, undoing that entry and spiking the launch
+                    //    base to +20g. Its crest is rounded via the DROP point that caps it.
+                    //  - hard inversions: felt g set by emitted-curvature sizing + the rider-up.
+                    if (isHardInversion((SegMode)ki) || ki == M_STATION ||
+                        ki == M_LAUNCH || ki == M_BOOST || ki == M_CLIMB) continue;
+                    if (up[i].y < 0.55f) continue;                          // banked/inverted: own sizing governs
+                    float dxa = sqrtf((cp[i].x-cp[i-1].x)*(cp[i].x-cp[i-1].x) + (cp[i].z-cp[i-1].z)*(cp[i].z-cp[i-1].z));
+                    float dxb = sqrtf((cp[i+1].x-cp[i].x)*(cp[i+1].x-cp[i].x) + (cp[i+1].z-cp[i].z)*(cp[i+1].z-cp[i].z));
+                    float span = fmaxf(0.5f * (dxa + dxb), 1.0f);            // horizontal span (felt-g chord basis)
+                    float v2   = fmaxf(gvlog[i] * gvlog[i], 100.0f);
+                    float sd   = cp[i + 1].y - 2.0f * cp[i].y + cp[i - 1].y;  // >0 valley, <0 crest
+                    float k    = span * span * GRAV / v2;                     // sd per 1g of curvature
+                    float target = Clamp(sd, (Gmin - 1.0f) * k, (Gmax - 1.0f) * k);
+                    cp[i].y = 0.5f * (cp[i + 1].y + cp[i - 1].y - target);   // set the height that yields the clamped sd
+                }
         }
 
         // forward-simulate ride speed alongside generation (mirrors the live

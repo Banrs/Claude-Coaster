@@ -1250,6 +1250,124 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // headless FELT-G AUDIT — rides the FINAL emitted spline with simtest-identical
+    // physics and computes the orientation-aware felt vertical/lateral g at every
+    // control point, reporting any point outside the +10/-7.5 envelope (and which
+    // element + seam it sits on). g = (WUP.up) + v^2*(kappaVec.up)/GRAV, kappaVec the
+    // chord curvature of the EMITTED control points (same design-math the generator
+    // sizes against). No window, no GPU. --gaudit [seeds] [drag] [boostTrig]
+    if (argc > 1 && TextIsEqual(argv[1], "--gaudit")) {
+        int seeds = (argc > 2) ? atoi(argv[2]) : 12;
+        if (argc > 3) DRAG       = (float)atof(argv[3]);
+        if (argc > 4) BOOST_TRIG = (float)atof(argv[4]);
+        const char* NM[] = {"FLAT","CLIMB","DROP","HILLS","TURN","LOOP","ROLL","STN","DIP","LAUNCH","HELIX","BOOST","IMMEL","SCURVE","DIVE","BANKAIR","WAVE","STALL","DIVELOOP","COBRA","WINGOVER","HEARTLINE","PRETZEL","STENGEL","BANANA"};
+        const Vector3 WUP3 = {0,1,0};
+        // per-element-kind worst across ALL seeds
+        float kMaxV[M_COUNT], kMinV[M_COUNT], kMaxL[M_COUNT];
+        for (int i=0;i<M_COUNT;i++){ kMaxV[i]=-1e9f; kMinV[i]=1e9f; kMaxL[i]=0; }
+        struct Off { float g; int seed,k,kind,pk,nk; float v,y,lat; };
+        std::vector<Off> offenders;        // points outside envelope
+        int totalPts = 0;
+        for (int sd = 1; sd <= seeds; sd++) {
+            g_rng = (uint32_t)sd * 2654435761u | 1u;
+            Track t; t.reset();
+            while ((int)t.cp.size() < 470) t.ensureAhead((float)t.cp.size() + 8.0f);
+            int n = (int)t.cp.size();
+            // forward-sim v across the static track (no popFront), recording v at each cp
+            std::vector<float> vAt(n, 0.0f);
+            float u = 0.5f, v = LAUNCH_V;
+            int lastK = -1;
+            for (int f = 0; f < 200000 && u < n - 4; f++) {
+                float dt = 1.0f / 60.0f;
+                float slope = t.tangent(u).y;
+                float acc = -GRAV * slope - DRAG * v * v - FRICTION;
+                v += acc * dt;
+                unsigned char tg = t.tagAt(u);
+                if (tg == M_LAUNCH && v < LAUNCH_V) v = fminf(v + 85.0f * dt, LAUNCH_V);
+                else if (tg == M_CLIMB && !t.chainAt(u) && v < CLIMB_V) v = fminf(v + 44.0f * dt, CLIMB_V);
+                if (tg == M_BOOST && v < BOOST_V) v = fminf(v + 55.0f * dt, BOOST_V);
+                if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fminf(v + 20 * dt, CHAIN_V);
+                for (float la = 1.0f; la <= 9.0f; la += 1.0f) {
+                    SegMode ahead = (SegMode)t.tagAt(u + la);
+                    if (!Track::isHardInversion(ahead)) continue;
+                    float bt; Track::invRAt(ahead, v, bt);
+                    if (bt > 0.0f && v > bt) v = fmaxf(v - (la <= 4.0f ? 24.0f : 16.0f) * dt, bt);
+                    break;
+                }
+                if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !t.chainAt(u) && v < 36.0f)
+                    v = fminf(v + 28.0f * dt, 36.0f);
+                v = fmaxf(v, 20.0f); v = fminf(v, 135.0f);
+                int ki = (int)u;
+                if (ki > lastK) { for (int q = lastK + 1; q <= ki && q < n; q++) vAt[q] = v; lastK = ki; }
+                float du = v * dt / fmaxf(t.speedScale(u), 0.5f);
+                if (!(du == du)) du = 0;
+                u += fminf(du, 1.5f);
+            }
+            // now measure felt g at each interior cp using the recorded ride speed
+            float seedMaxV = -1e9f; int seedMaxK = -1;
+            for (int k = 1; k < n - 1; k++) {
+                if (vAt[k] <= 0) continue;
+                Vector3 p0 = t.cp[k-1], p1 = t.cp[k], p2 = t.cp[k+1];
+                Vector3 a = Vector3Subtract(p1, p0), b = Vector3Subtract(p2, p1);
+                float la = Vector3Length(a), lb = Vector3Length(b);
+                if (la < 1e-4f || lb < 1e-4f) continue;
+                Vector3 kap = Vector3Scale(
+                    Vector3Subtract(Vector3Scale(b, 1.0f/lb), Vector3Scale(a, 1.0f/la)),
+                    1.0f / (0.5f * (la + lb)));                       // curvature vector (toward center)
+                Vector3 up = Vector3Normalize(t.up[k]);
+                Vector3 tan = Vector3Normalize(Vector3Subtract(p2, p0));
+                Vector3 lat = Vector3CrossProduct(up, tan);
+                float ll = Vector3Length(lat); if (ll > 1e-4f) lat = Vector3Scale(lat, 1.0f/ll);
+                float vv = vAt[k] * vAt[k];
+                float gV = Vector3DotProduct(WUP3, up) + vv * Vector3DotProduct(kap, up) / GRAV;
+                float gL = vv * Vector3DotProduct(kap, lat) / GRAV;
+                int kd = t.kind[k]; if (kd < 0 || kd >= M_COUNT) kd = 0;
+                totalPts++;
+                if (gV > kMaxV[kd]) kMaxV[kd] = gV;
+                if (gV < kMinV[kd]) kMinV[kd] = gV;
+                if (fabsf(gL) > kMaxL[kd]) kMaxL[kd] = fabsf(gL);
+                if (gV > seedMaxV) { seedMaxV = gV; seedMaxK = k; }
+                if (gV > 10.0f || gV < -7.5f || fabsf(gL) > 5.0f)
+                    offenders.push_back({gV, sd, k, kd, (int)t.kind[k-1], (int)t.kind[k+1], vAt[k], p1.y, gL});
+            }
+            printf("seed %2d  worst vert g = %+6.1f at cp %d (%s)\n", sd, seedMaxV, seedMaxK,
+                   (seedMaxK>=0 && t.kind[seedMaxK]<M_COUNT) ? NM[t.kind[seedMaxK]] : "-");
+        }
+        printf("\n  PER-ELEMENT FELT-G (across %d seeds, %d cps):\n", seeds, totalPts);
+        printf("  %-9s %8s %8s %8s\n", "element", "maxVert", "minVert", "maxLat");
+        for (int i = 0; i < M_COUNT; i++) {
+            if (kMaxV[i] < -1e8f) continue;
+            const char* flag = (kMaxV[i] > 10.0f || kMinV[i] < -7.5f) ? "  <-- OVER" : "";
+            printf("  %-9s %+8.1f %+8.1f %8.1f%s\n", NM[i], kMaxV[i], kMinV[i], kMaxL[i], flag);
+        }
+        std::sort(offenders.begin(), offenders.end(), [](const Off&a,const Off&b){
+            return fabsf(a.g-1.0f) > fabsf(b.g-1.0f); });
+        printf("\n  OFFENDERS outside +10/-7.5 vert (or |lat|>5): %d total. Worst 25:\n", (int)offenders.size());
+        for (int i = 0; i < (int)offenders.size() && i < 25; i++) {
+            Off& o = offenders[i];
+            printf("  seed%-2d cp%-3d  vertG=%+6.1f latG=%+5.1f  v=%4.0f (%3.0fkm/h) y=%6.1f  %s [%s->%s->%s]\n",
+                   o.seed, o.k, o.g, o.lat, o.v, o.v*3.6f, o.y, NM[o.kind],
+                   NM[o.pk], NM[o.kind], NM[o.nk]);
+        }
+        // dump the y-profile around the single worst offender so the geometry is visible
+        if (!offenders.empty()) {
+            Off& o = offenders[0];
+            g_rng = (uint32_t)o.seed * 2654435761u | 1u;
+            Track t; t.reset();
+            while ((int)t.cp.size() < 470) t.ensureAhead((float)t.cp.size() + 8.0f);
+            printf("\n  WORST OFFENDER y-profile (seed%d cp%d):\n", o.seed, o.k);
+            for (int k = o.k - 4; k <= o.k + 4; k++) {
+                if (k < 1 || k >= (int)t.cp.size()) continue;
+                float dyP = t.cp[k].y - t.cp[k-1].y;
+                printf("   cp%-3d %-9s y=%7.2f  dy=%+7.2f  span=%5.1f  genV=%4.0f  up.y=%+.2f%s\n", k, NM[t.kind[k]],
+                       t.cp[k].y, dyP, Vector3Length(Vector3Subtract(t.cp[k], t.cp[k-1])),
+                       k < (int)t.gvlog.size() ? t.gvlog[k] : 0.0f, t.up[k].y,
+                       k == o.k ? "  <== spike" : "");
+            }
+        }
+        return 0;
+    }
+
     // headless station re-entry test — reproduces the exact dispatched physics +
     // brake + berth flow, arming a station repeatedly (including right after a
     // loop) and asserting the train always berths instead of locking at a crawl.
