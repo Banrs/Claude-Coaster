@@ -323,7 +323,7 @@ struct Track {
         mode = M_WINGOVER;
         setClearance(14.0f, 46.0f);
         turnDir   = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        turnMag   = turnMagFor(5.5f, 0.12f, 0.34f);
+        turnMag   = turnMagFor(5.0f, 0.06f, 0.30f);
         bankT     = frnd(1.12f, 1.42f);
         hillBumps = 1;
         hillH     = frnd(26.0f, 38.0f);
@@ -424,14 +424,14 @@ struct Track {
         setClearance(big ? 12.0f : 6.0f, big ? 48.0f : 30.0f);
         turnDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
 
-        if (big) { turnMag = turnMagFor(6.0f, 0.20f, 0.55f); bankT = frnd(0.92f, 1.28f); remain = irnd(4, 6); }
-        else     { turnMag = frnd(0.18f, 0.28f); bankT = frnd(0.30f, 0.62f); remain = irnd(3, 5);  }
+        if (big) { turnMag = turnMagFor(5.0f, 0.07f, 0.45f); bankT = frnd(0.92f, 1.28f); remain = irnd(4, 6); }
+        else     { turnMag = turnMagFor(3.0f, 0.05f, 0.18f); bankT = frnd(0.30f, 0.62f); remain = irnd(3, 5);  }
     }
     void initHelix() {
         mode = M_HELIX;
         setClearance(18.0f, 58.0f);
         turnDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        turnMag = turnMagFor(4.7f, 0.26f, 0.62f);
+        turnMag = turnMagFor(4.5f, 0.10f, 0.55f);
         bankT   = frnd(0.62f, 0.82f);
 
         float R = SEG_LEN / turnMag;
@@ -455,7 +455,7 @@ struct Track {
         mode = M_SCURVE;
         setClearance(6.0f, 34.0f);
         turnDir   = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        turnMag   = turnMagFor(4.5f, 0.10f, 0.30f);
+        turnMag   = turnMagFor(4.0f, 0.06f, 0.26f);
         bankT     = frnd(0.30f, 0.52f);
         scurveLen = irnd(6, 10);
         remain    = scurveLen;
@@ -464,7 +464,7 @@ struct Track {
         mode = M_DIVE;
         setClearance(4.0f, 24.0f);
         turnDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        turnMag = turnMagFor(4.0f, 0.16f, 0.42f);
+        turnMag = turnMagFor(4.0f, 0.07f, 0.36f);
         bankT   = frnd(0.78f, 1.12f);
         remain  = irnd(4, 7);
     }
@@ -1081,7 +1081,7 @@ struct Track {
                 for (int i = lo; i < n - 1; i++) {
                     unsigned char ki = kind[i];
 
-                    if (ki == M_STATION || ki == M_LAUNCH || ki == M_BOOST || ki == M_CLIMB) continue;
+                    if (ki == M_STATION || ki == M_CLIMB) continue;
 
                     if (up[i].y < 0.55f) continue;
                     float dxa = sqrtf((cp[i].x-cp[i-1].x)*(cp[i].x-cp[i-1].x) + (cp[i].z-cp[i-1].z)*(cp[i].z-cp[i-1].z));
