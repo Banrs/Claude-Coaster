@@ -413,7 +413,10 @@ struct Renderer {
     VkPipeline gbufPipe, ssaoPipe, lightPipe, bloomPipe, postPipe;
     VkDescriptorSetLayout dsl1, dsl2, ssaoDSL, lightDSL; VkDescriptorPool dpool;
     VkDescriptorSet bloomSet, postSet, ssaoSet, lightSet;
-    Img gAlbedo, gNormal, gPosition, ssaoImg, hdr, bloom, out;
+    Img gAlbedo, gNormal, gPosition, ssaoImg, hdr, hdr2, bloom, out;
+    // SSR (reflect the lit scene in metallic surfaces) — ping-pong hdr -> hdr2
+    VkRenderPass ssrRP; VkPipelineLayout ssrLayout; VkPipeline ssrPipe; VkFramebuffer ssrFB;
+    VkDescriptorSetLayout ssrDSL; VkDescriptorSet ssrSet;
     VkImage depthImg; VkDeviceMemory depthMem; VkImageView depthView;
     VkFramebuffer gbufFB, ssaoFB, lightFB, bloomFB, postFB;
     Buffer vb, ib; uint32_t indexCount;
@@ -450,6 +453,7 @@ struct Renderer {
         gbufRP =makeGBufRP(dev);
         ssaoRP =makeRP(dev,AO_FMT,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,false);
         lightRP=makeRP(dev,HDR_FMT,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,false);
+        ssrRP  =makeRP(dev,HDR_FMT,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,false);
         waterRP=makeWaterRP(dev);
         bloomRP=makeRP(dev,HDR_FMT,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,false);
         postRP =makeRP(dev,OUT_FMT,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,false);  // HUD pass draws on top next
@@ -469,6 +473,7 @@ struct Renderer {
         sceneDSL=mkUboDSL(1);   // UBO + shadow                 (G-buffer + water passes)
         ssaoDSL =mkUboDSL(2);   // UBO + gPosition + gNormal    (SSAO pass)
         lightDSL=mkUboDSL(5);   // UBO + shadow + albedo+normal+position + ssao (lighting)
+        ssrDSL  =mkUboDSL(4);   // UBO + litColor + position + normal + albedo  (SSR)
         VkDescriptorPoolSize ps[2]={{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,32},{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,8}};
         VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pci.maxSets=12; pci.poolSizeCount=2; pci.pPoolSizes=ps;
         VK_CHECK(vkCreateDescriptorPool(dev,&pci,nullptr,&dpool));
@@ -481,6 +486,7 @@ struct Renderer {
         gbufLayout  =mkPL(sceneDSL,0,0);
         ssaoLayout  =mkPL(ssaoDSL,0,0);
         waterLayout =mkPL(sceneDSL,sizeof(WaterPC),VK_SHADER_STAGE_FRAGMENT_BIT);
+        ssrLayout   =mkPL(ssrDSL,0,0);
         lightLayout =mkPL(lightDSL,sizeof(LightPC),VK_SHADER_STAGE_FRAGMENT_BIT);
         shadowLayout=mkPL(VK_NULL_HANDLE,sizeof(ShadowPC),VK_SHADER_STAGE_VERTEX_BIT);
         bloomLayout =mkPL(dsl1,sizeof(BloomPC),VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT);
@@ -491,14 +497,16 @@ struct Renderer {
         VkShaderModule bf=makeShader(dev,sd+"/bloom.frag.spv"), pf=makeShader(dev,sd+"/post.frag.spv");
         VkShaderModule sv=makeShader(dev,sd+"/shadow.vert.spv");
         VkShaderModule wv=makeShader(dev,sd+"/water.vert.spv"), wf=makeShader(dev,sd+"/water.frag.spv");
+        VkShaderModule rf=makeShader(dev,sd+"/ssr.frag.spv");
         gbufPipe  =makeGBufPipe(dev,gbufRP,gbufLayout,gv,gf);
         ssaoPipe  =makeFsPipe(dev,ssaoRP,ssaoLayout,fv,af);
         lightPipe =makeFsPipe(dev,lightRP,lightLayout,fv,lf);
+        ssrPipe   =makeFsPipe(dev,ssrRP,ssrLayout,fv,rf);
         waterPipe =makeWaterPipe(dev,waterRP,waterLayout,wv,wf);
         shadowPipe=makeShadowPipe(dev,shadowRP,shadowLayout,sv);
         bloomPipe =makeFsPipe(dev,bloomRP,bloomLayout,fv,bf);
         postPipe  =makeFsPipe(dev,postRP,postLayout,fv,pf);
-        for(auto m:{gv,gf,fv,af,lf,bf,pf,sv,wv,wf}) vkDestroyShaderModule(dev,m,nullptr);
+        for(auto m:{gv,gf,fv,af,lf,bf,pf,sv,wv,wf,rf}) vkDestroyShaderModule(dev,m,nullptr);
         // scene UBO (persistently mapped) + shadow map image/framebuffer (fixed size)
         sceneUBO=makeBuffer(pd,dev,sizeof(SceneUBO),VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         vkMapMemory(dev,sceneUBO.mem,0,sizeof(SceneUBO),0,&sceneUBOmap);
@@ -508,7 +516,7 @@ struct Renderer {
         // descriptor sets
         auto alloc=[&](VkDescriptorSetLayout l){ VkDescriptorSet s; VkDescriptorSetAllocateInfo a{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; a.descriptorPool=dpool; a.descriptorSetCount=1; a.pSetLayouts=&l; VK_CHECK(vkAllocateDescriptorSets(dev,&a,&s)); return s; };
         bloomSet=alloc(dsl1); postSet=alloc(dsl2);
-        sceneSet=alloc(sceneDSL); ssaoSet=alloc(ssaoDSL); lightSet=alloc(lightDSL);
+        sceneSet=alloc(sceneDSL); ssaoSet=alloc(ssaoDSL); lightSet=alloc(lightDSL); ssrSet=alloc(ssrDSL);
         // fixed bindings that never change on resize: the scene UBO (all three sets)
         // and the shadow map (scene + lighting sets). G-buffer/AO image bindings are
         // (re)written in buildTargets.
@@ -518,8 +526,8 @@ struct Renderer {
             w.dstSet=set; w.dstBinding=0; w.descriptorCount=1; w.descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w.pBufferInfo=&ubi; return w; };
         auto img=[&](VkDescriptorSet set,uint32_t b,VkDescriptorImageInfo* ii){ VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w.dstSet=set; w.dstBinding=b; w.descriptorCount=1; w.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo=ii; return w; };
-        VkWriteDescriptorSet sw[5]={ ubo(sceneSet), img(sceneSet,1,&smi), ubo(ssaoSet), ubo(lightSet), img(lightSet,1,&smi) };
-        vkUpdateDescriptorSets(dev,5,sw,0,nullptr);
+        VkWriteDescriptorSet sw[6]={ ubo(sceneSet), img(sceneSet,1,&smi), ubo(ssaoSet), ubo(lightSet), img(lightSet,1,&smi), ubo(ssrSet) };
+        vkUpdateDescriptorSets(dev,6,sw,0,nullptr);
         // ---- HUD: pipeline, font atlas texture, dynamic vertex buffer ----
         hudLayout=mkPL(dsl1,sizeof(HudPC),VK_SHADER_STAGE_VERTEX_BIT);
         { VkShaderModule hv=makeShader(dev,sd+"/hud.vert.spv"), hf=makeShader(dev,sd+"/hud.frag.spv");
@@ -585,6 +593,7 @@ struct Renderer {
         gPosition= makeImg(pd,dev,e.width,e.height,POS_FMT,    CA_S,VK_IMAGE_ASPECT_COLOR_BIT);
         ssaoImg  = makeImg(pd,dev,e.width,e.height,AO_FMT,     CA_S,VK_IMAGE_ASPECT_COLOR_BIT);
         hdr  = makeImg(pd,dev,e.width,e.height,HDR_FMT,CA_S,VK_IMAGE_ASPECT_COLOR_BIT);
+        hdr2 = makeImg(pd,dev,e.width,e.height,HDR_FMT,CA_S,VK_IMAGE_ASPECT_COLOR_BIT);
         bloom= makeImg(pd,dev,halfExt.width,halfExt.height,HDR_FMT,CA_S,VK_IMAGE_ASPECT_COLOR_BIT);
         out  = makeImg(pd,dev,e.width,e.height,OUT_FMT,VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT,VK_IMAGE_ASPECT_COLOR_BIT);
         Img d= makeImg(pd,dev,e.width,e.height,DEPTH_FMT,VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,VK_IMAGE_ASPECT_DEPTH_BIT);
@@ -597,6 +606,7 @@ struct Renderer {
         ssaoFB =mkFB(ssaoRP,{ssaoImg.view},ext);
         lightFB=mkFB(lightRP,{hdr.view},ext);
         waterFB=mkFB(waterRP,{hdr.view,depthView},ext);
+        ssrFB  =mkFB(ssrRP,{hdr2.view},ext);
         bloomFB=mkFB(bloomRP,{bloom.view},halfExt);
         postFB =mkFB(postRP,{out.view},ext);
         hudFB  =mkFB(hudRP,{out.view},ext);
@@ -606,21 +616,24 @@ struct Renderer {
         VkDescriptorImageInfo gPi{samp,gPosition.view,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkDescriptorImageInfo aoi{samp,ssaoImg.view,  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkDescriptorImageInfo hi {samp,hdr.view,      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkDescriptorImageInfo h2i{samp,hdr2.view,     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkDescriptorImageInfo bi {samp,bloom.view,    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         auto img=[&](VkDescriptorSet set,uint32_t b,VkDescriptorImageInfo* ii){ VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w.dstSet=set; w.dstBinding=b; w.descriptorCount=1; w.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo=ii; return w; };
         VkWriteDescriptorSet w[]={
             img(ssaoSet,1,&gPi), img(ssaoSet,2,&gNi),
             img(lightSet,2,&gAi), img(lightSet,3,&gNi), img(lightSet,4,&gPi), img(lightSet,5,&aoi),
-            img(bloomSet,0,&hi), img(postSet,0,&hi), img(postSet,1,&bi) };
+            img(ssrSet,1,&hi), img(ssrSet,2,&gPi), img(ssrSet,3,&gNi), img(ssrSet,4,&gAi),
+            img(bloomSet,0,&h2i), img(postSet,0,&h2i), img(postSet,1,&bi) };   // bloom/post read SSR output
         vkUpdateDescriptorSets(dev,(uint32_t)(sizeof(w)/sizeof(w[0])),w,0,nullptr);
     }
     void destroyTargets(){
         vkDestroyFramebuffer(dev,gbufFB,nullptr); vkDestroyFramebuffer(dev,ssaoFB,nullptr); vkDestroyFramebuffer(dev,lightFB,nullptr);
         vkDestroyFramebuffer(dev,waterFB,nullptr); vkDestroyFramebuffer(dev,bloomFB,nullptr); vkDestroyFramebuffer(dev,postFB,nullptr); vkDestroyFramebuffer(dev,hudFB,nullptr);
         vkDestroyImageView(dev,depthView,nullptr); vkDestroyImage(dev,depthImg,nullptr); vkFreeMemory(dev,depthMem,nullptr);
+        vkDestroyFramebuffer(dev,ssrFB,nullptr);
         destroyImg(dev,gAlbedo); destroyImg(dev,gNormal); destroyImg(dev,gPosition); destroyImg(dev,ssaoImg);
-        destroyImg(dev,hdr); destroyImg(dev,bloom); destroyImg(dev,out);
+        destroyImg(dev,hdr); destroyImg(dev,hdr2); destroyImg(dev,bloom); destroyImg(dev,out);
     }
     void resize(VkExtent2D e){ vkDeviceWaitIdle(dev); destroyTargets(); buildTargets(e); }
 
@@ -679,6 +692,13 @@ struct Renderer {
             vkCmdBindVertexBuffers(cmd,0,1,&wvb.buf,&off); vkCmdBindIndexBuffer(cmd,wib.buf,0,VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(cmd,waterIndexCount,1,0,0,0); vkCmdEndRenderPass(cmd);
         }
+        // --- SSR: reflect the lit scene (hdr) into metallic surfaces -> hdr2 ---
+        VkClearValue rcl; rcl.color={{0,0,0,1}};
+        VkRenderPassBeginInfo rr{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO}; rr.renderPass=ssrRP; rr.framebuffer=ssrFB; rr.renderArea={{0,0},ext}; rr.clearValueCount=1; rr.pClearValues=&rcl;
+        vkCmdBeginRenderPass(cmd,&rr,VK_SUBPASS_CONTENTS_INLINE); setVP(ext);
+        vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,ssrPipe);
+        vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,ssrLayout,0,1,&ssrSet,0,nullptr);
+        vkCmdDraw(cmd,3,1,0,0); vkCmdEndRenderPass(cmd);
         // bloom -> half-res
         VkClearValue cb{}; cb.color={{0,0,0,1}};
         VkRenderPassBeginInfo r2{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO}; r2.renderPass=bloomRP; r2.framebuffer=bloomFB; r2.renderArea={{0,0},halfExt}; r2.clearValueCount=1; r2.pClearValues=&cb;

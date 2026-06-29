@@ -44,7 +44,7 @@ set(SHADER_OUT ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUT})
 set(SPV_FILES)
 foreach(stage gbuffer.vert gbuffer.frag fullscreen.vert ssao.frag lighting.frag
-              bloom.frag post.frag shadow.vert sky.vert sky.frag
+              ssr.frag bloom.frag post.frag shadow.vert sky.vert sky.frag
               water.vert water.frag hud.vert hud.frag)
   add_custom_command(
     OUTPUT ${SHADER_OUT}/${stage}.spv
