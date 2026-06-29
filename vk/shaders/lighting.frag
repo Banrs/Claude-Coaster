@@ -151,7 +151,8 @@ void main(){
     vec4 nr = texture(gNormalRough, uv);
     vec3 N  = normalize(nr.xyz);
     float rough = nr.a;
-    vec3 baseCol = texture(gAlbedo, uv).rgb;
+    vec4 alb = texture(gAlbedo, uv);
+    vec3 baseCol = alb.rgb; float metal = alb.a;
     float ao = texture(ssaoTex, uv).r;
 
     vec3 V = normalize(ro - wp);
@@ -159,7 +160,6 @@ void main(){
     vec3 H = normalize(V + L);
 
     vec3  albedo = pow(baseCol, vec3(2.2));
-    float metal = 0.0;
     vec3  F0 = mix(vec3(0.04), albedo, metal);
 
     float NoL=max(dot(N,L),0.0), NoV=max(dot(N,V),1e-4), NoH=max(dot(N,H),0.0), VoH=max(dot(V,H),0.0);
@@ -175,7 +175,7 @@ void main(){
     vec3 Lo = (diffuse + spec) * sunRad * NoL * shadow;
 
     vec3 skyA=vec3(0.34,0.45,0.66), ground=vec3(0.16,0.15,0.13);
-    vec3 amb = mix(ground, skyA, clamp(N.y*0.5+0.5,0.0,1.0)) * albedo * ao;
+    vec3 amb = mix(ground, skyA, clamp(N.y*0.5+0.5,0.0,1.0)) * albedo * ao * (1.0-metal);
     // image-based ambient specular: reflect the sky probe, Fresnel-weighted, blurred by roughness
     vec3 Rdir = reflect(-V, N);
     vec3 Fr = F_Schlick(NoV, F0);
