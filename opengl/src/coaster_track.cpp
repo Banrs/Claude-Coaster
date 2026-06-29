@@ -210,8 +210,8 @@ struct Track {
                     : 0.0f;
                 float g = 1.0f + v * v * kappa / GRAV;
                 if (g <= GCAP) break;
-                if (rR >= rBase * 2.4f - 0.01f) break;
-                rR = fminf(rR * 1.16f, rBase * 2.4f);
+                if (rR >= rBase * 4.0f - 0.01f) break;
+                rR = fminf(rR * 1.16f, rBase * 4.0f);
                 rfwdStep = stepBase * (rR / rBase);
             }
         }
@@ -394,6 +394,8 @@ struct Track {
             case M_DIVELOOP: return {2.6f, 26.0f, 40.0f, 1.0f, 2.0f};
             case M_COBRA:    return {3.0f, 22.0f, 35.0f, 1.0f, 2.2f};
             case M_PRETZEL:  return {3.6f, 28.0f, 38.0f, 1.0f, 2.0f};
+            case M_ROLL:     return {3.0f, 12.0f, 22.0f, 1.0f, 1.6f};   // brake entry so the corkscrew holds g
+            case M_HEARTLINE:return {2.2f, 16.0f, 26.0f, 1.0f, 1.6f};   // brake entry to tame lateral g
             default:         return {0.0f,  0.0f,  0.0f, 1.0f, 2.0f};
         }
     }
@@ -540,7 +542,7 @@ struct Track {
         elems++;
     }
     static bool isHardInversion(SegMode m) {
-        return m == M_LOOP || m == M_ROLL || m == M_IMMEL || m == M_DIVELOOP || m == M_COBRA || m == M_PRETZEL;
+        return m == M_LOOP || m == M_ROLL || m == M_IMMEL || m == M_DIVELOOP || m == M_COBRA || m == M_PRETZEL || m == M_HEARTLINE;
     }
     bool eligibleElem(SegMode m) const {
         // Per-element speed gate: tight inversions are only OFFERED once the forward-sim
