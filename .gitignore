@@ -1,5 +1,5 @@
 build/
-src/vendor/
+**/vendor/
 minecoaster
 minecoaster_orbit
 src/vk/minecoaster_vk

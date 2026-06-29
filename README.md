@@ -3,7 +3,19 @@
 A voxel roller-coaster simulator. An endless, procedurally generated coaster threads
 through a streaming Minecraft-style world — launches, drops, loops, cobras, helices and
 inversions, all sized by a physics-driven generator that holds the felt-g inside a
-realistic-but-arcadey envelope. Cross-platform, built on [raylib](https://www.raylib.com).
+realistic-but-arcadey envelope.
+
+## Repository layout
+
+The same game world + ride physics drive three independent renderer backends:
+
+| Folder | Backend | Status | Notes |
+|--------|---------|--------|-------|
+| [`opengl/`](opengl/) | **OpenGL** (raylib) | shipping | The cross-platform reference game. All gameplay/physics/world-gen lives here in `opengl/src/`. |
+| [`vulkan/`](vulkan/) | **Vulkan** | alpha | A from-scratch deferred-PBR renderer that ports the OpenGL game's world, coaster, physics and HUD for feature parity, plus a modern effect stack (SSAO, SSR, god rays, IBL, TAA…). Compiles `opengl/src/coaster_track.cpp` directly so the track generator is shared, not duplicated. See [`vulkan/README.md`](vulkan/README.md) / [`vulkan/WORK_HANDOFF.md`](vulkan/WORK_HANDOFF.md). |
+| [`win-rtx/`](win-rtx/) | **Windows DXR + DLSS** | scaffold | Hardware ray-tracing backend for Windows + NVIDIA RTX (see below). |
+
+Docs at the root: this `README.md` and [`REALISM.md`](REALISM.md).
 
 Windows RT coming later
 
@@ -18,22 +30,41 @@ Windows RT coming later
 - **Real ride physics** — gravity, drag, friction, LSM/hydraulic launches and boosters,
   with a live HUD (speed, altitude, element, g-meter).
 
-## Build
+## Build (OpenGL game)
 
 Requires CMake and a C++17 compiler. raylib is fetched and built automatically.
 
 ```sh
-cmake -B build
-cmake --build build -j
+cmake -B opengl/build -S opengl
+cmake --build opengl/build -j
 ```
 
-This produces `./minecoaster`. On macOS you can also just run `./build.sh`, or
-double-click `MINECOASTER.command`.
+This produces `opengl/minecoaster`. On macOS you can also just run `opengl/build.sh`,
+or double-click `opengl/MINECOASTER.command`.
+
+## Build (Vulkan alpha)
+
+```sh
+cmake -B vulkan/build -S vulkan
+cmake --build vulkan/build -j
+```
+
+Requires the Vulkan SDK (glslangValidator) + SDL2. See [`vulkan/README.md`](vulkan/README.md).
+
+## Windows RTX renderer (DXR + DLSS 4.5)
+
+A **hardware ray-tracing** renderer for Windows + NVIDIA RTX lives in
+[`win-rtx/`](win-rtx/). It bakes the same voxel world, builds a DXR acceleration
+structure from the 8³ macro-bricks, path-traces it on RT cores, and denoises +
+upscales with **DLSS 4.5** (Super Resolution + Ray Reconstruction) via NVIDIA
+Streamline — mirroring the look of the software tracer in `opengl/src/pathtrace.cpp`.
+See [`win-rtx/README.md`](win-rtx/README.md) and
+[`win-rtx/ARCHITECTURE.md`](win-rtx/ARCHITECTURE.md).
 
 ## Run
 
 ```sh
-./minecoaster
+opengl/minecoaster
 ```
 
 | Key       | Action                          |
@@ -49,6 +80,6 @@ double-click `MINECOASTER.command`.
 ## Headless tools
 
 ```sh
-./minecoaster --simtest     # ride 8 seeds, report avg speed / inversions / stalls
-./minecoaster --gaudit      # audit per-element felt-g against the envelope
+opengl/minecoaster --simtest     # ride 8 seeds, report avg speed / inversions / stalls
+opengl/minecoaster --gaudit      # audit per-element felt-g against the envelope
 ```
