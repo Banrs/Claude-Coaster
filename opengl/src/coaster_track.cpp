@@ -210,8 +210,8 @@ struct Track {
                     : 0.0f;
                 float g = 1.0f + v * v * kappa / GRAV;
                 if (g <= GCAP) break;
-                if (rR >= rBase * 4.0f - 0.01f) break;
-                rR = fminf(rR * 1.16f, rBase * 4.0f);
+                if (rR >= rBase * 2.6f - 0.01f) break;
+                rR = fminf(rR * 1.16f, rBase * 2.6f);
                 rfwdStep = stepBase * (rR / rBase);
             }
         }
@@ -388,14 +388,14 @@ struct Track {
     struct InvSpec { float gT, rMin, rMaxRec, gMul, hMul; };
     static InvSpec invSpec(SegMode m) {
         switch (m) {
-            // Scaled up ~1.45x (record-sized): bigger radii hold g down at the higher ride speed.
-            case M_LOOP:     return {3.7f, 22.0f, 32.0f, 1.6f, 2.6f};
-            case M_IMMEL:    return {3.2f, 24.0f, 38.0f, 1.0f, 2.0f};
-            case M_DIVELOOP: return {2.6f, 26.0f, 40.0f, 1.0f, 2.0f};
-            case M_COBRA:    return {3.0f, 22.0f, 35.0f, 1.0f, 2.2f};
-            case M_PRETZEL:  return {3.6f, 28.0f, 38.0f, 1.0f, 2.0f};
-            case M_ROLL:     return {3.0f, 12.0f, 22.0f, 1.0f, 1.6f};   // brake entry so the corkscrew holds g
-            case M_HEARTLINE:return {2.2f, 16.0f, 26.0f, 1.0f, 1.6f};   // brake entry to tame lateral g
+            // Record-sized (NOT inflated): g is held down by braking the ENTRY speed, not by huge radii.
+            case M_LOOP:     return {3.7f, 15.0f, 22.0f, 1.6f, 2.6f};
+            case M_IMMEL:    return {3.2f, 17.0f, 26.0f, 1.0f, 2.0f};
+            case M_DIVELOOP: return {2.6f, 18.0f, 28.0f, 1.0f, 2.0f};
+            case M_COBRA:    return {3.0f, 15.0f, 24.0f, 1.0f, 2.2f};
+            case M_PRETZEL:  return {3.6f, 20.0f, 26.0f, 1.0f, 2.0f};
+            case M_ROLL:     return {3.0f, 10.0f, 16.0f, 1.0f, 1.6f};   // brake entry so the corkscrew holds g at realistic size
+            case M_HEARTLINE:return {2.2f, 14.0f, 20.0f, 1.0f, 1.6f};   // brake entry to tame lateral g
             default:         return {0.0f,  0.0f,  0.0f, 1.0f, 2.0f};
         }
     }
@@ -403,8 +403,8 @@ struct Track {
     static float invRAt(SegMode m, float v, float &brakeTo) {
         InvSpec s = invSpec(m);
         if (s.gT <= 0.0f) { brakeTo = 0.0f; return 0.0f; }
-        const float gCeil = 8.0f;            // brake inversion entry to hold +8 g (was 10)
-        float rMax = s.rMaxRec * 1.45f;      // allow larger-than-record radii for low-g at high speed
+        const float gCeil = 8.0f;            // brake inversion entry to hold +8 g
+        float rMax = s.rMaxRec * 1.30f;      // cap at world-record +30% (manage g by speed, not size)
         float vv   = Clamp(v, 28.0f, 135.0f);
 
         float R    = Clamp(vv * vv / ((s.gT - 1.0f) * GRAV * s.gMul), s.rMin, rMax);
