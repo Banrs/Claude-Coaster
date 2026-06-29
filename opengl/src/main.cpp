@@ -24,7 +24,7 @@ static const float BUILD_MAX  = 430.0f;
 static const float TERRA_MAX  = 320.0f;
 static const float GRAV      = 9.81f;
 
-static float       DRAG      = 0.00060f;  // drops settle ~10-20 km/h below the boost peak; minimal braking elsewhere
+static float       DRAG      = 0.00048f;  // lower drag lifts avg to ~223 km/h AND flattens the speed profile so gen-speed tracks ride-speed (fewer g outliers); drops still settle below boost
 static const float FRICTION  = 0.010f;    // steel-on-steel rolling resistance (low)
 static const float CHAIN_V   = 22.0f;
 static const float MIN_V     = 42.0f;
