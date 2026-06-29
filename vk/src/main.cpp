@@ -357,15 +357,24 @@ static VkPipeline makeHudPipe(VkDevice dev, VkRenderPass rp, VkPipelineLayout la
 
 // ---- world ----
 struct World { Mesh mesh; Mesh water; Vec3 focus; ::Track trk; };
+static const float PATCH_HALF = 175.0f;   // terrain patch radius around the active centre
+// (Re)build the terrain/trees/track/water meshes around an arbitrary centre.
+// terrainH(x,z) is a pure function of world position, so re-centring just slides
+// the rendered window over the same infinite world — this is what makes terrain
+// (and the on-demand-generated coaster) effectively endless / streaming.
+static void buildWorldMeshes(World& w, Vec3 center){
+    w.mesh.verts.clear(); w.mesh.idx.clear();
+    float half=PATCH_HALF; w.focus=center;
+    world::buildTerrain(center.x,center.z,half,1.0f,w.mesh);
+    world::buildTrees(center.x,center.z,half,w.mesh);
+    world::buildTrackMesh(w.trk,w.mesh,center.x,center.z,half);
+    world::buildStation(w.trk,w.mesh,center.x,center.z,half);
+    world::buildCoins(w.trk,w.mesh,center.x,center.z,half);
+    w.water=world::buildWaterMesh(center.x,center.z,1600.0f,120);     // ocean follows the centre
+}
 static World buildWorld(){
-    World w; ::Track& trk=w.trk; world::genLongTrack(trk,2200);
-    w.focus=world::trackFocus(trk,260); float half=170.0f;
-    world::buildTerrain(w.focus.x,w.focus.z,half,1.0f,w.mesh);
-    world::buildTrees(w.focus.x,w.focus.z,half,w.mesh);
-    world::buildTrackMesh(trk,w.mesh,w.focus.x,w.focus.z,half);
-    world::buildStation(trk,w.mesh,w.focus.x,w.focus.z,half);
-    world::buildCoins(trk,w.mesh,w.focus.x,w.focus.z,half);
-    w.water=world::buildWaterMesh(w.focus.x,w.focus.z,1600.0f,120);   // ocean to the horizon around the island
+    World w; world::genLongTrack(w.trk,2200);
+    buildWorldMeshes(w, world::trackFocus(w.trk,260));
     printf("[vk] world mesh: %zu verts, %zu tris; water: %zu tris\n",
            w.mesh.verts.size(), w.mesh.idx.size()/3, w.water.idx.size()/3);
     printf("[vk] focus: %.1f %.1f %.1f\n", w.focus.x, w.focus.y, w.focus.z);
@@ -591,6 +600,15 @@ struct Renderer {
             vkMapMemory(dev,wvb.mem,0,wvbS,0,&p); memcpy(p,w.water.verts.data(),wvbS); vkUnmapMemory(dev,wvb.mem);
             vkMapMemory(dev,wib.mem,0,wibS,0,&p); memcpy(p,w.water.idx.data(),wibS); vkUnmapMemory(dev,wib.mem);
         }
+    }
+    // Re-upload after the world re-bakes around a new centre (streaming).
+    void reuploadMesh(const World& w){
+        vkDeviceWaitIdle(dev);
+        vkDestroyBuffer(dev,vb.buf,nullptr); vkFreeMemory(dev,vb.mem,nullptr);
+        vkDestroyBuffer(dev,ib.buf,nullptr); vkFreeMemory(dev,ib.mem,nullptr);
+        if(waterIndexCount){ vkDestroyBuffer(dev,wvb.buf,nullptr); vkFreeMemory(dev,wvb.mem,nullptr);
+                             vkDestroyBuffer(dev,wib.buf,nullptr); vkFreeMemory(dev,wib.mem,nullptr); }
+        uploadMesh(w);
     }
     void buildTargets(VkExtent2D e){
         ext=e; halfExt={ (e.width+1)/2, (e.height+1)/2 };
@@ -853,7 +871,7 @@ static void makeSwap(VkPhysicalDevice pd, VkDevice dev, VkSurfaceKHR surf, Swap&
     uint32_t ni=0; vkGetSwapchainImagesKHR(dev,s.chain,&ni,nullptr); s.images.resize(ni); vkGetSwapchainImagesKHR(dev,s.chain,&ni,s.images.data());
 }
 
-static int runWindowed(const World& world, const std::string& sd, int maxFrames){
+static int runWindowed(World& world, const std::string& sd, int maxFrames){
     if(SDL_Init(SDL_INIT_VIDEO)!=0){ fprintf(stderr,"SDL_Init: %s\n",SDL_GetError()); return 1; }
     uint32_t W=1280,H=720;
     SDL_Window* win=SDL_CreateWindow("MINECOASTER (Vulkan)",SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED,W,H,SDL_WINDOW_VULKAN|SDL_WINDOW_RESIZABLE);
@@ -881,6 +899,7 @@ static int runWindowed(const World& world, const std::string& sd, int maxFrames)
 
     FlyCam cam; cam.pos=world.focus+Vec3{120,86,150};
     world::RideSim rs; rs.reset(world.trk); bool rideMode=false; RideTelemetry tel; float telAcc=0;
+    Vec3 streamCenter=world.focus;   // re-bake the patch around the viewer as they roam (endless world)
     SDL_SetRelativeMouseMode(SDL_TRUE);
     printf("[vk] controls: WASD move, Q/E down/up, mouse look, Shift fast, C ride coaster, Esc quit\n");
     auto recreate=[&](){ vkDeviceWaitIdle(R.dev); vkDestroySwapchainKHR(R.dev,swap.chain,nullptr); makeSwap(R.pd,R.dev,surf,swap,W,H); R.resize(swap.ext); };
@@ -911,6 +930,14 @@ static int runWindowed(const World& world, const std::string& sd, int maxFrames)
             if(ks[SDL_SCANCODE_E])cam.pos.y+=sp; if(ks[SDL_SCANCODE_Q])cam.pos.y-=sp;
             view=cam.view();
         }
+        // --- streaming: re-bake terrain/track/water around the viewer when they
+        //     leave the current patch, so the world is effectively endless ---
+        { Vec3 here=view.pos; float dx=here.x-streamCenter.x, dz=here.z-streamCenter.z;
+          if(dx*dx+dz*dz > (PATCH_HALF*0.6f)*(PATCH_HALF*0.6f)){
+            buildWorldMeshes(world, Vec3{here.x, world.focus.y, here.z});
+            R.reuploadMesh(world); R.setCenter(Vec3{here.x, groundTopAt(here.x,here.z), here.z});
+            streamCenter=here; last=SDL_GetTicks();   // skip the rebuild stall in dt
+          } }
 
         VK_CHECK(vkWaitForFences(R.dev,1,&fence,VK_TRUE,UINT64_MAX));
         uint32_t idx; VkResult acq=vkAcquireNextImageKHR(R.dev,swap.chain,UINT64_MAX,semAcq,VK_NULL_HANDLE,&idx);
