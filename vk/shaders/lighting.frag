@@ -57,14 +57,14 @@ vec4 cloudVolume(vec3 ro, vec3 rd, vec3 sun, float lift){
   return vec4(acc, 1.0-trans);
 }
 vec3 skyCol(vec3 d, vec3 sun, vec3 ro){
-  const vec3 ZEN=vec3(0.025,0.17,0.58), MID=vec3(0.13,0.40,0.82), HOR=vec3(0.55,0.74,0.97);
-  const vec3 HAZE=vec3(1.0,0.78,0.48), GND=vec3(0.30,0.38,0.47);
+  const vec3 ZEN=vec3(0.020,0.14,0.55), MID=vec3(0.10,0.34,0.80), HOR=vec3(0.30,0.54,0.88);
+  const vec3 HAZE=vec3(1.0,0.80,0.52), GND=vec3(0.20,0.40,0.62);
   float h = clamp(d.y*0.5+0.5,0.0,1.0); float t = smoothstep(0.03,0.92,h);
   vec3 c = mix(HOR,MID,smoothstep(0.0,0.55,t)); c = mix(c,ZEN,smoothstep(0.34,1.0,t));
-  float airMass = exp(-max(d.y,0.0)*2.6); c = mix(c, HOR, airMass*0.22);
+  float airMass = exp(-max(d.y,0.0)*2.6); c = mix(c, HOR, airMass*0.10);
   float hz = exp(-abs(d.y)*4.2); float lift = smoothstep(-0.12,0.55,sun.y);
-  c += HOR*hz*0.10; c += HAZE*hz*(0.05+0.10*(1.0-lift));
-  c = mix(GND,c,smoothstep(-0.10,0.04,d.y));
+  c += HOR*hz*0.05; c += HAZE*hz*(0.03+0.07*(1.0-lift));
+  c = mix(GND,c,smoothstep(-0.28,-0.02,d.y));
   float mu = clamp(dot(d,sun),-1.0,1.0); float fwd = max(mu,0.0);
   c *= 0.55+0.45*mu*mu;
   vec3 sunTint = mix(vec3(1.0,0.62,0.32),vec3(1.0,0.90,0.70),lift);
