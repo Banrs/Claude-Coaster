@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <thread>
+#include <atomic>
 #include <climits>
 
 static const float SEG_LEN   = 14.0f;
@@ -485,10 +486,11 @@ struct TerrainMesh {
     int keyCx = INT_MIN, keyCz = INT_MIN, keyU = INT_MIN;
     std::thread worker;
     bool building = false;
+    std::atomic<bool> ready{false};   // worker sets when the CPU build has finished
     int  pendCx = 0, pendCz = 0, pendU = 0;
 
-    static const int REBUILD_CELLS = 12;
-    static const int REBUILD_U     = 3;
+    static const int REBUILD_CELLS = 40;   // re-centre the mesh every ~40 m (was 12 -> rebuilt ~7x/sec at speed)
+    static const int REBUILD_U     = 8;
     bool needsRebuild(int cx, int cz, int uIdx) const {
         if (building) return false;
         return !live || abs(cx - keyCx) >= REBUILD_CELLS || abs(cz - keyCz) >= REBUILD_CELLS
@@ -498,14 +500,19 @@ struct TerrainMesh {
     template <class EmitFn>
     void dispatch(EmitFn &&emit, int cx, int cz, int uIdx) {
         pendCx = cx; pendCz = cz; pendU = uIdx; building = true;
+        ready = false;
         gCapPos.clear(); gCapUV.clear(); gCapNrm.clear(); gCapCol.clear();
 
-        worker = std::thread([emit]() { gCapture = true; emit(); gCapture = false; });
+        worker = std::thread([this, emit]() { gCapture = true; emit(); gCapture = false; ready = true; });
     }
 
     int capVerts = 0;
-    void finish() {
+    // block=false: poll — only join+upload once the worker has finished, so the main thread
+    // never stalls on the ~90 ms build (the previous mesh stays visible meanwhile). block=true:
+    // wait (first build / screenshot modes / shutdown, where a complete mesh must exist now).
+    void finish(bool block = false) {
         if (!building) return;
+        if (!block && !ready.load()) return;
         if (worker.joinable()) worker.join();
         int vcount = (int)(gCapPos.size() / 3);
         if (vcount > 0) {
@@ -1426,7 +1433,9 @@ int main(int argc, char **argv) {
 
         double tFrame0 = GetTime();
 
-        gTerrainMesh.finish();
+        // Poll in play + bench (no stall); block only in single-frame screenshot modes that
+        // need a fully built mesh at capture time.
+        gTerrainMesh.finish(shotMode || rttestMode || cobraShot || elemShot);
         float rawDt = (shotMode || benchMode || rttestMode || cobraShot || elemShot) ? (1.0f / 60.0f) : GetFrameTime();
         static float dtOverride = getenv("MC_DT") ? (float)atof(getenv("MC_DT")) : 0.0f;
         if (dtOverride > 0.0f) rawDt = dtOverride;  // streaming stress/verify: force per-frame sim step
@@ -1837,6 +1846,12 @@ int main(int argc, char **argv) {
         int ccx = (int)floorf(P.x / CELL), ccz = (int)floorf(P.z / CELL);
         float fogEnd = TERRA_R * CELL;
 
+        // The height prefill + track carve is the worker's INPUT and an O(TERRA_R^2) per-frame
+        // cost. Only refresh it on a rebuild frame: cheap on the ~99% of frames that just redraw
+        // the cached mesh, and it stays stable while the async worker consumes it (rebuilds are
+        // gated until the in-flight build finishes, so the inputs aren't overwritten mid-build).
+        bool wantRebuild = gTerrainMesh.needsRebuild(ccx, ccz, (int)u);
+        if (wantRebuild) {
         prefillTerrain(ccx, ccz, TERRA_R);
 
         std::fill(carveLo.begin(), carveLo.end(),  1e9f);
@@ -1929,8 +1944,9 @@ int main(int argc, char **argv) {
                     if (hi > carveHi[ci]) carveHi[ci] = hi;
                 }
         }
+        }   // end if (wantRebuild) — prep only on rebuild frames
 
-        auto buildTerrainMesh = [&]() {
+        auto buildTerrainMesh = [&, ccx, ccz, u, fogEnd]() {
         {
         const bool depthPass = false;
         waterCells.clear();
@@ -2379,9 +2395,9 @@ int main(int argc, char **argv) {
         }
         };
 
-        if (gTerrainMesh.needsRebuild(ccx, ccz, (int)u)) {
+        if (wantRebuild) {
             gTerrainMesh.dispatch(buildTerrainMesh, ccx, ccz, (int)u);
-            if (!gTerrainMesh.live) gTerrainMesh.finish();
+            if (!gTerrainMesh.live) gTerrainMesh.finish(true);   // first build: must have a mesh to draw
         }
 
         Matrix lightVP = gShadow.computeLightVP(P);
@@ -3076,7 +3092,7 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
     }
-    gTerrainMesh.finish();
+    gTerrainMesh.finish(true);   // shutdown: join the worker before teardown
 
     if (benchMode) {
         static const char *EN[M_COUNT] = {
