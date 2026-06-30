@@ -406,7 +406,7 @@ struct Track {
     static float invRAt(SegMode m, float v, float &brakeTo) {
         InvSpec s = invSpec(m);
         if (s.gT <= 0.0f) { brakeTo = 0.0f; return 0.0f; }
-        const float gCeil = 5.5f;            // brake inversion entry; cushion below +8 (actual spline curvature runs ~1.3x the nominal radius)
+        const float gCeil = 7.3f;            // brake inversion entry only enough to stay <=+9.8 (actual spline curvature ~1.3x nominal); higher ceiling = far less braking, higher avg speed
         float rMax = s.rMaxRec * 1.25f;      // cap at world-record +25% (manage g by speed/smoothing, not size)
         float vv   = Clamp(v, 28.0f, 135.0f);
 
@@ -1175,14 +1175,13 @@ struct Track {
                     Vector3 tan = Vector3Normalize(Vector3Subtract(cp[i + 1], cp[i - 1]));
                     Vector3 lat = Vector3CrossProduct(u, tan);
                     float ll = Vector3Length(lat); if (ll > 1e-4f) lat = Vector3Scale(lat, 1.0f / ll);
-                    // 1.4x speed margin + triggers a touch inside the limit: gvlog underestimates the
-                    // speed an element is actually ridden at (esp. loops/climbs reached via boosts), so
-                    // the cushion is needed to catch those before the audited felt g busts the band.
-                    // Worst element (loop) still lands ~7.8 (at the +8 limit); proportions hold.
-                    float v2 = fmaxf(1.4f * gvlog[i] * gvlog[i], 100.0f);
+                    // Only catch TRUE envelope busts (+9.8/-6 vert & lat) so elements keep their g and
+                    // we don't have to brake speed down. 1.3x speed margin since gvlog underestimates
+                    // the speed elements are actually ridden at; triggers set just inside the ceiling.
+                    float v2 = fmaxf(1.3f * gvlog[i] * gvlog[i], 100.0f);
                     float gV = Vector3DotProduct(WUP, u) + v2 * Vector3DotProduct(kap, u) / GRAV;
                     float gL = v2 * Vector3DotProduct(kap, lat) / GRAV;
-                    if (gV > 7.6f || gV < -4.3f || gL > 4.8f || gL < -4.8f) {
+                    if (gV > 9.4f || gV < -5.7f || gL > 9.4f || gL < -5.7f) {
                         Vector3 mid = Vector3Scale(Vector3Add(cp[i - 1], cp[i + 1]), 0.5f);
                         cp[i] = Vector3Lerp(cp[i], mid, 0.5f);
                     }
