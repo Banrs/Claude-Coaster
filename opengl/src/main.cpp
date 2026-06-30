@@ -1888,6 +1888,9 @@ int main(int argc, char **argv) {
 
                     float clampY = loY - 3.0f;
                     float coilR = radMax + 2.0f;
+                    // Only clear an ANNULUS under the track ring (the coil sits at ~radMax around the
+                    // axis); flattening the whole interior disc made a giant flat "stone mesa" artifact.
+                    float innerR = fmaxf(radMax - 9.0f, 0.0f);
                     int acx = (int)floorf(ax.x / CELL), acz = (int)floorf(ax.z / CELL);
                     int rc = (int)ceilf(coilR / CELL) + 1;
                     for (int oz = -rc; oz <= rc; oz++)
@@ -1896,7 +1899,8 @@ int main(int argc, char **argv) {
                             if (dx < -TERRA_R || dx > TERRA_R || dz < -TERRA_R || dz > TERRA_R) continue;
                             float cwx = (acx + ox) * CELL + CELL * 0.5f - ax.x;
                             float cwz = (acz + oz) * CELL + CELL * 0.5f - ax.z;
-                            if (cwx*cwx + cwz*cwz > coilR*coilR) continue;
+                            float r2c = cwx*cwx + cwz*cwz;
+                            if (r2c > coilR*coilR || r2c < innerR*innerR) continue;
                             int ci = (dz + TERRA_R) * carveW + (dx + TERRA_R);
                             if (clampY < forceTop[ci]) forceTop[ci] = clampY;
                         }
@@ -2199,36 +2203,6 @@ int main(int argc, char **argv) {
 
         float trackFog = fogEnd * 1.9f;
 
-        Vector3 hxAxis = { 0, 0, 0 }; int hxN = 0; float hxTopY = -1e9f;
-        int hxSeed = -1;
-        for (int i = k0; i <= k1 && i + 1 < (int)trk.cp.size(); i++)
-            if (trk.kind[i] == M_HELIX) { hxSeed = i; break; }
-        if (hxSeed >= 0) {
-            int a = hxSeed, b = hxSeed;
-            while (a > 1 && trk.kind[a - 1] == M_HELIX) a--;
-            while (b + 2 < (int)trk.cp.size() && trk.kind[b + 1] == M_HELIX) b++;
-            for (int i = a; i <= b; i++) {
-                hxAxis.x += trk.cp[i].x; hxAxis.z += trk.cp[i].z; hxN++;
-                if (trk.cp[i].y > hxTopY) hxTopY = trk.cp[i].y;
-            }
-        }
-        bool haveHx = hxN >= 4;
-        if (haveHx) {
-            hxAxis.x /= hxN; hxAxis.z /= hxN;
-            float gAxis = groundTopAt(hxAxis.x, hxAxis.z), th = hxTopY - gAxis;
-            float ddxA = hxAxis.x - P.x, ddzA = hxAxis.z - P.z;
-            float fogA = Clamp((sqrtf(ddxA*ddxA+ddzA*ddzA) - trackFog*0.70f)/(trackFog*0.27f), 0.0f, 1.0f);
-            if (fogA < 0.97f && th > 3.0f) {
-                Color scA = mixc(Color{ 122, 126, 134, 255 }, FOG, fogA);
-
-                float tw = 1.4f;
-                for (float sx : { -1.0f, 1.0f }) for (float sz : { -1.0f, 1.0f })
-                    drawCubeTex(T_IRON, Vector3{ hxAxis.x + sx*tw, gAxis + th*0.5f, hxAxis.z + sz*tw }, 0.34f, th, 0.34f, scA);
-                for (float ry = gAxis + 8.0f; ry < hxTopY - 2.0f; ry += 9.0f)
-                    drawCubeTex(T_IRON, Vector3{ hxAxis.x, ry, hxAxis.z }, 2.0f*tw + 0.4f, 0.32f, 2.0f*tw + 0.4f, scA);
-            }
-        }
-
         auto drawVBent = [&](Vector3 p, float topY, float gC, Vector3 lat, Vector3 tang, Vector3 railUp, Color sc) {
             float hgt = topY - gC;
             if (hgt < 1.0f) return;
@@ -2297,11 +2271,6 @@ int main(int argc, char **argv) {
             Vector3 t = Vector3Normalize(Vector3Subtract(trk.cp[i + 1], trk.cp[i - 1]));
             Vector3 lat = Vector3Normalize(Vector3CrossProduct(Vector3{ t.x, 0, t.z }, Vector3{ 0, 1, 0 }));
             Color sc = mixc(Color{ 118, 122, 130, 255 }, FOG, fog);
-            if (tg == M_HELIX && haveHx) {
-                drawCubeTex(T_IRON, Vector3{ (p.x + hxAxis.x)*0.5f, p.y - 0.6f, (p.z + hxAxis.z)*0.5f },
-                            fabsf(hxAxis.x - p.x) + 0.4f, 0.30f, fabsf(hxAxis.z - p.z) + 0.4f, sc);
-                continue;
-            }
 
             float topY = p.y - 0.5f;
             float gC   = groundTopAt(p.x, p.z);
