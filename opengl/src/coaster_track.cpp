@@ -25,6 +25,8 @@ struct Track {
     float   genPrevCurv = 0;
     float   genPrevDyaw = 0;
     float   genV      = LAUNCH_V;
+    float   genFloorY = -1e9f;   // curvature-bounded terrain floor (lifts track out of the ground smoothly)
+    float   genFloorVy = 0.0f;
     unsigned char lastGenMode = (unsigned char)M_FLAT;
     Vector3 genPrevUp = WUP;
     int     upEaseSteps = 0;
@@ -129,7 +131,7 @@ struct Track {
         mode = M_FLAT; remain = 3; turnDir = 1; turnMag = 0.4f; mega = false; elems = 0;
         elemLimit = irnd(7, 11); queuedInv = 0; launchElem = M_CLIMB;
         lastElem = M_FLAT; prevElem = M_FLAT; helixDrop = -3.4f; genV = LAUNCH_V;
-        genPrevDy = 0; genPrevCurv = 0; genPrevDyaw = 0;
+        genPrevDy = 0; genPrevCurv = 0; genPrevDyaw = 0; genFloorY = -1e9f; genFloorVy = 0;
         setClearance(10.0f, 24.0f);
 
         pushCP(gpos, WUP, (unsigned char)M_LAUNCH);
@@ -1192,20 +1194,27 @@ struct Track {
                 }
         }
 
-        // Rate-limited terrain floor: the smoothing/relaxation passes above pull cps ~15-30 m below
-        // the per-cp terrain clamp (the track rides under the ground). Lift the just-frozen cp
-        // (index n-15: out of the smoothing window AND not read by the genV step below, so element
-        // sizing is untouched) up onto the terrain -- but rising no faster than ~7 m/cp (~26 deg) so
-        // a sharp terrain spike becomes a climbable slope, never the vertical wall that stalled the
-        // generator. Elevated track (cp above terrain) is left alone.
+        // Curvature-bounded terrain floor: the smoothing/relaxation passes above pull cps below the
+        // per-cp terrain clamp, so the track rides under the ground. Lift the just-frozen cp (index
+        // n-15: out of the smoothing window and not read by the genV step below) onto the terrain --
+        // but the floor climbs as a SMOOTH ramp (bounded slope AND bounded acceleration) so it never
+        // creates the convex kink that a hard rate-limited lift did (+30 g spikes). Where terrain
+        // rises faster than the curvature bound allows, the floor lags (a little underground) rather
+        // than spiking g -- the lesser evil. Elevated track (cp above the floor) is untouched.
         if ((int)cp.size() >= 16) {
             int i = (int)cp.size() - 15;
             unsigned char ki = kind[i];
-            if (ki != M_STATION) {   // stations stay dead flat; everything else (incl. LAUNCH) rides up onto the terrain rather than tunnelling through it -- an uphill launch still reaches 310 (thrust >> gravity)
-                float clr    = (ki == M_DIP) ? 1.5f : 4.5f;   // DIP skims water shallower; still floored so it can't plunge through a hillside
-                float tf     = groundTopAt(cp[i].x, cp[i].z) + clr;
-                float floorY = fminf(tf, cp[i - 1].y + 8.0f);
-                if (cp[i].y < floorY) cp[i].y = floorY;
+            if (ki != M_STATION) {
+                float clr = (ki == M_DIP) ? 1.5f : 4.5f;
+                float tf  = groundTopAt(cp[i].x, cp[i].z) + clr;
+                if (tf <= genFloorY) {            // terrain at/below the floor: follow it down, reset the climb
+                    genFloorY = tf; genFloorVy = 0.0f;
+                } else {                           // terrain above: climb toward it, easing the slope in (bounded g)
+                    genFloorVy = fminf(genFloorVy + 1.8f, 10.0f);   // +accel cap (curvature ~ +6 g at 80 m/s) ... slope cap 10 m/cp (~36 deg)
+                    genFloorY += genFloorVy;
+                    if (genFloorY > tf) { genFloorY = tf; genFloorVy = 0.0f; }
+                }
+                if (cp[i].y < genFloorY) cp[i].y = genFloorY;
             }
         }
 
