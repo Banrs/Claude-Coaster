@@ -406,7 +406,7 @@ struct Track {
     static float invRAt(SegMode m, float v, float &brakeTo) {
         InvSpec s = invSpec(m);
         if (s.gT <= 0.0f) { brakeTo = 0.0f; return 0.0f; }
-        const float gCeil = 7.3f;            // brake inversion entry only enough to stay <=+9.8 (actual spline curvature ~1.3x nominal); higher ceiling = far less braking, higher avg speed
+        const float gCeil = 7.8f;            // brake inversion entry only enough to stay <=+9.8 (actual spline curvature ~1.3x nominal); higher ceiling = far less braking, higher avg speed
         float rMax = s.rMaxRec * 1.25f;      // cap at world-record +25% (manage g by speed/smoothing, not size)
         float vv   = Clamp(v, 28.0f, 135.0f);
 
@@ -443,7 +443,7 @@ struct Track {
         mode = M_HELIX;
         setClearance(18.0f, 58.0f);
         turnDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        turnMag = turnMagFor(4.5f, 0.10f, 0.55f);
+        turnMag = turnMagFor(5.5f, 0.13f, 0.55f);   // ~5.5 g lateral target -> radius ~100-120 m (was ~140-160 m); smaller without spiking g at the ~76 m/s it's ridden
         bankT   = frnd(0.62f, 0.82f);
 
         float R = SEG_LEN / turnMag;
@@ -771,11 +771,11 @@ struct Track {
             // turn entry/exit into a lateral-g spike; the coefficient is speed-scaled.
             float jlimYaw = Clamp(1.1f * SEG_LEN * GRAV / fmaxf(genV * genV, 100.0f), 0.0010f, 0.16f);
             dyaw = Clamp(dyaw, genPrevDyaw - jlimYaw, genPrevDyaw + jlimYaw);
-            // Cap sustained turn rate so lateral g stays within ~8 felt at the speeds turns are
-            // ridden (often faster than the gen-time genV right after a drop). Size for a high
-            // reference speed but keep radii within ~WR+25-40% (don't make turns unrealistically wide).
+            // Cap sustained turn rate so lateral g stays near the +9.8 limit (not above) at the speeds
+            // turns are ridden. Higher cap = TIGHTER turns/helices (smaller, more thrilling) instead of
+            // the old huge-radius low-g spirals. The felt-g safety net still trims anything over.
             float vCap = fmaxf(genV, 80.0f);
-            float dyawMax = 4.0f * SEG_LEN * GRAV / (vCap * vCap);
+            float dyawMax = 5.5f * SEG_LEN * GRAV / (vCap * vCap);
             dyaw = Clamp(dyaw, -dyawMax, dyawMax);
             genPrevDyaw = dyaw;
         }
