@@ -1024,7 +1024,8 @@ int main(int argc, char **argv) {
 
                 if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !t.chainAt(u) && v < 36.0f)
                     v = fminf(v + 28.0f * dt, 36.0f);
-                v = fmaxf(v, 20.0f);   // no hard speed cap (speed self-limits via drag near LAUNCH_V)
+                v = fmaxf(v, 20.0f);
+            v = fminf(v, 86.4f);   // max-speed ceiling: 86.4 m/s = 311 km/h (user: keep max < 312 on all seeds). Clips only the drop/boost peaks, so avg is barely affected.
                 if (f > 120) { sumV += v; nV++; gSumV += v; gNV++; if (v > maxV) maxV = v;
                     if (tg == M_BOOST) gBoostF++; if (tg == M_LAUNCH) gLaunchF++;
                     if (tg != prevTag && Track::isHardInversion((SegMode)tg)) gInv++;
@@ -1130,7 +1131,8 @@ int main(int argc, char **argv) {
                 }
                 if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !t.chainAt(u) && v < 36.0f)
                     v = fminf(v + 28.0f * dt, 36.0f);
-                v = fmaxf(v, 20.0f);   // no hard speed cap (speed self-limits via drag near LAUNCH_V)
+                v = fmaxf(v, 20.0f);
+            v = fminf(v, 86.4f);   // max-speed ceiling: 86.4 m/s = 311 km/h (user: keep max < 312 on all seeds). Clips only the drop/boost peaks, so avg is barely affected.
                 int ki = (int)u;
                 if (ki > lastK) { for (int q = lastK + 1; q <= ki && q < n; q++) vAt[q] = v; lastK = ki; }
                 float du = v * dt / fmaxf(t.speedScale(u), 0.5f);
@@ -1223,7 +1225,8 @@ int main(int argc, char **argv) {
                 v += acc * dt;
                 if (t.tagAt(u) == M_LAUNCH) v += 100.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;   // punchy LSM thrust, fades near ~320 (no clamp)
                 if (t.tagAt(u) == M_BOOST)  v += 120.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;   // boost thrust, fades near ~320 (no clamp)
-                v = fmaxf(v, 20.0f);   // no hard speed cap (speed self-limits via drag near LAUNCH_V)
+                v = fmaxf(v, 20.0f);
+            v = fminf(v, 86.4f);   // max-speed ceiling: 86.4 m/s = 311 km/h (user: keep max < 312 on all seeds). Clips only the drop/boost peaks, so avg is barely affected.
 
                 sinceStation += dt;
                 if (sinceStation > 6.0f && !t.stationPending && !t.stationActive)
@@ -1592,7 +1595,8 @@ int main(int argc, char **argv) {
 
             if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !onLift && v < 36.0f)
                 v = fminf(v + 28.0f * dt, 36.0f);
-            v = fmaxf(v, 20.0f);   // no hard speed cap (speed self-limits via drag near LAUNCH_V)
+            v = fmaxf(v, 20.0f);
+            v = fminf(v, 86.4f);   // max-speed ceiling: 86.4 m/s = 311 km/h (user: keep max < 312 on all seeds). Clips only the drop/boost peaks, so avg is barely affected.
             if (gForceSpeed > 0.0f) v = gForceSpeed;
 
             sinceStation += dt;
