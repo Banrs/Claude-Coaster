@@ -119,17 +119,6 @@ private:
             if (v < liftV) v = fminf(v + 20.0f * dt, liftV);
         }
 
-        // pre-brake before an upcoming hard inversion (loop/cobra/dive-loop/etc.) to
-        // its radius-appropriate entry speed, so inversions aren't taken at pinned
-        // speed with absurd g-forces. Ported from the base game (main.cpp ~1579).
-        for (float la = 1.0f; la <= 9.0f; la += 1.0f) {
-            SegMode ahead = (SegMode)trk.tagAt(u + la);
-            if (!::Track::isHardInversion(ahead)) continue;
-            float bt = 0.0f; ::Track::invRAt(ahead, v, bt);
-            if (bt > 0.0f && v > bt) v = fmaxf(v - (la <= 4.0f ? 24.0f : 16.0f) * dt, bt);
-            break;
-        }
-
         // small uphill assist on plain track so the train never stalls
         if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !onLift && v < 36.0f)
             v = fminf(v + 28.0f * dt, 36.0f);

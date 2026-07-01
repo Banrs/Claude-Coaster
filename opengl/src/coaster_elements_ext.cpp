@@ -5,7 +5,7 @@
         if (rnd01() < 0.5f) pzSide = Vector3Scale(pzSide, -1.0f);
         pzBase = gpos;
 
-        { float bt; pzR = invRFor(M_PRETZEL, bt); pzR *= frnd(0.85f, 1.0f); }
+        { pzR = invRFor(M_PRETZEL); pzR *= frnd(0.85f, 1.0f); }
         pzDrift = pzR * 1.5f;
         pzLat   = pzR * frnd(1.4f, 1.9f);
         pzSteps = 26;

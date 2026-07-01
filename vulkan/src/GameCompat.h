@@ -1,7 +1,7 @@
 // GameCompat.h — minimal raylib/game shim so the *actual* coaster generator
-// (../../src/coaster_track.cpp) compiles unchanged inside the Vulkan build.
+// (../../opengl/src/coaster_track.cpp) compiles unchanged inside the Vulkan build.
 // Provides the symbols that file references: Vector3 + the raymath subset, the
-// physics constants, the RNG, the SegMode enum, Color/Theme/Coin, and
+// physics constants, the RNG, the SegMode enum, Color/Theme, and
 // groundTopAt() (backed by the ported terrainH in Terrain.h).
 #pragma once
 #include "Terrain.h"     // world::terrainH, world::WATER_Y
@@ -78,7 +78,6 @@ static const float LAUNCH_V = 100.0f;
 static const float CLIMB_V  = 40.0f;
 static float       BOOST_V  = 79.0f;
 static float       BOOST_TRIG = 78.0f;
-static float       INV_GATE = 79.0f;
 static const Vector3 WUP = { 0, 1, 0 };
 
 // ---- RNG (mirror ../../src/main.cpp) ----
@@ -102,7 +101,6 @@ static const Color RAIL = {190,198,212,255};
 static int   gForceElem  = -1;                       // generator debug knobs (unused here)
 static float gForceSpeed = 0.0f;
 
-struct Coin  { Vector3 pos; bool alive; };
 struct Theme { Color body, accent, spine; };
 static const Theme THEMES[] = {
     {{244, 72, 88,255},{255,244,248,255},{214, 44, 78,255}},

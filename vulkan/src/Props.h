@@ -101,26 +101,16 @@ inline void buildStation(const ::Track& trk, Mesh& out, float cx, float cz, floa
                0.30f, 0.08f, 0.30f, gold);
 }
 
-// Build collectible coins as small thin gold boxes. For every alive Coin in
-// trk.coins that lies within the patch, emit one at coin.pos.
+// Build decorative coins as small thin gold boxes, one every ~40 control points
+// slightly above the track (using trk.up[i] for the offset). The base game never
+// actually generates collectible Coin entries on Track (dead feature, removed),
+// so this placeholder placement is the only source of coins in either renderer.
 inline void buildCoins(const ::Track& trk, Mesh& out, float cx, float cz, float half){
     const Vec3 gold{1.00f, 0.83f, 0.30f};
     const float coinR = 0.5f;     // disc radius (right/fwd half-extents)
     const float coinT = 0.10f;    // thin: up half-extent
     Vec3 I{1,0,0}, J{0,1,0}, K{0,0,1};
 
-    if(!trk.coins.empty()){
-        for(const Coin& c : trk.coins){
-            if(!c.alive) continue;
-            if(!inPatchXZ(c.pos.x, c.pos.z, cx, cz, half)) continue;
-            addBox(out, v3(c.pos), I, J, K, coinR, coinT, coinR, gold);
-        }
-        return;
-    }
-
-    // Fallback: trk.coins is empty (e.g. coins not generated), so place a coin
-    // every ~40 control points slightly above the track using trk.up[i] for the
-    // offset, just so there's something to collect/see.
     int N = (int)trk.cp.size();
     for(int i = 0; i < N; i += 40){
         Vector3 P = trk.cp[i];

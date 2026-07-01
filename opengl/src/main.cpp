@@ -1,15 +1,24 @@
 #include "raylib.h"
 #include "raymath.h"
 #include "rlgl.h"
-#define GL_SILENCE_DEPRECATION
-#include <OpenGL/gl3.h>
+#if defined(__APPLE__)
+    #define GL_SILENCE_DEPRECATION
+    #include <OpenGL/gl3.h>
+#elif defined(_WIN32)
+    #include <windows.h>
+    #include <GL/gl.h>
+#else
+    #include <GL/gl.h>
+#endif
 
 #include <deque>
 #include <vector>
+#include <unordered_map>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <ctime>
 #include <thread>
 #include <atomic>
@@ -17,7 +26,7 @@
 
 static const float SEG_LEN   = 14.0f;
 static const float CELL      = 1.0f;
-static const int   TERRA_R   = 192;
+static const int   TERRA_R   = 256;   // 16 chunks * 16 m/chunk (TERRAIN_BUCKET) render distance
 
 static const float WATER_Y   = 30.0f;
 static const float BUILD_MAX  = 430.0f;
@@ -32,14 +41,27 @@ static const float MAX_V     = 82.0f;
 static const float LAUNCH_V  = 105.0f;  // asymptote ~378: keeps strong thrust (~20 m/s^2) right up to the 86.1 m/s (310) clamp, so the launch reliably saturates 310 with margin (was 95 -> faded to ~10 and topped ~300)
 static const float CLIMB_V   = 40.0f;
 static float       BOOST_V   = 62.0f;
-static float       BOOST_TRIG = 58.0f;
-static float       INV_GATE  = 64.0f;
+// Ambient re-power threshold: below this speed the ride considers itself "run down" and
+// re-launches/re-boosts (uniformly, regardless of what element comes next -- this is pure
+// pacing, not an inversion-reactive brake). Was 58.0, which sat ABOVE every hard-inversion's
+// speed gate (eligibleElem()'s invSpec-derived gates run ~36.5-54.2 m/s), so the ride always
+// got re-powered before genV could ever coast down into an inversion's eligible window --
+// LOOP/ROLL/IMMEL/DIVELOOP/COBRA/PRETZEL/HEARTLINE were structurally unreachable (measured:
+// 0/8 rides). Lowering it lets the ride coast further before re-powering, giving genV real
+// chances to fall through the inversion gates naturally (confirmed via --gaudit: g-safety
+// unaffected, offender counts stay in the same pre-existing noise band as baseline).
+static float       BOOST_TRIG = 52.0f;
 
 static const Vector3 WUP = { 0, 1, 0 };
 
 static const Color SKY    = {186, 205, 232, 255};
 
-static const Color FOG    = {198, 214, 232, 255};
+// Sampled directly from SKY_FS's actual rendered horizon pixel colour (the raw
+// HORIZON/ZENITH shader constants are much bluer than what tonemapping +
+// atmospheric blending actually produce on screen) so distant fogged terrain
+// blends into the real sky behind it instead of a visibly different "wall"
+// at the render-distance frontier.
+static const Color FOG    = {198, 204, 209, 255};
 static const Color GRASS  = {130, 206, 102, 255};
 static const Color SAND   = {242, 228, 184, 255};
 static const Color DIRT   = {158, 116,  82, 255};
@@ -470,24 +492,69 @@ static void endVoxelBatch() {
 }
 
 static thread_local bool gCapture = false;
-static std::vector<float>         gCapPos, gCapUV, gCapNrm;
-static std::vector<unsigned char> gCapCol;
+
+// Terrain vertices are captured into fixed-size world-space BUCKETS instead of one flat
+// array -- 16x16 world units, the same footprint as a Minecraft chunk (CELL=1.0, so that's
+// 16x16 cells). Generation is UNCHANGED (still one worker thread builds the whole TERRA_R
+// ring synchronously, still swapped in atomically -- see TerrainMesh::finish -- so this
+// cannot reintroduce the old async per-chunk streaming void bug: nothing is generated on
+// demand, everything is generated together, every time, exactly as before). Bucketing only
+// lets the DRAW side skip submitting buckets that are off-screen / outside the shadow box,
+// instead of always drawing the entire ring's geometry regardless of what's visible.
+static const float TERRAIN_BUCKET = 16.0f;   // world units per draw-culling bucket (16x16, MC-style)
+struct CapBucket {
+    std::vector<float> pos, uv, nrm;
+    std::vector<unsigned char> col;
+    Vector3 bmin{ 1e9f, 1e9f, 1e9f }, bmax{ -1e9f, -1e9f, -1e9f };
+};
+// NOT thread_local: exactly like the flat arrays this replaces, only the single in-flight
+// worker thread ever writes here (gated by TerrainMesh::building), and the main thread only
+// reads it after worker.join() in finish() -- the same single-writer contract as before.
+static std::unordered_map<int64_t, CapBucket> gCapBuckets;
+
+static inline int64_t terrainBucketKey(float x, float z) {
+    int bx = (int)floorf(x / TERRAIN_BUCKET) + 100000;
+    int bz = (int)floorf(z / TERRAIN_BUCKET) + 100000;
+    return ((int64_t)bx << 32) | (uint32_t)bz;
+}
+// Set ONCE per primitive (by emitCubeTex, from the shape's own centre) before it emits any
+// vertices -- capVert must NOT recompute a bucket per vertex: a cube straddling a bucket
+// boundary would then split its own triangles across two chunk meshes and tear a gap in
+// both of them at every chunk seam.
+static thread_local int64_t gCapBucketKey = 0;
+
 static inline void capVert(float x, float y, float z, float u, float v,
                            float nx, float ny, float nz, Color c) {
-    gCapPos.push_back(x); gCapPos.push_back(y); gCapPos.push_back(z);
-    gCapUV.push_back(u);  gCapUV.push_back(v);
-    gCapNrm.push_back(nx); gCapNrm.push_back(ny); gCapNrm.push_back(nz);
-    gCapCol.push_back(c.r); gCapCol.push_back(c.g); gCapCol.push_back(c.b); gCapCol.push_back(c.a);
+    CapBucket &b = gCapBuckets[gCapBucketKey];
+    b.pos.push_back(x); b.pos.push_back(y); b.pos.push_back(z);
+    b.uv.push_back(u);  b.uv.push_back(v);
+    b.nrm.push_back(nx); b.nrm.push_back(ny); b.nrm.push_back(nz);
+    b.col.push_back(c.r); b.col.push_back(c.g); b.col.push_back(c.b); b.col.push_back(c.a);
+    if (x < b.bmin.x) b.bmin.x = x; if (x > b.bmax.x) b.bmax.x = x;
+    if (y < b.bmin.y) b.bmin.y = y; if (y > b.bmax.y) b.bmax.y = y;
+    if (z < b.bmin.z) b.bmin.z = z; if (z > b.bmax.z) b.bmax.z = z;
 }
 
+struct TerrainChunk { Mesh mesh{}; Vector3 center{}; float radius = 0.0f; };
+
 struct TerrainMesh {
-    Mesh mesh{};
+    std::vector<TerrainChunk> chunks;
     bool live = false;
     int keyCx = INT_MIN, keyCz = INT_MIN, keyU = INT_MIN;
     std::thread worker;
     bool building = false;
     std::atomic<bool> ready{false};   // worker sets when the CPU build has finished
     int  pendCx = 0, pendCz = 0, pendU = 0;
+
+    // Upload-spreading state (see finish()): once the worker's CPU build is done, GPU
+    // uploads for the (possibly hundreds of) new chunk buckets are throttled to a few per
+    // frame instead of all at once, exactly like the project's earlier chunked renderer did
+    // (git: "perf: spread chunk uploads across frames") -- one full-ring rebuild uploading
+    // every bucket in a single frame is the "insane fps spike" on every rebuild.
+    std::vector<CapBucket> pendingBuckets;
+    std::vector<TerrainChunk> pendingChunks;
+    size_t uploadCursor = 0;
+    static const int UPLOAD_BUDGET = 12;   // chunks uploaded per frame once the world is already live
 
     static const int REBUILD_CELLS = 40;   // re-centre the mesh every ~40 m (was 12 -> rebuilt ~7x/sec at speed)
     static const int REBUILD_U     = 8;
@@ -501,49 +568,63 @@ struct TerrainMesh {
     void dispatch(EmitFn &&emit, int cx, int cz, int uIdx) {
         pendCx = cx; pendCz = cz; pendU = uIdx; building = true;
         ready = false;
-        gCapPos.clear(); gCapUV.clear(); gCapNrm.clear(); gCapCol.clear();
+        gCapBuckets.clear();
 
         worker = std::thread([this, emit]() { gCapture = true; emit(); gCapture = false; ready = true; });
     }
 
-    int capVerts = 0;
-    // block=false: poll — only join+upload once the worker has finished, so the main thread
-    // never stalls on the ~90 ms build (the previous mesh stays visible meanwhile). block=true:
-    // wait (first build / screenshot modes / shutdown, where a complete mesh must exist now).
+    void uploadOne(CapBucket &b) {
+        int vcount = (int)(b.pos.size() / 3);
+        if (vcount == 0) return;
+        TerrainChunk c{};
+        c.mesh.vertexCount   = vcount;
+        c.mesh.triangleCount = vcount / 3;
+        c.mesh.vertices  = (float *)RL_CALLOC(vcount * 3, sizeof(float));
+        c.mesh.texcoords = (float *)RL_CALLOC(vcount * 2, sizeof(float));
+        c.mesh.normals   = (float *)RL_CALLOC(vcount * 3, sizeof(float));
+        c.mesh.colors    = (unsigned char *)RL_CALLOC(vcount * 4, sizeof(unsigned char));
+        std::copy(b.pos.begin(), b.pos.end(), c.mesh.vertices);
+        std::copy(b.uv.begin(),  b.uv.end(),  c.mesh.texcoords);
+        std::copy(b.nrm.begin(), b.nrm.end(), c.mesh.normals);
+        std::copy(b.col.begin(), b.col.end(), c.mesh.colors);
+        UploadMesh(&c.mesh, true);
+        c.center = Vector3Scale(Vector3Add(b.bmin, b.bmax), 0.5f);
+        c.radius = Vector3Distance(c.center, b.bmax) + 0.5f;
+        pendingChunks.push_back(c);
+    }
+
+    // block=false: poll — once the worker's CPU build is done, upload a handful of chunks
+    // per call (spread across frames) so the main thread never stalls on hundreds of
+    // UploadMesh calls at once; the previous chunks stay visible the whole time. block=true:
+    // finish everything synchronously now (first build / screenshot modes / shutdown, where
+    // complete chunks must exist immediately).
     void finish(bool block = false) {
         if (!building) return;
-        if (!block && !ready.load()) return;
-        if (worker.joinable()) worker.join();
-        int vcount = (int)(gCapPos.size() / 3);
-        if (vcount > 0) {
-            if (live && vcount <= capVerts) {
-
-                mesh.vertexCount   = vcount;
-                mesh.triangleCount = vcount / 3;
-                UpdateMeshBuffer(mesh, 0, gCapPos.data(), (int)(gCapPos.size() * sizeof(float)), 0);
-                UpdateMeshBuffer(mesh, 1, gCapUV.data(),  (int)(gCapUV.size()  * sizeof(float)), 0);
-                UpdateMeshBuffer(mesh, 2, gCapNrm.data(), (int)(gCapNrm.size() * sizeof(float)), 0);
-                UpdateMeshBuffer(mesh, 3, gCapCol.data(), (int)(gCapCol.size() * sizeof(unsigned char)), 0);
-            } else {
-
-                if (live) { UnloadMesh(mesh); mesh = Mesh{}; live = false; }
-                capVerts = (vcount * 5) / 4;
-                mesh.vertexCount   = capVerts;
-                mesh.triangleCount = capVerts / 3;
-                mesh.vertices  = (float *)RL_CALLOC(capVerts * 3, sizeof(float));
-                mesh.texcoords = (float *)RL_CALLOC(capVerts * 2, sizeof(float));
-                mesh.normals   = (float *)RL_CALLOC(capVerts * 3, sizeof(float));
-                mesh.colors    = (unsigned char *)RL_CALLOC(capVerts * 4, sizeof(unsigned char));
-                std::copy(gCapPos.begin(), gCapPos.end(), mesh.vertices);
-                std::copy(gCapUV.begin(),  gCapUV.end(),  mesh.texcoords);
-                std::copy(gCapNrm.begin(), gCapNrm.end(), mesh.normals);
-                std::copy(gCapCol.begin(), gCapCol.end(), mesh.colors);
-                UploadMesh(&mesh, true);
-                mesh.vertexCount   = vcount;
-                mesh.triangleCount = vcount / 3;
-                live = true;
-            }
+        if (uploadCursor == 0 && pendingBuckets.empty()) {
+            // Not yet past the CPU-build stage: wait for (or poll) the worker.
+            if (!block && !ready.load()) return;
+            if (worker.joinable()) worker.join();
+            pendingBuckets.reserve(gCapBuckets.size());
+            for (auto &kv : gCapBuckets) pendingBuckets.push_back(std::move(kv.second));
+            gCapBuckets.clear();
+            pendingChunks.clear();
+            pendingChunks.reserve(pendingBuckets.size());
+            uploadCursor = 0;
         }
+
+        int budget = (block || !live) ? (int)pendingBuckets.size() : UPLOAD_BUDGET;
+        size_t end = uploadCursor + (size_t)budget;
+        if (end > pendingBuckets.size()) end = pendingBuckets.size();
+        for (; uploadCursor < end; uploadCursor++) uploadOne(pendingBuckets[uploadCursor]);
+        if (uploadCursor < pendingBuckets.size()) return;   // more to upload next frame
+
+        // Every bucket is uploaded: swap the WHOLE new chunk set in at once -- the old
+        // chunks (still `live`, still fully drawable) are only torn down now, so there is
+        // never a frame where the terrain is partially missing.
+        for (auto &c : chunks) UnloadMesh(c.mesh);
+        chunks = std::move(pendingChunks);
+        live = !chunks.empty();
+        pendingBuckets.clear(); pendingChunks.clear(); uploadCursor = 0;
         keyCx = pendCx; keyCz = pendCz; keyU = pendU;
         building = false;
     }
@@ -561,7 +642,11 @@ static inline Color capCol(Color c, float k) {
     return Color{ (unsigned char)(c.r * k), (unsigned char)(c.g * k),
                   (unsigned char)(c.b * k), c.a };
 }
-static void emitCubeTex(int tile, Vector3 p, float w, float h, float l, Color c) {
+// Per-face bit mask so callers (the terrain heightfield) can emit only the faces that
+// are actually exposed to air, instead of every face of a fully-buried cube.
+enum { CFACE_PZ = 1, CFACE_NZ = 2, CFACE_PY = 4, CFACE_NY = 8, CFACE_PX = 16, CFACE_NX = 32,
+       CFACE_ALL = 63 };
+static void emitCubeTex(int tile, Vector3 p, float w, float h, float l, Color c, unsigned mask = CFACE_ALL) {
     float x = p.x, y = p.y, z = p.z;
     float u0 = (tile * 16 + 0.5f) / (float)(TILE_N * 16);
     float u1 = (tile * 16 + 15.5f) / (float)(TILE_N * 16);
@@ -569,6 +654,11 @@ static void emitCubeTex(int tile, Vector3 p, float w, float h, float l, Color c)
 
     float kT = gAOTop / 255.0f, kB = gAOBot / 255.0f;
     if (gCapture) {
+        // Route every vertex of THIS cube into the bucket keyed by the cube's own centre,
+        // never per-vertex -- a cube that straddles a bucket boundary must still land as
+        // one whole primitive in one chunk mesh, or the boundary vertices split across two
+        // chunks and tear the shared triangles apart (visible gaps at chunk seams).
+        gCapBucketKey = terrainBucketKey(x, z);
 
         Color cB = capCol(c, kB), cT = capCol(c, kT);
         float xm = x - w/2, xp = x + w/2, ym = y - h/2, yp = y + h/2, zm = z - l/2, zp = z + l/2;
@@ -576,60 +666,84 @@ static void emitCubeTex(int tile, Vector3 p, float w, float h, float l, Color c)
         #define CAPQ(nx,ny,nz, ax,ay,az,au,av,ac, bx,by,bz,bu,bv,bc, ccx,ccy,ccz,cu,cv,cc, dx,dy,dz,du,dv,dc) \
             capVert(ax,ay,az,au,av,nx,ny,nz,ac); capVert(bx,by,bz,bu,bv,nx,ny,nz,bc); capVert(ccx,ccy,ccz,cu,cv,nx,ny,nz,cc); \
             capVert(ax,ay,az,au,av,nx,ny,nz,ac); capVert(ccx,ccy,ccz,cu,cv,nx,ny,nz,cc); capVert(dx,dy,dz,du,dv,nx,ny,nz,dc)
-        CAPQ(0,0,1,  xm,ym,zp,u0,v1,cB,  xp,ym,zp,u1,v1,cB,  xp,yp,zp,u1,v0,cT,  xm,yp,zp,u0,v0,cT);
-        CAPQ(0,0,-1, xm,ym,zm,u1,v1,cB,  xm,yp,zm,u1,v0,cT,  xp,yp,zm,u0,v0,cT,  xp,ym,zm,u0,v1,cB);
-        CAPQ(0,1,0,  xm,yp,zm,u0,v0,cT,  xm,yp,zp,u0,v1,cT,  xp,yp,zp,u1,v1,cT,  xp,yp,zm,u1,v0,cT);
-        CAPQ(0,-1,0, xm,ym,zm,u1,v0,cB,  xp,ym,zm,u0,v0,cB,  xp,ym,zp,u0,v1,cB,  xm,ym,zp,u1,v1,cB);
-        CAPQ(1,0,0,  xp,ym,zm,u1,v1,cB,  xp,yp,zm,u1,v0,cT,  xp,yp,zp,u0,v0,cT,  xp,ym,zp,u0,v1,cB);
-        CAPQ(-1,0,0, xm,ym,zm,u0,v1,cB,  xm,ym,zp,u1,v1,cB,  xm,yp,zp,u1,v0,cT,  xm,yp,zm,u0,v0,cT);
+        if (mask & CFACE_PZ) CAPQ(0,0,1,  xm,ym,zp,u0,v1,cB,  xp,ym,zp,u1,v1,cB,  xp,yp,zp,u1,v0,cT,  xm,yp,zp,u0,v0,cT);
+        if (mask & CFACE_NZ) CAPQ(0,0,-1, xm,ym,zm,u1,v1,cB,  xm,yp,zm,u1,v0,cT,  xp,yp,zm,u0,v0,cT,  xp,ym,zm,u0,v1,cB);
+        if (mask & CFACE_PY) CAPQ(0,1,0,  xm,yp,zm,u0,v0,cT,  xm,yp,zp,u0,v1,cT,  xp,yp,zp,u1,v1,cT,  xp,yp,zm,u1,v0,cT);
+        if (mask & CFACE_NY) CAPQ(0,-1,0, xm,ym,zm,u1,v0,cB,  xp,ym,zm,u0,v0,cB,  xp,ym,zp,u0,v1,cB,  xm,ym,zp,u1,v1,cB);
+        if (mask & CFACE_PX) CAPQ(1,0,0,  xp,ym,zm,u1,v1,cB,  xp,yp,zm,u1,v0,cT,  xp,yp,zp,u0,v0,cT,  xp,ym,zp,u0,v1,cB);
+        if (mask & CFACE_NX) CAPQ(-1,0,0, xm,ym,zm,u0,v1,cB,  xm,ym,zp,u1,v1,cB,  xm,yp,zp,u1,v0,cT,  xm,yp,zm,u0,v0,cT);
         #undef CAPQ
         return;
     }
 
+    if (mask & CFACE_PZ) {
     rlNormal3f(0, 0, 1);
     aoColor(c, kB); rlTexCoord2f(u0, v1); rlVertex3f(x - w/2, y - h/2, z + l/2);
     aoColor(c, kB); rlTexCoord2f(u1, v1); rlVertex3f(x + w/2, y - h/2, z + l/2);
     aoColor(c, kT); rlTexCoord2f(u1, v0); rlVertex3f(x + w/2, y + h/2, z + l/2);
     aoColor(c, kT); rlTexCoord2f(u0, v0); rlVertex3f(x - w/2, y + h/2, z + l/2);
+    }
+    if (mask & CFACE_NZ) {
     rlNormal3f(0, 0, -1);
     aoColor(c, kB); rlTexCoord2f(u1, v1); rlVertex3f(x - w/2, y - h/2, z - l/2);
     aoColor(c, kT); rlTexCoord2f(u1, v0); rlVertex3f(x - w/2, y + h/2, z - l/2);
     aoColor(c, kT); rlTexCoord2f(u0, v0); rlVertex3f(x + w/2, y + h/2, z - l/2);
     aoColor(c, kB); rlTexCoord2f(u0, v1); rlVertex3f(x + w/2, y - h/2, z - l/2);
+    }
+    if (mask & CFACE_PY) {
     rlNormal3f(0, 1, 0);
     aoColor(c, kT); rlTexCoord2f(u0, v0); rlVertex3f(x - w/2, y + h/2, z - l/2);
     aoColor(c, kT); rlTexCoord2f(u0, v1); rlVertex3f(x - w/2, y + h/2, z + l/2);
     aoColor(c, kT); rlTexCoord2f(u1, v1); rlVertex3f(x + w/2, y + h/2, z + l/2);
     aoColor(c, kT); rlTexCoord2f(u1, v0); rlVertex3f(x + w/2, y + h/2, z - l/2);
+    }
+    if (mask & CFACE_NY) {
     rlNormal3f(0, -1, 0);
     aoColor(c, kB); rlTexCoord2f(u1, v0); rlVertex3f(x - w/2, y - h/2, z - l/2);
     aoColor(c, kB); rlTexCoord2f(u0, v0); rlVertex3f(x + w/2, y - h/2, z - l/2);
     aoColor(c, kB); rlTexCoord2f(u0, v1); rlVertex3f(x + w/2, y - h/2, z + l/2);
     aoColor(c, kB); rlTexCoord2f(u1, v1); rlVertex3f(x - w/2, y - h/2, z + l/2);
+    }
+    if (mask & CFACE_PX) {
     rlNormal3f(1, 0, 0);
     aoColor(c, kB); rlTexCoord2f(u1, v1); rlVertex3f(x + w/2, y - h/2, z - l/2);
     aoColor(c, kT); rlTexCoord2f(u1, v0); rlVertex3f(x + w/2, y + h/2, z - l/2);
     aoColor(c, kT); rlTexCoord2f(u0, v0); rlVertex3f(x + w/2, y + h/2, z + l/2);
     aoColor(c, kB); rlTexCoord2f(u0, v1); rlVertex3f(x + w/2, y - h/2, z + l/2);
+    }
+    if (mask & CFACE_NX) {
     rlNormal3f(-1, 0, 0);
     aoColor(c, kB); rlTexCoord2f(u0, v1); rlVertex3f(x - w/2, y - h/2, z - l/2);
     aoColor(c, kB); rlTexCoord2f(u1, v1); rlVertex3f(x - w/2, y - h/2, z + l/2);
     aoColor(c, kT); rlTexCoord2f(u1, v0); rlVertex3f(x - w/2, y + h/2, z + l/2);
     aoColor(c, kT); rlTexCoord2f(u0, v0); rlVertex3f(x - w/2, y + h/2, z - l/2);
+    }
 }
 
-static void drawCubeTexAO(int tile, Vector3 p, float w, float h, float l, Color c,
-                          unsigned char aoTop, unsigned char aoBot) {
+static void drawCubeTexAOFace(int tile, Vector3 p, float w, float h, float l, Color c,
+                          unsigned char aoTop, unsigned char aoBot, unsigned mask) {
     gAOTop = aoTop; gAOBot = aoBot;
     if (gCapture || gVoxelBatchOpen) {
-        emitCubeTex(tile, p, w, h, l, c);
+        emitCubeTex(tile, p, w, h, l, c, mask);
     } else {
         rlSetTexture(gAtlas.id);
         rlBegin(RL_QUADS);
-        emitCubeTex(tile, p, w, h, l, c);
+        emitCubeTex(tile, p, w, h, l, c, mask);
         rlEnd();
     }
     gAOTop = 255; gAOBot = 255;
+}
+static void drawCubeTexAO(int tile, Vector3 p, float w, float h, float l, Color c,
+                          unsigned char aoTop, unsigned char aoBot) {
+    drawCubeTexAOFace(tile, p, w, h, l, c, aoTop, aoBot, CFACE_ALL);
+}
+// Only emit the specified faces -- used by the terrain heightfield so a fully-buried cube
+// face (hidden against an equal-or-taller neighbour, or facing straight down into the
+// ground) is never generated at all, instead of generated and then merely hidden.
+static void drawCubeTexFace(int tile, Vector3 p, float w, float h, float l, Color c, unsigned mask) {
+    unsigned char aoBot = 255;
+    if (h > 1.2f) aoBot = 196;
+    drawCubeTexAOFace(tile, p, w, h, l, c, 255, aoBot, mask);
 }
 static void drawCubeTex(int tile, Vector3 p, float w, float h, float l, Color c) {
 
@@ -717,8 +831,6 @@ enum SegMode { M_FLAT, M_CLIMB, M_DROP, M_HILLS, M_TURN, M_LOOP, M_ROLL,
                M_WINGOVER, M_HEARTLINE,
                M_PRETZEL, M_STENGEL, M_BANANA,
                M_COUNT };
-
-struct Coin { Vector3 pos; bool alive; };
 
 static int   gForceElem  = -1;
 static float gForceSpeed = 0.0f;
@@ -987,8 +1099,7 @@ int main(int argc, char **argv) {
         if (argc > 2) DRAG       = (float)atof(argv[2]);
         if (argc > 3) BOOST_V    = (float)atof(argv[3]);
         if (argc > 4) BOOST_TRIG = (float)atof(argv[4]);
-        if (argc > 5) INV_GATE   = (float)atof(argv[5]);
-        printf("(using DRAG=%.5f BOOST_V=%.1f BOOST_TRIG=%.1f INV_GATE=%.1f)\n", DRAG, BOOST_V, BOOST_TRIG, INV_GATE);
+        printf("(using DRAG=%.5f BOOST_V=%.1f BOOST_TRIG=%.1f)\n", DRAG, BOOST_V, BOOST_TRIG);
         double gSumV = 0; long gNV = 0;
         long gBoostF = 0, gLaunchF = 0;
         long gInv = 0;
@@ -996,7 +1107,7 @@ int main(int argc, char **argv) {
             g_rng = seed * 2654435761u | 1u;
             Track t; t.reset();
             float u = 0.5f, v = LAUNCH_V;
-            size_t maxCP = 0, maxCoins = 0; int bad = 0;
+            size_t maxCP = 0; int bad = 0;
             float maxAlt = 0, maxY = 0;
             double sumV = 0; long nV = 0; float maxV = 0;
             unsigned char prevTag = 255;
@@ -1026,14 +1137,6 @@ int main(int argc, char **argv) {
                 if (tg == M_BOOST) v += 112.0f * fmaxf(0.0f, 1.0f - v / 89.0f) * dt;   // boost thrust, fades to 0 near ~320 (no clamp)
                 if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fminf(v + 20 * dt, CHAIN_V);
 
-                for (float la = 1.0f; la <= 9.0f; la += 1.0f) {
-                    SegMode ahead = (SegMode)t.tagAt(u + la);
-                    if (!Track::isHardInversion(ahead)) continue;
-                    float bt; Track::invRAt(ahead, v, bt);
-                    if (bt > 0.0f && v > bt) v = fmaxf(v - (la <= 4.0f ? 22.0f : 14.0f) * dt, bt);
-                    break;
-                }
-
                 if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !t.chainAt(u) && v < 36.0f)
                     v = fminf(v + 28.0f * dt, 36.0f);
                 v = fmaxf(v, 20.0f);
@@ -1060,11 +1163,6 @@ int main(int argc, char **argv) {
                 if (!(du == du)) du = 0;
                 u += fminf(du, 1.5f);
                 while (u > 8.0f && (int)t.cp.size() > 12) { t.popFront(); u -= 1.0f; }
-                while (!t.coins.empty()) {
-                    Vector3 d = Vector3Subtract(t.coins.front().pos, t.pos(u));
-                    Vector3 th = Vector3Normalize(Vector3{ t.tangent(u).x, 0, t.tangent(u).z });
-                    if (d.x * th.x + d.z * th.z < -30.0f) t.coins.pop_front(); else break;
-                }
                 Vector3 P = t.pos(u);
                 if (!(P.x == P.x) || !(u == u) || !(v == v)) bad++;
                 float a = P.y - groundTopAt(P.x, P.z);
@@ -1080,7 +1178,6 @@ int main(int argc, char **argv) {
                         !(rt.y == rt.y) || !(rt.z == rt.z) || Vector3Length(rt) < 1e-3f) bad++;
                 }
                 maxCP = maxCP > t.cp.size() ? maxCP : t.cp.size();
-                maxCoins = maxCoins > t.coins.size() ? maxCoins : t.coins.size();
             }
             double avg = nV ? sumV / nV : 0;
             const char* NM[] = {"FLAT","CLIMB","DROP","HILLS","TURN","LOOP","ROLL","STN","DIP","LAUNCH","HELIX","BOOST","IMMEL","SCURVE","DIVE","BANKAIR","WAVE","STALL","DIVELOOP","COBRA","WINGOVER","HEARTLINE","PRETZEL","STENGEL","BANANA"};
@@ -1121,8 +1218,8 @@ int main(int argc, char **argv) {
         const char* NM[] = {"FLAT","CLIMB","DROP","HILLS","TURN","LOOP","ROLL","STN","DIP","LAUNCH","HELIX","BOOST","IMMEL","SCURVE","DIVE","BANKAIR","WAVE","STALL","DIVELOOP","COBRA","WINGOVER","HEARTLINE","PRETZEL","STENGEL","BANANA"};
         const Vector3 WUP3 = {0,1,0};
 
-        float kMaxV[M_COUNT], kMinV[M_COUNT], kMaxL[M_COUNT];
-        for (int i=0;i<M_COUNT;i++){ kMaxV[i]=-1e9f; kMinV[i]=1e9f; kMaxL[i]=0; }
+        float kMaxV[M_COUNT], kMinV[M_COUNT], kMaxL[M_COUNT], kMaxClr[M_COUNT];
+        for (int i=0;i<M_COUNT;i++){ kMaxV[i]=-1e9f; kMinV[i]=1e9f; kMaxL[i]=0; kMaxClr[i]=-1e9f; }
         // In-game-accurate g: smooth-spline du-window curvature + the HUD's 6 Hz temporal
         // lowpass (exactly what the rider's g-meter shows). The coarse 3-point arrays above
         // read the raw control points, so they catch rail-joint kinks the smooth spline never
@@ -1153,13 +1250,6 @@ int main(int argc, char **argv) {
                 else if (tg == M_CLIMB && !t.chainAt(u) && v < CLIMB_V) v = fminf(v + 44.0f * dt, CLIMB_V);
                 if (tg == M_BOOST) v += 112.0f * fmaxf(0.0f, 1.0f - v / 89.0f) * dt;   // boost thrust, fades to 0 near ~320 (no clamp)
                 if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fminf(v + 20 * dt, CHAIN_V);
-                for (float la = 1.0f; la <= 9.0f; la += 1.0f) {
-                    SegMode ahead = (SegMode)t.tagAt(u + la);
-                    if (!Track::isHardInversion(ahead)) continue;
-                    float bt; Track::invRAt(ahead, v, bt);
-                    if (bt > 0.0f && v > bt) v = fmaxf(v - (la <= 4.0f ? 22.0f : 14.0f) * dt, bt);
-                    break;
-                }
                 if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !t.chainAt(u) && v < 36.0f)
                     v = fminf(v + 28.0f * dt, 36.0f);
                 v = fmaxf(v, 20.0f);
@@ -1220,6 +1310,7 @@ int main(int argc, char **argv) {
                 // hasn't been applied to them yet. In live play the track generates continuously, so
                 // every cp the car reaches HAS been floored -- those tail cps are an audit-only artifact.
                 if (k < n - 16 && clr < gMinClear) { gMinClear = clr; gMinClearK = (int)t.base + k; gMinClearSeed = sd; gMinClearLocalK = k; }
+                if (k < n - 16 && clr > kMaxClr[kd]) kMaxClr[kd] = clr;
                 totalPts++;
                 if (gV > kMaxV[kd]) kMaxV[kd] = gV;
                 if (gV < kMinV[kd]) kMinV[kd] = gV;
@@ -1234,11 +1325,11 @@ int main(int argc, char **argv) {
         printf("\n  MIN TRACK CLEARANCE above terrain = %+.1f m (at abs cp %ld) %s\n",
                gMinClear, gMinClearK, gMinClear < -2.0f ? " <-- UNDER THE MAP" : "");
         printf("  PER-ELEMENT FELT-G (across %d seeds, %d cps):\n", seeds, totalPts);
-        printf("  %-9s %8s %8s %8s\n", "element", "maxVert", "minVert", "maxLat");
+        printf("  %-9s %8s %8s %8s %9s\n", "element", "maxVert", "minVert", "maxLat", "maxClrM");
         for (int i = 0; i < M_COUNT; i++) {
             if (kMaxV[i] < -1e8f) continue;
             const char* flag = (kMaxV[i] > 9.8f || kMinV[i] < -6.0f || kMaxL[i] > 9.8f) ? "  <-- OVER" : "";
-            printf("  %-9s %+8.1f %+8.1f %8.1f%s\n", NM[i], kMaxV[i], kMinV[i], kMaxL[i], flag);
+            printf("  %-9s %+8.1f %+8.1f %8.1f %9.1f%s\n", NM[i], kMaxV[i], kMinV[i], kMaxL[i], kMaxClr[i], flag);
         }
         printf("\n  IN-GAME-ACCURATE FELT-G (HUD meter: smooth spline + 6 Hz lowpass, %d seeds):\n", seeds);
         printf("  %-9s %8s %8s %8s\n", "element", "maxVert", "minVert", "maxLat");
@@ -1652,15 +1743,6 @@ int main(int argc, char **argv) {
                 if (v < liftV) v = fminf(v + 20.0f * dt, liftV);
             }
 
-            for (float la = 1.0f; la <= 9.0f; la += 1.0f) {
-                SegMode ahead = (SegMode)trk.tagAt(u + la);
-                if (!Track::isHardInversion(ahead)) continue;
-
-                float bt; Track::invRAt(ahead, v, bt);
-                if (bt > 0.0f && v > bt) v = fmaxf(v - (la <= 4.0f ? 22.0f : 14.0f) * dt, bt);
-                break;
-            }
-
             if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !onLift && v < 36.0f)
                 v = fminf(v + 28.0f * dt, 36.0f);
             v = fmaxf(v, 20.0f);
@@ -1843,10 +1925,12 @@ int main(int argc, char **argv) {
             cam.fovy     = 62;
         }
         if (orbitShot && !onFoot) {
-            cam.position = Vector3Add(P, Vector3{ 58.0f, 62.0f, 58.0f });
+            Vector3 off = { 58.0f, 62.0f, 58.0f };
+            if (const char* ov = getenv("MC_CAMOFF")) sscanf(ov, "%f,%f,%f", &off.x, &off.y, &off.z);
+            cam.position = Vector3Add(P, off);
             cam.target   = P;
             cam.up       = Vector3{ 0, 1, 0 };
-            cam.fovy     = 60;
+            cam.fovy     = getenv("MC_CAMFOV") ? (float)atof(getenv("MC_CAMFOV")) : 60;
         }
         if (waterShot) {
 
@@ -2012,7 +2096,12 @@ int main(int argc, char **argv) {
             if (trk.stationActive) stampStation(trk.stationPos, trk.stationYaw);
         }
 
-        for (float su = fmaxf(u - 14.0f, 0.0f); su <= u + 28.0f; su += 0.17f) {
+        // Step big enough to still fully cover the DEEP_R=10.5 m corridor with no gaps
+        // (consecutive samples only need to stay under ~2*DEEP_R apart; at ~14 m of arc
+        // length per su unit, 0.17 was sampling every ~2.4 m -- ~8x more samples than the
+        // corridor needs, the single largest CPU cost of a terrain rebuild). 0.4 samples
+        // every ~5.6 m: same coverage, ~2.4x fewer iterations of the carve-corridor scan.
+        for (float su = fmaxf(u - 14.0f, 0.0f); su <= u + 28.0f; su += 0.4f) {
             Vector3 ps = trk.pos(su);
             float lo = ps.y - 4.0f, hi = ps.y + 4.5f;
             int scx = (int)floorf(ps.x / CELL), scz = (int)floorf(ps.z / CELL);
@@ -2117,22 +2206,35 @@ int main(int argc, char **argv) {
                         drawCubeTex(capTile, Vector3{ wx, h + 0.5f, wz }, cellSz, 1, cellSz, cap);
                     }
                 } else {
-                    drawCubeTex(T_GRAIN, Vector3{ wx, (colBot + h) * 0.5f, wz }, cellSz, h - colBot, cellSz, col);
+                    // Thin-skin heightfield (Minecraft-style hidden-face culling) for the
+                    // BODY only. The top layer (the cap the player actually walks/rides on)
+                    // keeps its full, unculled cube -- every face always emitted, exactly
+                    // like the original renderer -- since culling it was the source of the
+                    // visible artifacting. Only the body underneath it (never visible except
+                    // at an exposed cliff/step) is thinned out below.
+                    const float SKIRT = 0.06f;
                     drawCubeTex(capTile, Vector3{ wx, h + 0.5f, wz }, cellSz, 1, cellSz, cap);
 
-                    if (!depthPass && dist2 < 56.0f * 56.0f && cHi <= cLo) {
-                        const float HC = cellSz * 0.5f;
-                        struct { int ox, oz; float dx, dz; } nb[4] = {
-                            { 1, 0,  HC*0.5f, 0 }, { -1, 0, -HC*0.5f, 0 },
-                            { 0, 1,  0,  HC*0.5f }, { 0,-1, 0, -HC*0.5f } };
+                    if (cHi <= cLo) {   // no local carve cavity complicating the column here
+                        int hN[4] = { gHCache.get(cx + 1, cz), gHCache.get(cx - 1, cz),
+                                      gHCache.get(cx, cz + 1), gHCache.get(cx, cz - 1) };
+                        unsigned fc[4] = { CFACE_PX, CFACE_NX, CFACE_PZ, CFACE_NZ };
                         for (int n = 0; n < 4; n++) {
-                            int hN = gHCache.get(cx + nb[n].ox, cz + nb[n].oz);
-                            if (h - hN != 1) continue;
-                            float ew = (nb[n].ox != 0) ? HC : cellSz;
-                            float el = (nb[n].oz != 0) ? HC : cellSz;
-                            drawCubeTex(capTile, Vector3{ wx + nb[n].dx, h - 0.5f, wz + nb[n].dz },
-                                        ew, 1.0f, el, cap);
+                            if (hN[n] >= h) continue;                       // hidden: neighbour same height or taller
+                            float rawTop = top, rawBot = fmaxf((float)hN[n] + 1.0f, colBot);
+                            float rawH = rawTop - rawBot;
+                            if (rawH < 0.02f) continue;
+                            bool ledge = rawH <= 1.05f;   // a 1-unit step reads as a grassy ledge, matching the cap
+                            float faceTop = rawTop + SKIRT, faceBot = rawBot - SKIRT;
+                            drawCubeTexFace(ledge ? capTile : T_GRAIN,
+                                            Vector3{ wx, (faceBot + faceTop) * 0.5f, wz },
+                                            cellSz + SKIRT, faceTop - faceBot, cellSz + SKIRT, ledge ? cap : col, fc[n]);
                         }
+                    } else {
+                        // A carve cavity touches this column (rare -- only near specific
+                        // track features): fall back to the old full-depth body so the
+                        // cavity's own floor/roof logic above still has solid walls to meet.
+                        drawCubeTex(T_GRAIN, Vector3{ wx, (colBot + h) * 0.5f, wz }, cellSz, h - colBot, cellSz, col);
                     }
                 }
 
@@ -2253,6 +2355,7 @@ int main(int argc, char **argv) {
         }
         };
 
+        float curShadowCullR = SHADOW_CASCADE_CULL_R[0];   // set per-cascade before each depth-pass drawWorld(true) call
         auto drawWorld = [&](bool depthPass, bool coasterOnly = false) {
         if (!coasterOnly && gTerrainMesh.live) {
 
@@ -2264,7 +2367,39 @@ int main(int argc, char **argv) {
                 SetShaderValue(gShadow.lit, gShadow.locFogEnd, &fe, SHADER_UNIFORM_FLOAT);
                 SetShaderValue(gShadow.lit, gShadow.locFogCol, fc, SHADER_UNIFORM_VEC3);
             }
-            DrawMesh(gTerrainMesh.mesh, mat, MatrixIdentity());
+            // Cull terrain chunks before submitting them. The full TERRA_R ring is always
+            // generated together every rebuild (see TerrainMesh::finish) -- this only skips
+            // DrawMesh calls for chunks that can't be seen, it never skips generating them,
+            // so it cannot reintroduce the old per-chunk-streaming void bug.
+            if (depthPass) {
+                // Each cascade uses its own ortho box centred on P (see ShadowSys::computeLightVP)
+                // -- cull by 3-D distance from P using the CURRENT cascade's cull radius
+                // (curShadowCullR, set by the caller before each cascade's drawWorld(true) call),
+                // which already includes a margin past that cascade's box half-diagonal.
+                for (auto &c : gTerrainMesh.chunks) {
+                    float dx = c.center.x - P.x, dy = c.center.y - P.y, dz = c.center.z - P.z;
+                    if (sqrtf(dx*dx + dy*dy + dz*dz) - c.radius > curShadowCullR) continue;
+                    DrawMesh(c.mesh, mat, MatrixIdentity());
+                }
+            } else {
+                Vector3 F = Vector3Normalize(Vector3Subtract(cam.target, cam.position));
+                Vector3 Rt = Vector3Normalize(Vector3CrossProduct(F, cam.up));
+                Vector3 Up = Vector3CrossProduct(Rt, F);
+                float aspect = (float)GetRenderWidth() / (float)GetRenderHeight();
+                // 20% margin past the true half-angle so a chunk can never pop off-screen;
+                // errs toward drawing a little extra, never toward under-drawing.
+                float tanV = tanf(cam.fovy * 0.5f * DEG2RAD) * 1.2f;
+                float tanH = tanV * aspect;
+                for (auto &c : gTerrainMesh.chunks) {
+                    Vector3 d = Vector3Subtract(c.center, cam.position);
+                    float fz = Vector3DotProduct(d, F);
+                    if (fz + c.radius < 0.0f) continue;                    // fully behind camera
+                    float zc = fmaxf(fz, 0.0f);
+                    if (fabsf(Vector3DotProduct(d, Rt)) > zc * tanH + c.radius) continue;
+                    if (fabsf(Vector3DotProduct(d, Up)) > zc * tanV + c.radius) continue;
+                    DrawMesh(c.mesh, mat, MatrixIdentity());
+                }
+            }
             if (!depthPass) {
                 float off = 0.0f;
                 SetShaderValue(gShadow.lit, gShadow.locFogEnd, &off, SHADER_UNIFORM_FLOAT);
@@ -2339,10 +2474,15 @@ int main(int argc, char **argv) {
         for (int i = k0; i <= k1 && i + 1 < (int)trk.cp.size(); i++) {
             Vector3 p = trk.cp[i];
             unsigned char tg = trk.kind[i];
+            // BANANA is excluded here on purpose: unlike the tight, self-contained loop-shaped
+            // elements below (whose top/bottom sit at nearly the same X/Z), a banana roll travels
+            // forward continuously across its whole length while doing one roll, so its inverted
+            // midpoint is tens of meters from every other point of the same element -- a straight-down
+            // support there can't clip through its own track, and skipping it left a large unsupported gap.
             if ((tg == M_LOOP || tg == M_ROLL || tg == M_IMMEL ||
                  tg == M_STALL || tg == M_DIVELOOP || tg == M_COBRA ||
                  tg == M_HEARTLINE || tg == M_WINGOVER ||
-                 tg == M_PRETZEL || tg == M_BANANA) && trk.up[i].y < 0.35f) continue;
+                 tg == M_PRETZEL) && trk.up[i].y < 0.35f) continue;
             float ddx = p.x - P.x, ddz = p.z - P.z;
             float dist = sqrtf(ddx * ddx + ddz * ddz);
             float fog = Clamp((dist - trackFog * 0.70f) / (trackFog * 0.27f), 0.0f, 1.0f);
@@ -2458,25 +2598,55 @@ int main(int argc, char **argv) {
             if (!gTerrainMesh.live) gTerrainMesh.finish(true);   // first build: must have a mesh to draw
         }
 
-        Matrix lightVP = gShadow.computeLightVP(P);
+        gShadow.computeLightVP(P);
         BeginDrawing();
 
         rlDrawRenderBatchActive();
-        rlEnableFramebuffer(gShadow.fbo);
-        rlViewport(0, 0, gShadow.SM, gShadow.SM);
-        rlClearScreenBuffers();
-        rlDisableColorBlend();
-        rlEnableDepthTest(); rlEnableDepthMask();
-        glDepthFunc(GL_LEQUAL);
-        rlSetMatrixProjection(MatrixIdentity());
-        rlSetMatrixModelview(lightVP);
-        BeginShaderMode(gShadow.depth);
-        drawWorld(true);
-        rlDrawRenderBatchActive();
-        EndShaderMode();
-        rlEnableColorBlend();
-        rlDisableFramebuffer();
+        for (int ci = 0; ci < SHADOW_CASCADES; ci++) {
+            rlEnableFramebuffer(gShadow.fbo[ci]);
+            rlViewport(0, 0, gShadow.SM[ci], gShadow.SM[ci]);
+            rlClearScreenBuffers();
+            rlDisableColorBlend();
+            rlEnableDepthTest(); rlEnableDepthMask();
+            glDepthFunc(GL_LEQUAL);
+            rlSetMatrixProjection(MatrixIdentity());
+            rlSetMatrixModelview(gShadow.lightVP[ci]);
+            BeginShaderMode(gShadow.depth);
+            curShadowCullR = SHADOW_CASCADE_CULL_R[ci];
+            drawWorld(true);
+            rlDrawRenderBatchActive();
+            EndShaderMode();
+            rlEnableColorBlend();
+            rlDisableFramebuffer();
+        }
         rlViewport(0, 0, GetRenderWidth(), GetRenderHeight());
+
+        // Bind all 3 cascade matrices/textures once per frame; every gShadow.lit
+        // draw call below (main pass, water, path-trace overlays) shares them.
+        auto bindShadowUniforms = [&]() {
+            for (int i = 0; i < SHADOW_CASCADES; i++) {
+                SetShaderValueMatrix(gShadow.lit, gShadow.locLightVP[i], gShadow.lightVP[i]);
+                float texel[2] = { 1.0f / gShadow.SM[i], 1.0f / gShadow.SM[i] };
+                SetShaderValue(gShadow.lit, gShadow.locShadowTexel[i], texel, SHADER_UNIFORM_VEC2);
+                SetShaderValue(gShadow.lit, gShadow.locInvRange[i], &gShadow.invRange[i], SHADER_UNIFORM_FLOAT);
+            }
+            SetShaderValue(gShadow.lit, gShadow.locCascadeSplit0, &SHADOW_CASCADE_R[0], SHADER_UNIFORM_FLOAT);
+            SetShaderValue(gShadow.lit, gShadow.locCascadeSplit1, &SHADOW_CASCADE_R[1], SHADER_UNIFORM_FLOAT);
+            float sf[3] = { gShadow.focus.x, gShadow.focus.y, gShadow.focus.z };
+            SetShaderValue(gShadow.lit, gShadow.locShadowFocus, sf, SHADER_UNIFORM_VEC3);
+        };
+        static const int SHADOW_TEX_UNITS[SHADOW_CASCADES] = { 10, 13, 14 };
+        auto bindShadowTextures = [&]() {
+            for (int i = 0; i < SHADOW_CASCADES; i++) {
+                SetShaderValue(gShadow.lit, gShadow.locShadowMap[i], &SHADOW_TEX_UNITS[i], SHADER_UNIFORM_INT);
+                rlActiveTextureSlot(SHADOW_TEX_UNITS[i]); rlEnableTexture(gShadow.depthTex[i]);
+            }
+            rlActiveTextureSlot(0);
+        };
+        auto unbindShadowTextures = [&]() {
+            for (int i = 0; i < SHADOW_CASCADES; i++) { rlActiveTextureSlot(SHADOW_TEX_UNITS[i]); rlDisableTexture(); }
+            rlActiveTextureSlot(0);
+        };
 
         if (!liveRT) {
         ClearBackground(SKY);
@@ -2515,9 +2685,7 @@ int main(int argc, char **argv) {
         BeginMode3D(cam);
 
         {
-            SetShaderValueMatrix(gShadow.lit, gShadow.locLightVP, lightVP);
-            float texel[2] = { 1.0f / gShadow.SM, 1.0f / gShadow.SM };
-            SetShaderValue(gShadow.lit, gShadow.locShadowTexel, texel, SHADER_UNIFORM_VEC2);
+            bindShadowUniforms();
             float ld[3] = { g_sunDir.x, g_sunDir.y, g_sunDir.z };
             SetShaderValue(gShadow.lit, gShadow.locLightDir, ld, SHADER_UNIFORM_VEC3);
             float vp3[3] = { cam.position.x, cam.position.y, cam.position.z };
@@ -2530,13 +2698,11 @@ int main(int argc, char **argv) {
             SetShaderValue(gShadow.lit, gShadow.locGround, gnd, SHADER_UNIFORM_VEC3);
         }
 
-        const int SHADOW_UNIT = 10;
         BeginShaderMode(gShadow.lit);
-        SetShaderValue(gShadow.lit, gShadow.locShadowMap, &SHADOW_UNIT, SHADER_UNIFORM_INT);
-        rlActiveTextureSlot(SHADOW_UNIT); rlEnableTexture(gShadow.depthTex); rlActiveTextureSlot(0);
+        bindShadowTextures();
         drawWorld(false);
         EndShaderMode();
-        rlActiveTextureSlot(SHADOW_UNIT); rlDisableTexture(); rlActiveTextureSlot(0);
+        unbindShadowTextures();
 
         {
             struct SplashContact { Vector3 p, fwd, right; float gap; };
@@ -2637,10 +2803,8 @@ int main(int argc, char **argv) {
             SetShaderValue(gShadow.lit, gShadow.locFogEnd, &fe, SHADER_UNIFORM_FLOAT);
             SetShaderValue(gShadow.lit, gShadow.locFogCol, fc, SHADER_UNIFORM_VEC3);
 
-            const int SHADOW_UNIT_W = 10;
             BeginShaderMode(gShadow.lit);
-            SetShaderValue(gShadow.lit, gShadow.locShadowMap, &SHADOW_UNIT_W, SHADER_UNIFORM_INT);
-            rlActiveTextureSlot(SHADOW_UNIT_W); rlEnableTexture(gShadow.depthTex); rlActiveTextureSlot(0);
+            bindShadowTextures();
 
             rlSetTexture(gAtlas.id);
             float wu = (T_WHITE * 16 + 8.0f) / (float)(TILE_N * 16);
@@ -2668,7 +2832,7 @@ int main(int argc, char **argv) {
             }
             rlEnd();
             EndShaderMode();
-            rlActiveTextureSlot(SHADOW_UNIT_W); rlDisableTexture(); rlActiveTextureSlot(0);
+            unbindShadowTextures();
             float off = 0.0f;
             SetShaderValue(gShadow.lit, gShadow.locFogEnd, &off, SHADER_UNIFORM_FLOAT);
         }
@@ -2722,8 +2886,12 @@ int main(int argc, char **argv) {
             SetShaderValue(gPT.rt, gPT.rAtlasSize, asz, SHADER_UNIFORM_VEC2);
             SetShaderValue(gPT.rt, gPT.rVoxSize, &vsz, SHADER_UNIFORM_FLOAT);
 
-            SetShaderValueMatrix(gPT.rt, gPT.rLightVP, lightVP);
-            float rstx[2] = { 1.0f / gShadow.SM, 1.0f / gShadow.SM };
+            // The voxel path tracer has its own single-shadow-map shader interface (it
+            // computes most shadowing via its own voxel ray march); feed it cascade 1
+            // (mid distance) as a reasonable single proxy rather than extending its
+            // shader to the full 3-cascade scheme.
+            SetShaderValueMatrix(gPT.rt, gPT.rLightVP, gShadow.lightVP[1]);
+            float rstx[2] = { 1.0f / gShadow.SM[1], 1.0f / gShadow.SM[1] };
             SetShaderValue(gPT.rt, gPT.rShadowTexel, rstx, SHADER_UNIFORM_VEC2);
             const int RT_SHADOW_UNIT = 12;
             SetShaderValue(gPT.rt, gPT.rShadowMap, &RT_SHADOW_UNIT, SHADER_UNIFORM_INT);
@@ -2731,7 +2899,7 @@ int main(int argc, char **argv) {
             BeginTextureMode(gPT.rtBuf);
                 rlEnableDepthTest();
                 glDepthFunc(GL_ALWAYS);
-                rlActiveTextureSlot(RT_SHADOW_UNIT); rlEnableTexture(gShadow.depthTex); rlActiveTextureSlot(0);
+                rlActiveTextureSlot(RT_SHADOW_UNIT); rlEnableTexture(gShadow.depthTex[1]); rlActiveTextureSlot(0);
                 BeginShaderMode(gPT.rt);
                     DrawTexturePro(gPT.vox,
                         Rectangle{0,0,(float)gPT.vox.width,(float)gPT.vox.height},
@@ -2763,9 +2931,7 @@ int main(int argc, char **argv) {
             glDepthFunc(GL_LEQUAL);
 
             BeginMode3D(cam);
-                SetShaderValueMatrix(gShadow.lit, gShadow.locLightVP, lightVP);
-                float texelL[2] = { 1.0f / gShadow.SM, 1.0f / gShadow.SM };
-                SetShaderValue(gShadow.lit, gShadow.locShadowTexel, texelL, SHADER_UNIFORM_VEC2);
+                bindShadowUniforms();
                 float ldL[3] = { g_sunDir.x, g_sunDir.y, g_sunDir.z };
                 SetShaderValue(gShadow.lit, gShadow.locLightDir, ldL, SHADER_UNIFORM_VEC3);
                 float vpL[3] = { cam.position.x, cam.position.y, cam.position.z };
@@ -2776,13 +2942,11 @@ int main(int argc, char **argv) {
                 SetShaderValue(gShadow.lit, gShadow.locSun, sunL, SHADER_UNIFORM_VEC3);
                 SetShaderValue(gShadow.lit, gShadow.locSky, skyL, SHADER_UNIFORM_VEC3);
                 SetShaderValue(gShadow.lit, gShadow.locGround, gndL, SHADER_UNIFORM_VEC3);
-                const int SHADOW_UNIT_L = 10;
                 BeginShaderMode(gShadow.lit);
-                    SetShaderValue(gShadow.lit, gShadow.locShadowMap, &SHADOW_UNIT_L, SHADER_UNIFORM_INT);
-                    rlActiveTextureSlot(SHADOW_UNIT_L); rlEnableTexture(gShadow.depthTex); rlActiveTextureSlot(0);
+                    bindShadowTextures();
                     drawWorld(false, true);
                 EndShaderMode();
-                rlActiveTextureSlot(SHADOW_UNIT_L); rlDisableTexture(); rlActiveTextureSlot(0);
+                unbindShadowTextures();
             EndMode3D();
         }
 
@@ -2860,9 +3024,7 @@ int main(int argc, char **argv) {
             rlDrawRenderBatchActive();
             glClear(GL_DEPTH_BUFFER_BIT);
             BeginMode3D(cam);
-                SetShaderValueMatrix(gShadow.lit, gShadow.locLightVP, lightVP);
-                float texel2[2] = { 1.0f / gShadow.SM, 1.0f / gShadow.SM };
-                SetShaderValue(gShadow.lit, gShadow.locShadowTexel, texel2, SHADER_UNIFORM_VEC2);
+                bindShadowUniforms();
                 float ld2[3] = { g_sunDir.x, g_sunDir.y, g_sunDir.z };
                 SetShaderValue(gShadow.lit, gShadow.locLightDir, ld2, SHADER_UNIFORM_VEC3);
                 float vp2[3] = { cam.position.x, cam.position.y, cam.position.z };
@@ -2874,13 +3036,11 @@ int main(int argc, char **argv) {
                 SetShaderValue(gShadow.lit, gShadow.locSun, sun2, SHADER_UNIFORM_VEC3);
                 SetShaderValue(gShadow.lit, gShadow.locSky, sky2, SHADER_UNIFORM_VEC3);
                 SetShaderValue(gShadow.lit, gShadow.locGround, gnd2, SHADER_UNIFORM_VEC3);
-                const int SHADOW_UNIT2 = 10;
                 BeginShaderMode(gShadow.lit);
-                    SetShaderValue(gShadow.lit, gShadow.locShadowMap, &SHADOW_UNIT2, SHADER_UNIFORM_INT);
-                    rlActiveTextureSlot(SHADOW_UNIT2); rlEnableTexture(gShadow.depthTex); rlActiveTextureSlot(0);
+                    bindShadowTextures();
                     drawWorld(false, true);
                 EndShaderMode();
-                rlActiveTextureSlot(SHADOW_UNIT2); rlDisableTexture(); rlActiveTextureSlot(0);
+                unbindShadowTextures();
             EndMode3D();
         }
 
@@ -3144,8 +3304,8 @@ int main(int argc, char **argv) {
             double ms = (GetTime() - tFrame0) * 1000.0;
             float alt = P.y - groundTopAt(P.x, P.z);
             if ((frame % 25) == 0 || ms > 60.0)
-                printf("f%-5d cam%d  %6.1fms  u=%.2f v=%.1f alt=%.0f cp=%zu coins=%zu tag=%d invY=%.2f\n",
-                       frame, camMode, ms, u, v, alt, trk.cp.size(), trk.coins.size(),
+                printf("f%-5d cam%d  %6.1fms  u=%.2f v=%.1f alt=%.0f cp=%zu tag=%d invY=%.2f\n",
+                       frame, camMode, ms, u, v, alt, trk.cp.size(),
                        (int)trk.tagAt(u), N.y);
             fflush(stdout);
         }
@@ -3236,7 +3396,7 @@ int main(int argc, char **argv) {
 
     gBaker.shutdown();
     UnloadShader(gShadow.lit); UnloadShader(gShadow.depth);
-    rlUnloadFramebuffer(gShadow.fbo);
+    for (int ci = 0; ci < SHADOW_CASCADES; ci++) rlUnloadFramebuffer(gShadow.fbo[ci]);
     UnloadTexture(gAtlas);
     UnloadAudioStream(wind);
     UnloadSound(sndCoin);
