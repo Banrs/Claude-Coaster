@@ -2360,8 +2360,7 @@ int main(int argc, char **argv) {
         }
         };
 
-        float curShadowCullR = SHADOW_CASCADE_CULL_R[0];   // set per-cascade before each depth-pass drawWorld(true) call
-        auto drawWorld = [&](bool depthPass, bool coasterOnly = false) {
+        auto drawWorld = [&](bool depthPass, bool coasterOnly = false, float cullR = 0.0f) {
         if (!coasterOnly && gTerrainMesh.live) {
 
             Material mat = gTerrainMat;
@@ -2378,12 +2377,16 @@ int main(int argc, char **argv) {
             // so it cannot reintroduce the old per-chunk-streaming void bug.
             if (depthPass) {
                 // Each cascade uses its own ortho box centred on P (see ShadowSys::computeLightVP)
-                // -- cull by 3-D distance from P using the CURRENT cascade's cull radius
-                // (curShadowCullR, set by the caller before each cascade's drawWorld(true) call),
-                // which already includes a margin past that cascade's box half-diagonal.
+                // -- cull by XZ distance from P using the CURRENT cascade's cull radius (cullR,
+                // passed in by the caller for this depth-pass call), which already includes a
+                // margin past that cascade's box half-diagonal. Must be XZ-only (not 3-D) to match
+                // the ortho box's footprint and the shader's shadow() cascade-selection distance
+                // (also XZ-only, see render_fx.cpp) -- a 3-D check would under-cull tall/deep
+                // chunks whose vertical offset from P is large but whose XZ offset is well within
+                // the box, silently dropping them from the depth pass.
                 for (auto &c : gTerrainMesh.chunks) {
-                    float dx = c.center.x - P.x, dy = c.center.y - P.y, dz = c.center.z - P.z;
-                    if (sqrtf(dx*dx + dy*dy + dz*dz) - c.radius > curShadowCullR) continue;
+                    float dx = c.center.x - P.x, dz = c.center.z - P.z;
+                    if (sqrtf(dx*dx + dz*dz) - c.radius > cullR) continue;
                     DrawMesh(c.mesh, mat, MatrixIdentity());
                 }
             } else {
@@ -2618,8 +2621,7 @@ int main(int argc, char **argv) {
             rlSetMatrixProjection(MatrixIdentity());
             rlSetMatrixModelview(gShadow.lightVP[ci]);
             BeginShaderMode(gShadow.depth);
-            curShadowCullR = SHADOW_CASCADE_CULL_R[ci];
-            drawWorld(true);
+            drawWorld(true, false, SHADOW_CASCADE_CULL_R[ci]);
             rlDrawRenderBatchActive();
             EndShaderMode();
             rlEnableColorBlend();
