@@ -1589,8 +1589,13 @@ int main(int argc, char **argv) {
     };
     if (onFoot) placeOnFoot();
 
+    std::vector<float> gBenchFrameMs;
+    if (benchMode) gBenchFrameMs.reserve(16384);
+    int benchFrameCap = gForceSpeed < 0.0f ? 16000 : gForceElem >= 0 ? 1500 : 5000;
+    if (benchMode) { if (const char *bf = getenv("MC_BENCH_FRAMES")) benchFrameCap = atoi(bf); }
+
     while (true) {
-        if (benchMode) { if (frame >= (gForceSpeed < 0.0f ? 16000 : gForceElem >= 0 ? 1500 : 5000)) break; }
+        if (benchMode) { if (frame >= benchFrameCap) break; }
         else if (WindowShouldClose()) break;
 
         double tFrame0 = GetTime();
@@ -3303,6 +3308,7 @@ int main(int argc, char **argv) {
 
         if (benchMode) {
             double ms = (GetTime() - tFrame0) * 1000.0;
+            gBenchFrameMs.push_back((float)ms);
             float alt = P.y - groundTopAt(P.x, P.z);
             if ((frame % 25) == 0 || ms > 60.0)
                 printf("f%-5d cam%d  %6.1fms  u=%.2f v=%.1f alt=%.0f cp=%zu tag=%d invY=%.2f\n",
@@ -3312,6 +3318,26 @@ int main(int argc, char **argv) {
         }
     }
     gTerrainMesh.finish(true);   // shutdown: join the worker before teardown
+
+    if (benchMode && !gBenchFrameMs.empty()) {
+        std::vector<float> sortedMs = gBenchFrameMs;
+        std::sort(sortedMs.begin(), sortedMs.end());
+        size_t n = sortedMs.size();
+        double sum = 0; for (float ms : sortedMs) sum += ms;
+        double mean = sum / (double)n;
+        size_t worstN = std::max((size_t)1, n / 100);
+        double worstSum = 0; for (size_t i = n - worstN; i < n; i++) worstSum += sortedMs[i];
+        double onePctLow = worstSum / (double)worstN;
+        double p50 = sortedMs[n / 2];
+        double p95 = sortedMs[(size_t)(n * 0.95)];
+        double p99 = sortedMs[(size_t)(n * 0.99)];
+        printf("\n=== bench frame-time summary (n=%zu) ===\n", n);
+        printf("  mean=%.2fms (%.1f fps)  P50=%.2fms  min=%.2fms  max=%.2fms\n",
+               mean, mean > 0.0 ? 1000.0 / mean : 0.0, p50, sortedMs.front(), sortedMs.back());
+        printf("  P95=%.2fms  P99=%.2fms  1%%-low(avg worst %zu frames)=%.2fms\n",
+               p95, p99, worstN, onePctLow);
+        fflush(stdout);
+    }
 
     if (benchMode) {
         static const char *EN[M_COUNT] = {
