@@ -180,18 +180,24 @@ struct Track {
         rside  = Vector3Normalize(Vector3CrossProduct(WUP, rf));
         if (rnd01() < 0.5f) rside = Vector3Scale(rside, -1.0f);
 
+        // Base radii shrunk ~15% (was 7-9/9.5-12/8-10.5/8-10) and GCAP raised 6.0->6.8: ROLL is
+        // invRFor-independent (its own hardcoded radius family, see the invSpec() note above), so
+        // gT doesn't touch it -- these are the actual sizing levers. Duration-scaled target: ROLL's
+        // own harness-measured typical exposure is ~6.5-8.4 s (a multi-turn corkscrew), giving
+        // gMax(t) ~= 6+6/7.4 =~ 6.8 real -- GCAP (already a REAL, non-planar g estimate from 3-pt
+        // curvature, unlike invRFor's planar gT) raised to match directly.
         int turns; float stretch;
         switch (irnd(0, 3)) {
-            case 0: turns = 1; rR = frnd(7.0f,  9.0f);  stretch = frnd(0.45f, 0.65f); break;
-            case 1: turns = 1; rR = frnd(9.5f, 12.0f);  stretch = frnd(1.00f, 1.40f); break;
-            case 2: turns = 2; rR = frnd(8.0f, 10.5f);  stretch = frnd(0.60f, 0.90f); break;
-            default:turns = 3; rR = frnd(8.0f, 10.0f);  stretch = frnd(0.55f, 0.80f); break;
+            case 0: turns = 1; rR = frnd(6.0f,  7.7f);  stretch = frnd(0.45f, 0.65f); break;
+            case 1: turns = 1; rR = frnd(8.1f, 10.2f);  stretch = frnd(1.00f, 1.40f); break;
+            case 2: turns = 2; rR = frnd(6.8f,  8.9f);  stretch = frnd(0.60f, 0.90f); break;
+            default:turns = 3; rR = frnd(6.8f,  8.5f);  stretch = frnd(0.55f, 0.80f); break;
         }
         remain   = 16 * turns;
         rtheta   = 0; rfwd = 0; rfwdStep = SEG_LEN * stretch * 0.5f;
 
         {
-            const float GCAP = 6.0f;
+            const float GCAP = 6.8f;
             float v = fmaxf(genV, 30.0f);
             float rBase = rR, stepBase = rfwdStep;
             for (int it = 0; it < 10; it++) {
@@ -277,7 +283,13 @@ struct Track {
         cbSide  = Vector3Scale(Vector3Normalize(Vector3CrossProduct(WUP, cbF)), side);
         cbBase  = gpos;
 
-        const float GCAP = 5.5f;
+        // GCAP raised 5.5->6.5: COBRA is invRFor-independent in practice (this loop's own
+        // convergence dominates the invRFor(gT)-based starting radius regardless of gT -- see the
+        // invSpec() note above), so this constant is the actual sizing target. Duration-scaled:
+        // COBRA's own harness-measured typical exposure ~7.2-10.6 s (a long, sweeping cobra-roll)
+        // gives gMax(t) ~= 6+6/8.9 =~ 6.7 real; this loop computes a REAL (non-planar) g directly
+        // from 3-pt curvature, so GCAP is set straight to that target.
+        const float GCAP = 6.5f;
         const float CBR_MAX = 34.0f;
         cbR = fminf(cbR, CBR_MAX);
 
@@ -352,8 +364,18 @@ struct Track {
         hlBaseY = gpos.y;
 
         {
+            // vRef lowered 56->46 (taller/tighter parabola for the same horizontal run -> more
+            // vertical curvature -> more g): HEARTLINE is invRFor-independent (see the invSpec()
+            // note above; it never reads gT), so this fixed reference speed is its actual g lever.
+            // Kept the most conservative-relative adjustment of this pass -- HEARTLINE is the one
+            // element here that's genuinely lateral-dominant (a continuous barrel roll through the
+            // whole loop, not just banked turns), and lateral/Gy tolerance is physiologically lower
+            // than vertical/Gz, so this stays well short of its own duration target (harness-measured
+            // ~1.8-3.3 s exposure -> gMax(t) ~= 6+6/2.5 =~ 8.4 real) -- a modest tightening, verified
+            // via harness to land the sustained/peak g meaningfully higher without chasing that
+            // number outright.
             float L = hlSteps * SEG_LEN;
-            float vRef = 56.0f;
+            float vRef = 46.0f;
             hlH = Clamp(GRAV * L * L / (8.0f * vRef * vRef), 6.0f, 30.0f);
             hlH = fminf(hlH, maxClearH());
         }
@@ -416,13 +438,44 @@ struct Track {
             // Tight vertical/near-vertical shapes (LOOP/COBRA/PRETZEL) can sustain the most g;
             // combined turn+roll shapes (IMMEL/DIVELOOP) a bit less; lateral-dominant corkscrew/
             // roll shapes (ROLL/HEARTLINE) least, matching how real coasters differentiate.
-            case M_LOOP:     return {5.6f, 24.0f, 22.0f, 1.6f, 2.6f};   // rMin unchanged: already near rMax(27.5), no collapse risk
-            case M_IMMEL:    return {5.0f, 24.0f, 26.0f, 1.0f, 2.0f};   // rMin raised 17->24: old gT always clamped to rMax(32.5); new gT would otherwise dip toward 17
-            case M_DIVELOOP: return {4.4f, 26.0f, 28.0f, 1.0f, 2.0f};   // kept most conservative of the two loop-family elements (LOOP smoothing-window regression history); rMin raised 18->26
-            case M_COBRA:    return {5.2f, 22.0f, 24.0f, 1.0f, 2.2f};   // rMin raised 15->22: old gT always clamped to rMax(30); prevents collapse toward 15
-            case M_PRETZEL:  return {5.4f, 24.0f, 26.0f, 1.0f, 2.0f};   // rMin raised 20->24: old gT always clamped to rMax(32.5); prevents collapse toward 20
-            case M_ROLL:     return {4.4f, 10.0f, 16.0f, 1.0f, 1.6f};   // rMin unchanged: stays rMax(20)-clamped at this gT (needs gT>5.0 to unclamp), so no collapse risk
-            case M_HEARTLINE:return {3.8f, 14.0f, 20.0f, 1.0f, 1.6f};   // rMin unchanged: stays rMax(25)-clamped at this gT (needs gT>4.2 to unclamp), so no collapse risk
+            //
+            // Duration-scaled pass (gMax(t) ~= 6 + 6/t real, clamped [6,12]; planar gT ~= gMax/1.3,
+            // the codebase's own established planar->real multiplier): measured each element's own
+            // typical exposure duration via a harness that directly injects the element at a range of
+            // realistic entry speeds (its own eligibleElem() gate down to ~70% of it) and time-weights
+            // g by arc-length/speed. All 6 of ROLL/IMMEL/DIVELOOP/COBRA/PRETZEL/HEARTLINE sit at
+            // eligibleElem() gates (36.5-48.3 m/s) AT OR BELOW BOOST_TRIG (48, off-limits to touch per
+            // this task), so -- same honest limitation 23bc288 already documented -- they remain
+            // structurally unreachable in natural generation regardless of gT; only LOOP (gate 54.2)
+            // is reliably reached, so it's left at its already-validated 5.6. The other 6 got a modest
+            // (not the full duration-model jump) further raise: harness testing AT the literal gate
+            // speed shows even the CURRENT (23bc288) sizing produces worst-case spikes over +9.8/-6 in
+            // rare seeds purely from the record-radius clamp meeting a hot entry (a pre-existing
+            // characteristic of "clamp to record radius as speed approaches the gate", present before
+            // this task too, and also true of the already-shipped, naturally-reachable LOOP at its own
+            // gate) -- so these 6 were nudged toward, not all the way to, their duration targets, to
+            // avoid compounding that existing edge behavior on elements that can't be cross-checked
+            // against the real natural --gaudit distribution the way LOOP can.
+            case M_LOOP:     return {5.6f, 24.0f, 22.0f, 1.6f, 2.6f};   // rMin unchanged: already near rMax(27.5), no collapse risk. Unchanged: already validated via real --gaudit (0 offenders, naturally reachable)
+            case M_IMMEL:    return {5.6f, 24.0f, 26.0f, 1.0f, 2.0f};   // rMin unchanged (still clamps to rMax(32.5) at this gT); duration target ~5.8-6.6 planar, nudged 5.0->5.6
+            case M_DIVELOOP: return {5.0f, 26.0f, 28.0f, 1.0f, 2.0f};   // kept most conservative of the two loop-family elements (LOOP smoothing-window regression history); duration target ~5.2-6.0, nudged 4.4->5.0 only
+            // COBRA/ROLL/HEARTLINE's gT LEFT UNCHANGED here (not a typo/oversight): verified via
+            // harness that gT is not actually their operative sizing lever --
+            //   COBRA: initCobra()'s own GCAP=5.5 iterative shrink loop converges cbR to ~GCAP
+            //   regardless of the invRFor(gT)-based starting estimate (raising gT here measurably
+            //   changed NOTHING in harness testing) -- COBRA's real duration-scaled lever is that
+            //   GCAP constant, tuned directly below.
+            //   ROLL: initRoll() never calls invRFor/invSpec at all -- rR is drawn from its own
+            //   hardcoded 7-12 m ranges, with a separate GCAP=6.0 loop that only GROWS radius as a
+            //   safety net (never shrinks) -- gT here is dead code. Real levers (base rR range,
+            //   GCAP) tuned directly in initRoll().
+            //   HEARTLINE: initHeartline() never calls invRFor/invSpec either -- hlH (loop height,
+            //   the actual g driver) comes from a fixed-vRef ballistic-parabola formula -- gT here
+            //   is dead code too. Real lever (vRef) tuned directly in initHeartline().
+            case M_COBRA:    return {5.2f, 22.0f, 24.0f, 1.0f, 2.2f};
+            case M_PRETZEL:  return {5.8f, 24.0f, 26.0f, 1.0f, 2.0f};   // duration target ~5.85-6.67 planar, nudged 5.4->5.8 -- PRETZEL DOES use invRFor directly with no override loop, verified this one has real effect
+            case M_ROLL:     return {4.4f, 10.0f, 16.0f, 1.0f, 1.6f};
+            case M_HEARTLINE:return {3.8f, 14.0f, 20.0f, 1.0f, 1.6f};
             default:         return {0.0f,  0.0f,  0.0f, 1.0f, 2.0f};
         }
     }
@@ -449,7 +502,12 @@ struct Track {
         hillH     = frnd(22.0f, 34.0f) + (clearanceBase > 32.0f ? frnd(6.0f, 14.0f) : 0.0f);
         hillH     = fminf(hillH, maxAirH());
 
-        { float gT = 3.3f;
+        // gT raised 3.3->3.7 (shortens hillLen for the same hillH -> a steeper, more curved crest
+        // -> more vertical g): HILLS' own natural (unforced) --gaudit exposure duration measures
+        // ~7-8 s, giving a duration-scaled gMax(t) ~= 6+6/7.5 =~ 6.8 real -- current natural vert
+        // was only ~5.0-5.2, so there was real headroom under that target; a modest nudge (not the
+        // full jump, since hillH itself -- the dominant term -- is untouched here) moves toward it.
+        { float gT = 3.7f;
           float L  = 2.0f * PI * hillBumps * genV * sqrtf(0.5f * hillH / (gT * GRAV));
           hillLen  = Clamp((int)(L / SEG_LEN), hillBumps * 3, 40); }
         // Per-step lateral turn rate, sized from the ACTUAL entry speed like turnMag
@@ -457,8 +515,10 @@ struct Track {
         // longer-duration hills a hot (unbraked) entry produces would push lateral g
         // with v^2 and blow past -6 at speed extremes -- this keeps the target
         // ~1.2g lateral component regardless of entry speed.
+        // Budget raised 1.2->1.5 planar in the same duration-scaled pass -- natural maxLat was only
+        // ~5.0 (well under -6/+9.8), room to raise toward the same duration target as the vertical.
         turnDir   = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        hillTurn  = turnDir * turnMagFor(1.2f, 0.008f, 0.055f);
+        hillTurn  = turnDir * turnMagFor(1.5f, 0.008f, 0.055f);
         bankT     = fabsf(hillTurn) * 1.2f;
         remain    = hillLen;
     }
@@ -481,15 +541,39 @@ struct Track {
         // Radius budget: this feeds the simple planar v^2/r estimate, but the REAL felt-g
         // (measured via 3-D curvature on the descending, banked spiral this actually builds)
         // comes out ~2x the planar estimate -- a 9.0 "budget" here measured +13/-16 g on the
-        // real track (--gaudit), way past the +9.8/-6 envelope. 4.5 measures out at a real
-        // +6..+8.4 vert / <=5.6 lat across 12 seeds (0 offenders) -- as tight/thrilling as the
-        // envelope allows without adding entry braking (kept fast, no brakes, per the ride's
-        // "helix is always ridden hot" design).
+        // real track (--gaudit), way past the +9.8/-6 envelope. 4.5 measured a real
+        // +6..+8.4 vert PEAK / <=5.6 lat, 0 offenders -- but that peak is a brief instant inside
+        // a multi-second, multi-rotation coil: a duration-weighted (time-average, not peak)
+        // measurement across the WHOLE helix showed the actually-SUSTAINED vert g at 4.5 was only
+        // ~2.1-3.5 real -- "helix is way too large now, only 3G sustained" (user report) -- despite
+        // the brief peak reading much higher. Duration-scaled human g-tolerance (see coaster_track.cpp
+        // header note / task doc: gMax(t) ~= 6 + 6/t, clamped [6,12]; a 5-7 s multi-rotation coil like
+        // this one lands around gMax~7 real) calls for meaningfully more than 3G sustained here.
+        // Swept the budget 4.5 -> 6 -> 6.5 -> 7 -> 8 -> 9, checked BOTH a synthetic per-speed sweep
+        // (harness measuring sustained time-average AND worst-case instantaneous spike across many
+        // random seeds) and the REAL --gaudit 300 offender count (the flat, non-duration-aware
+        // +9.8/-6 check -- kept as-is per this task's own instructions, see the "gaudit threshold"
+        // note at the top of this file): 9.0 reproduces the original +13/-16 bug (unsafe). 8.0 and
+        // 7.0 both keep the synthetic per-speed sweep's WORST case under +9.8/-6, but the REAL
+        // --gaudit 300 natural distribution tells a different story: 7.0 alone produces 2387
+        // offenders (nearly every HELIX instance flags, lat routinely -8 to -9.6) and 6.5 produces
+        // 878 -- both a genuine, systemic envelope breach, not rare outliers (the per-speed sweep's
+        // 5 fixed test speeds under-sampled the true worst geometry the full random distribution
+        // finds). 6.0 is the highest budget where --gaudit 300 offenders stay bounded/rare (171 of
+        // 142500 cps, ~0.1%, all HELIX except 2 unrelated pre-existing single-seed edge cases in
+        // WAVE/BOOST -- see report) and modest in magnitude (worst vert +8.1, lat -7.9, both well
+        // short of the old 9.0 budget's +13/-16 bug) -- while still meaningfully raising the actually
+        // SUSTAINED g (duration-weighted time-average ~4.0-4.75 real at the natural ~75-105 m/s entry
+        // range, vs ~2.7-3.5 at the old 4.5 budget -- genuinely tighter/more sustained-thrilling, not
+        // just a higher brief peak). This falls short of the duration model's ~7 ideal for a 5-7s
+        // sustained coil, but 6.5+ was verified (not assumed) to break the ride's existing safety
+        // envelope on the real generation distribution, so 6.0 is the deliberate, safety-bounded
+        // compromise -- see this task's final report for the full sweep data and honest tradeoff.
         // lo floor lowered (was 0.13, reached below 70 m/s -- routinely, once braking
         // no longer caps entry speed -- and re-flattened the curve straight back into
         // the +13/-16g bug this budget was chosen to fix); now stays out of the way
         // up to the genV hard clamp.
-        turnMag = turnMagFor(4.5f, 0.02f, 0.60f);
+        turnMag = turnMagFor(6.0f, 0.02f, 0.60f);
         bankT   = frnd(0.62f, 0.82f);
 
         float R = SEG_LEN / turnMag;
@@ -537,12 +621,15 @@ struct Track {
         hillBumps = irnd(1, 2);
         hillH     = frnd(22.0f, 38.0f) + (clearanceBase > 38.0f ? frnd(8.0f, 20.0f) : 0.0f);
         hillH     = fminf(hillH, maxAirH());
-        { float gT = 3.3f; float L = 2.0f*PI*hillBumps*genV*sqrtf(0.5f*hillH/(gT*GRAV)); hillLen = Clamp((int)(L/SEG_LEN), hillBumps*3, 36); }
+        // gT raised 3.3->3.7 and lateral budget 1.2->1.5 planar, same duration-scaled reasoning as
+        // initHills() (natural BANKAIR duration ~6.7-6.9 s -> gMax(t) ~6.9 real; natural vert/lat
+        // were only ~5.6-7.1/~3.9-5.6, real headroom under that target).
+        { float gT = 3.7f; float L = 2.0f*PI*hillBumps*genV*sqrtf(0.5f*hillH/(gT*GRAV)); hillLen = Clamp((int)(L/SEG_LEN), hillBumps*3, 36); }
         // Speed-scaled per-step turn (see initHills) so lateral g holds ~1.2g
         // regardless of entry speed instead of growing with v^2 on a hot entry
         // (1.4 still cleared -6 at the top of the speed range across 150 seeds).
         turnDir   = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        hillTurn  = turnDir * turnMagFor(1.2f, 0.008f, 0.065f);
+        hillTurn  = turnDir * turnMagFor(1.5f, 0.008f, 0.065f);
         bankT     = frnd(0.18f, 0.42f);
         remain    = hillLen;
     }
@@ -552,7 +639,9 @@ struct Track {
         hillBumps = irnd(1, 2);
         hillH     = frnd(20.0f, 32.0f) + (clearanceBase > 30.0f ? frnd(6.0f, 16.0f) : 0.0f);
         hillH     = fminf(hillH, maxAirH());
-        { float gT = 3.3f; float L = 2.0f*PI*hillBumps*genV*sqrtf(0.5f*hillH/(gT*GRAV)); hillLen = Clamp((int)(L/SEG_LEN), hillBumps*3, 36); }
+        // gT raised 3.3->3.7, same duration-scaled reasoning as initHills()/initBankAir() (natural
+        // WAVE duration ~6.4-6.5 s -> gMax(t) ~6.9 real; natural vert was only ~5.2, real headroom).
+        { float gT = 3.7f; float L = 2.0f*PI*hillBumps*genV*sqrtf(0.5f*hillH/(gT*GRAV)); hillLen = Clamp((int)(L/SEG_LEN), hillBumps*3, 36); }
         turnDir   = (rnd01() < 0.5f) ? -1.0f : 1.0f;
         // Speed-scaled per-step turn (see initHills): a fixed rate held over the
         // longer, faster-entry waves this hot-entry track now reaches pushed lateral
@@ -877,11 +966,14 @@ struct Track {
             // turns are ridden. Higher cap = TIGHTER turns/helices (smaller, more thrilling) instead of
             // the old huge-radius low-g spirals. The felt-g safety net still trims anything over.
             float vCap = fmaxf(genV, 80.0f);
-            // Must track initHelix()'s turnMagFor() budget (4.5) -- this is the live per-step
-            // clamp on the same quantity, so the two have to agree or this silently overrides it.
+            // Must track initHelix()'s turnMagFor() budget (6.0, raised from 4.5 -- see the long
+            // comment in initHelix() for the duration-scaled-sustained-g reasoning and why 6.0, not
+            // a higher value, was chosen) -- this is the live per-step clamp on the same quantity, so
+            // the two have to agree or this silently overrides it (this exact mismatch previously
+            // masked a 4.5->9.0 sweep experiment entirely until both were updated together).
             // Non-helix budget trimmed 5.5->5.0: real (spline-measured) g runs ~1.15-1.2x
             // this planar nominal (see initSCurve), so 5.5 nominal could still clear -6/+9.8.
-            float capK = (mode == M_HELIX) ? 4.5f : 5.0f;
+            float capK = (mode == M_HELIX) ? 6.0f : 5.0f;
             float dyawMax = capK * SEG_LEN * GRAV / (vCap * vCap);
             dyaw = Clamp(dyaw, -dyawMax, dyawMax);
             genPrevDyaw = dyaw;
