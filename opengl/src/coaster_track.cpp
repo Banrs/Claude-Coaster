@@ -74,6 +74,7 @@ struct Track {
 
     Vector3 pzF{}, pzSide{}, pzBase{};  float pzR = 30, pzDrift = 0, pzLat = 0; int pzSteps = 26;
     Vector3 sdF{}, sdSide{}, sdBase{};  float sdH = 12, sdSpan = 0, sdDrop = 0, sdCrestT = 0.3f;  int sdSteps = 13;
+    float   sdB1T = 0, sdB2T = 0, sdBendDrop = 0, sdStraightDrop = 0;
     Vector3 brF{}, brSide{}, brBase{};  float brH = 18, brSpan = 0, brDir = 1; int brSteps = 26;
 
     Vector3 hlF{}, hlSide{};
@@ -711,8 +712,8 @@ struct Track {
     // without needing a separate height cap.
     // STALL/WINGOVER's cap is deliberately the SAME number as their initStall/initWingover
     // setClearance() hi bound (named constants below, shared by both call sites so they
-    // can't silently drift apart) -- BANANA/STENGEL have no equivalent setClearance() call,
-    // so their caps are independent literals.
+    // can't silently drift apart) -- BANANA has no equivalent setClearance() call, so its
+    // cap is an independent literal.
     static constexpr float STALL_CLEARANCE_HI    = 48.0f;
     static constexpr float WINGOVER_CLEARANCE_HI = 46.0f;
     static float maxTrickHeight(SegMode m) {
@@ -720,7 +721,14 @@ struct Track {
             case M_STALL:     return STALL_CLEARANCE_HI;
             case M_BANANA:    return 36.0f;
             case M_WINGOVER:  return WINGOVER_CLEARANCE_HI;
-            case M_STENGEL:   return 40.0f;
+            // STENGEL used to share this cap (40m), which is backwards for a DIVE element --
+            // it guarantees the element can never be offered with more than 40m of ground
+            // clearance to work with, so its own corridor-scanned sdDrop (see initStengel())
+            // was almost always clamped down to its 10m floor regardless of how steep the
+            // shape formula asked for. STALL/BANANA/WINGOVER are aerial tricks where being
+            // too high above the ground looks unmoored, hence a real max-height cap; STENGEL
+            // needs altitude, not a ceiling on it -- not height-gated here at all, its own
+            // corridor scan already keeps it from diving into terrain.
             default:          return -1.0f;   // not height-gated
         }
     }
