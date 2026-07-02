@@ -125,6 +125,33 @@
         float spanRef = Clamp(0.80f * v, 46.0f, 80.0f);
         float over    = fmaxf(genV, v) / v;
         brSpan = spanRef / (over * over);
+
+        // BANANA is a closed-form element (its whole vertical/lateral profile is fixed by
+        // brH/brSpan right here, with zero per-step terrain feedback once underway -- the
+        // same class of blind spot STENGEL had before its own corridor scan below). Its
+        // fU(t) profile always clears its OWN entry height (fU is a parabola, >=0, peaking
+        // at brH mid-element), so it never dives -- but a terrain bump anywhere under the
+        // forward+lateral corridor it actually sweeps can still rise faster than the fixed
+        // climb/roll profile provides, leaving the track under the bump despite still
+        // climbing (measured: --gaudit 300 min clearance case). Sample that corridor
+        // (matching the real es()-scaled lateral spread stepBanana bows out to) and, if some
+        // point needs more clearance than the current brH profile would deliver there, RAISE
+        // brH (never lower it) just enough to clear it -- capped at maxClearH() so this never
+        // asks for more height than the current speed can physically justify.
+        {
+            float L = brSteps * SEG_LEN;
+            float need = 0.0f;
+            for (int la = 1; la <= brSteps; la++) {
+                float t   = (float)la / (float)brSteps;
+                float es  = t * t * (3.0f - 2.0f * t);
+                float fUr = 1.0f - (2.0f * t - 1.0f) * (2.0f * t - 1.0f);   // matches stepBanana's fU shape
+                float tx  = brBase.x + brF.x * (L * t) + brSide.x * (brSpan * es * brDir);
+                float tz  = brBase.z + brF.z * (L * t) + brSide.z * (brSpan * es * brDir);
+                float wantHere = groundTopAt(tx, tz) + 14.0f - brBase.y;
+                if (fUr > 0.15f) need = fmaxf(need, wantHere / fUr);
+            }
+            if (need > brH) brH = fminf(need, maxClearH());
+        }
         remain = brSteps;
     }
     Vector3 stepBanana() {

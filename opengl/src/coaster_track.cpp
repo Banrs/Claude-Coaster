@@ -810,12 +810,30 @@ struct Track {
             default: {
 
                 bool slow = genV < BOOST_TRIG;
-                if (elems >= elemLimit)        startLaunch();
-                else if (slow && h < 22.0f)    startLaunch();
-                else if (slow)                 startBoost();
+                // TURN/HELIX/HILLS/DIVE/BANKAIR/WAVE/SCURVE/WINGOVER are the modes that carry
+                // a banked up-vector (see the bank block below in stepGeneric) -- unlike
+                // LOOP/ROLL/IMMEL and the dedicated closed-form elements (which always route
+                // through enterDrop()'s DROP/FLAT first), these fall through this default
+                // case directly, and the elemLimit/slow branches below used to be able to
+                // jump straight from one of them into M_LAUNCH/M_BOOST, which ride dead flat
+                // (up = WUP, no bank at all -- see stepGeneric). That snapped the up-vector
+                // from a live bank (up to bankT, ~70 degrees for a big TURN) to flat in a
+                // single ~14 m segment: a real, visible kink at the seam, distinct from the
+                // gentle DROP/FLAT unwind every other element gets (genPoint()'s upEaseSteps
+                // easing only triggers when the new mode is DROP/FLAT, never LAUNCH/BOOST,
+                // since LAUNCH's LSM track can't tilt at all). Route banked modes through the
+                // same FLAT-first unwind everything else uses before any launch/boost/next-
+                // element decision, so the existing upEaseSteps easing gets a chance to run.
+                bool wasBanked = (mode == M_TURN || mode == M_HELIX || mode == M_HILLS ||
+                                   mode == M_DIVE || mode == M_BANKAIR || mode == M_WAVE ||
+                                   mode == M_SCURVE || mode == M_WINGOVER);
+                if (wasBanked)                  { mode = M_FLAT; remain = irnd(4, 6); }
+                else if (elems >= elemLimit)    startLaunch();
+                else if (slow && h < 22.0f)     startLaunch();
+                else if (slow)                  startBoost();
 
-                else if (mode != M_FLAT)       { mode = M_FLAT; remain = irnd(4, 6); }
-                else                           chooseElement(h);
+                else if (mode != M_FLAT)        { mode = M_FLAT; remain = irnd(4, 6); }
+                else                            chooseElement(h);
                 break;
             }
         }
@@ -1065,7 +1083,14 @@ struct Track {
 
             float dir = (mode == M_SCURVE && (scurveLen - remain) >= scurveLen / 2)
                         ? -turnDir : turnDir;
-            if (mode == M_WAVE) dir = -turnDir;
+            // WAVE used to force dir=-turnDir here, banking AWAY from the direction it was
+            // actually yawing (dyaw for M_WAVE is hillTurn = turnDir*rate, same sign
+            // convention HILLS/BANKAIR use and bank correctly with via the default `dir =
+            // turnDir` above) -- so WAVE was the one element of this hillTurn-driven family
+            // that leaned its up-vector outward, away from the turn center, instead of into
+            // it like a real coaster banks. No functional reason for the flip (HILLS/BANKAIR
+            // share the exact same dyaw mechanic and don't flip); removed so WAVE banks into
+            // its turn like its siblings.
             float bank = bankT * dir;
             upv = Vector3Normalize(Vector3Add(Vector3Scale(WUP, cosf(bank)),
                                               Vector3Scale(side, sinf(bank))));
