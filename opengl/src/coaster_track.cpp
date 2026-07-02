@@ -346,7 +346,17 @@ struct Track {
         setClearance(14.0f, WINGOVER_CLEARANCE_HI);
         turnDir   = (rnd01() < 0.5f) ? -1.0f : 1.0f;
         turnMag   = turnMagFor(3.0f, 0.015f, 0.18f);   // gentler heading rate -> lateral stays in envelope; lo lowered, see initTurn/initHelix
-        bankT     = frnd(0.60f, 0.84f);               // less bank -> smaller up-vector snap into the exit FLAT
+        // A real wingover (the B&M term this element is named for) is a HALF-CORKSCREW: the
+        // train banks essentially all the way to inverted, not a mild lean. bankT used to peak
+        // at 0.84 rad (~48 degrees) -- barely more than a TURN's own bank -- making WINGOVER
+        // geometrically almost indistinguishable from a plain banked turn over a hill despite
+        // the different name. Since the per-step bank easing (see stepGeneric's rateFrac fix)
+        // always returns to upright by the end of the element (this game has no standalone
+        // "ride inverted into the next element" state), this can't be a literal half-corkscrew
+        // that STAYS inverted -- but peaking close to full inversion and rolling back out is a
+        // real, distinct, dramatic maneuver in its own right, and reads as the corkscrew-style
+        // roll the name promises instead of a shallow tilt.
+        bankT     = frnd(2.55f, 2.95f);                // ~146-169 degrees at peak -- near-full inversion, not a lean
         hillBumps = 1;
         hillH     = frnd(20.0f, 28.0f);               // gentler crest -> less vertical g projected to lateral during the roll
         hillH     = fminf(hillH, maxClearH());
