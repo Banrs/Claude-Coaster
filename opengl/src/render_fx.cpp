@@ -42,6 +42,20 @@ static const char *SHADOW_FS =
     // to just the rail quads without forcing a GPU flush around every one of
     // the ~1000+ rail samples drawn per frame).
     "uniform vec3 railTangent; uniform vec2 railUVRange;\n"
+    // Real screen-space reflection source for bare metal (rails/iron/gold, see
+    // the `sheen` mix near the end of main() below): this is a single-pass
+    // forward renderer with no G-buffer, so a fragment can't sample the
+    // CURRENT frame's own still-being-drawn scene color/depth (chicken/egg --
+    // the pixel a reflection ray would land on may not have rendered yet this
+    // frame). Instead it samples the PREVIOUS frame's fully-resolved scene
+    // color/depth (see PostFX's sceneRT[2] ping-pong in main.cpp) via a
+    // screen-space ray march -- a temporally-reprojected SSR, one frame of
+    // lag, invisible in practice at any reasonable frame rate for a subtle
+    // metal highlight -- so rails genuinely reflect nearby geometry/sky
+    // instead of only the analytic skyReflect() gradient. prevVP is the
+    // view-projection matrix that rendered THAT previous frame, used to
+    // reproject each marched world-space sample back into its screen space.
+    "uniform sampler2D prevSceneColor; uniform sampler2D prevSceneDepth; uniform mat4 prevVP;\n"
     // The main gameplay pass now renders into an offscreen linear-HDR target
     // (see PostFX below / main.cpp) that tonemaps + gamma-encodes once,
     // centrally, in a single composite pass -- so by default this shader
@@ -70,6 +84,14 @@ static const char *SHADOW_FS =
     // in world metres then converted per-cascade via its own inverse depth range.
     "uniform float invRange0; uniform float invRange1; uniform float invRange2;\n"
     "uniform float cascadeSplit0; uniform float cascadeSplit1;\n"
+    // World metres per shadow-map texel (XY, i.e. 2*cascadeRadius/mapResolution)
+    // for each cascade -- lets the PCSS blocker-search/penumbra math below
+    // convert a normalized depth difference into an actual shadow-map texel
+    // radius without hardcoding derived constants in the shader (main.cpp sets
+    // these directly from SHADOW_CASCADE_R[i]/SM[i], the same source values
+    // ShadowSys::computeLightVP already uses, so there's no separate formula
+    // here to get out of sync).
+    "uniform float pcssTexelWorld0; uniform float pcssTexelWorld1; uniform float pcssTexelWorld2;\n"
     // The cascades are centred on the train/focus point P (see ShadowSys::computeLightVP),
     // NOT the camera -- cascade SELECTION must use distance from that same point, or any
     // shot where the camera sits away from the train (orbit/free-look/elevated views) picks
@@ -81,10 +103,15 @@ static const char *SHADOW_FS =
     "  vec2(-0.326,-0.406),vec2(-0.840,-0.074),vec2(-0.696, 0.457),vec2(-0.203, 0.621),\n"
     "  vec2( 0.962,-0.195),vec2( 0.473,-0.480),vec2( 0.519, 0.767),vec2( 0.185,-0.893),\n"
     "  vec2( 0.507, 0.064),vec2( 0.896, 0.412),vec2(-0.322,-0.933),vec2(-0.792,-0.598));\n"
-    "float pcfTap(sampler2D sm, vec2 texel, vec3 p, float bias){\n"
+    // radiusScale is now a PARAMETER (texel count), not a fixed 1.4 -- PCSS
+    // (below) varies it per-fragment based on blocker distance, so shadows go
+    // tight right at the occluding edge and soften with distance from it
+    // (the visual signature of a ray-traced soft shadow) instead of every
+    // cascade using one uniform softness everywhere.
+    "float pcfTap(sampler2D sm, vec2 texel, vec3 p, float bias, float radiusScale){\n"
     "  float ang = fract(sin(dot(fragWorld.xz, vec2(12.9898,78.233)))*43758.5453)*6.2831853;\n"
     "  float ca=cos(ang), sa=sin(ang); mat2 rot=mat2(ca,-sa,sa,ca);\n"
-    "  vec2 o = texel*1.4;\n"
+    "  vec2 o = texel*radiusScale;\n"
     "  float s=0.0;\n"
     "  for(int i=0; i<12; i++){\n"
     "    vec2 tap = p.xy + rot*PD12[i]*o;\n"
@@ -93,11 +120,48 @@ static const char *SHADOW_FS =
     "  }\n"
     "  return s*(1.0/12.0);\n"
     "}\n"
+    // PCSS blocker search: reuses the first 6 taps of the same Poisson disk
+    // (same per-fragment rotation as pcfTap, so the search and the later PCF
+    // filter agree on "nearby") at a fixed, generous texel radius to find
+    // occluders closer to the light than the receiver. Returns the number
+    // found and their average depth -- when nothing is found the fragment is
+    // in open sun with no nearby occluder and shadowCascadeN below skips the
+    // PCF filter entirely (both a correctness win -- no shadow at all where
+    // there's genuinely nothing to cast one -- and a performance win, exactly
+    // the "tight near the occluder, otherwise not paying for it" behaviour a
+    // ray-traced soft shadow has and a fixed-radius PCF cannot).
+    "void blockerSearch(sampler2D sm, vec2 texel, vec3 p, float bias, float searchTexels, out int n, out float avgBlocker){\n"
+    "  float ang = fract(sin(dot(fragWorld.xz, vec2(12.9898,78.233)))*43758.5453)*6.2831853;\n"
+    "  float ca=cos(ang), sa=sin(ang); mat2 rot=mat2(ca,-sa,sa,ca);\n"
+    "  vec2 o = texel*searchTexels;\n"
+    "  float sum=0.0; int cnt=0;\n"
+    "  for(int i=0; i<6; i++){\n"
+    "    vec2 tap = p.xy + rot*PD12[i]*o;\n"
+    "    if(tap.x<0.0||tap.x>1.0||tap.y<0.0||tap.y>1.0) continue;\n"
+    "    float d = texture(sm, tap).r;\n"
+    "    if(d < p.z - bias){ sum += d; cnt++; }\n"
+    "  }\n"
+    "  n = cnt;\n"
+    "  avgBlocker = (cnt > 0) ? sum/float(cnt) : 0.0;\n"
+    "}\n"
     // Bias tuned in world metres (matches the old single-map 1.4-3.2 m range,
     // now comfortably clearing the ~1 m terrain height steps regardless of
     // which cascade is sampled); converted to each cascade's normalized units
     // by the caller via invRangeN.
     "float worldBias(float NoL){ return clamp(1.4 + 1.75*(1.0-NoL), 1.4, 3.2); }\n"
+    // PCSS tuning: PCSS_ANGULAR_TAN stands in for the sun's apparent angular
+    // size (tan of its half-angle) -- deliberately larger than the real sun
+    // (~0.005) so the penumbra is actually visible at this game's scale
+    // rather than a few sub-pixel texels, matching the "soft with distance"
+    // look this pass is going for without pretending to be physically exact.
+    // MIN/MAX clamp the resulting filter radius in texels: MIN keeps a touch
+    // of softness even for near-contact blockers (avoids a hard PCF-sized
+    // edge right where the penumbra should be tightest), MAX stops the filter
+    // from growing into a blurry mess for distant/large occluders.
+    "const float PCSS_ANGULAR_TAN = 0.06;\n"
+    "const float PCSS_MIN_TEXELS = 1.1;\n"
+    "const float PCSS_MAX_TEXELS = 11.0;\n"
+    "const float PCSS_SEARCH_TEXELS = 5.0;\n"
     // Split per-cascade so every call site passes a compile-time-known cascade --
     // no runtime idx branch (the old single shadowCascade(idx,N) re-tested idx on
     // every call even though callers always pass a literal 0/1/2).
@@ -105,19 +169,37 @@ static const char *SHADOW_FS =
     "  float NoL = max(dot(N,lightDir),0.0);\n"
     "  vec4 lp = lightVP0*vec4(fragWorld,1.0); vec3 p = lp.xyz/lp.w; p = p*0.5+0.5;\n"
     "  if(p.z<=0.0||p.z>1.0||p.x<0.0||p.x>1.0||p.y<0.0||p.y>1.0) return 1.0;\n"
-    "  return pcfTap(shadowMap0, shadowTexel0, p, worldBias(NoL)*invRange0);\n"
+    "  float bias = worldBias(NoL)*invRange0;\n"
+    "  int nB; float avgB;\n"
+    "  blockerSearch(shadowMap0, shadowTexel0, p, bias, PCSS_SEARCH_TEXELS, nB, avgB);\n"
+    "  if(nB == 0) return 1.0;\n"
+    "  float worldZDiff = (p.z - avgB) / invRange0;\n"
+    "  float radius = clamp(worldZDiff*PCSS_ANGULAR_TAN/pcssTexelWorld0, PCSS_MIN_TEXELS, PCSS_MAX_TEXELS);\n"
+    "  return pcfTap(shadowMap0, shadowTexel0, p, bias, radius);\n"
     "}\n"
     "float shadowCascade1(vec3 N){\n"
     "  float NoL = max(dot(N,lightDir),0.0);\n"
     "  vec4 lp = lightVP1*vec4(fragWorld,1.0); vec3 p = lp.xyz/lp.w; p = p*0.5+0.5;\n"
     "  if(p.z<=0.0||p.z>1.0||p.x<0.0||p.x>1.0||p.y<0.0||p.y>1.0) return 1.0;\n"
-    "  return pcfTap(shadowMap1, shadowTexel1, p, worldBias(NoL)*invRange1);\n"
+    "  float bias = worldBias(NoL)*invRange1;\n"
+    "  int nB; float avgB;\n"
+    "  blockerSearch(shadowMap1, shadowTexel1, p, bias, PCSS_SEARCH_TEXELS, nB, avgB);\n"
+    "  if(nB == 0) return 1.0;\n"
+    "  float worldZDiff = (p.z - avgB) / invRange1;\n"
+    "  float radius = clamp(worldZDiff*PCSS_ANGULAR_TAN/pcssTexelWorld1, PCSS_MIN_TEXELS, PCSS_MAX_TEXELS);\n"
+    "  return pcfTap(shadowMap1, shadowTexel1, p, bias, radius);\n"
     "}\n"
     "float shadowCascade2(vec3 N){\n"
     "  float NoL = max(dot(N,lightDir),0.0);\n"
     "  vec4 lp = lightVP2*vec4(fragWorld,1.0); vec3 p = lp.xyz/lp.w; p = p*0.5+0.5;\n"
     "  if(p.z<=0.0||p.z>1.0||p.x<0.0||p.x>1.0||p.y<0.0||p.y>1.0) return 1.0;\n"
-    "  return pcfTap(shadowMap2, shadowTexel2, p, worldBias(NoL)*invRange2);\n"
+    "  float bias = worldBias(NoL)*invRange2;\n"
+    "  int nB; float avgB;\n"
+    "  blockerSearch(shadowMap2, shadowTexel2, p, bias, PCSS_SEARCH_TEXELS, nB, avgB);\n"
+    "  if(nB == 0) return 1.0;\n"
+    "  float worldZDiff = (p.z - avgB) / invRange2;\n"
+    "  float radius = clamp(worldZDiff*PCSS_ANGULAR_TAN/pcssTexelWorld2, PCSS_MIN_TEXELS, PCSS_MAX_TEXELS);\n"
+    "  return pcfTap(shadowMap2, shadowTexel2, p, bias, radius);\n"
     "}\n"
     // Select cascade by focus-XZ distance (matches the fog/culling convention
     // used elsewhere in this shader), soft-blending across a band near each
@@ -163,6 +245,40 @@ static const char *SHADOW_FS =
     "  vec3 sky = mix(skyHorz, skyZen, pow(ry, 0.45));\n"
     "  float sunGlow = pow(max(dot(R, lightDir), 0.0), 8.0);\n"
     "  return mix(sky, sunCol*0.55, 0.30*sunGlow);\n"
+    "}\n"
+    // Screen-space ray march against the PREVIOUS frame's color/depth (see the
+    // prevSceneColor/prevSceneDepth/prevVP comment above). Starts the march
+    // half a metre off the surface (thin rail cross-sections, ~0.18 m, are
+    // almost always clear of their own geometry by the first step) and grows
+    // the step size geometrically so a handful of taps still reach tens of
+    // metres out to catch nearby structure/terrain/sky. `hit` reports whether
+    // a real surface was found in front of the marched point (a crossing, the
+    // classic screen-space-raymarch hit test) -- exactly the same NDC-depth
+    // comparison pattern the shadow cascades above use, just against last
+    // frame's own render instead of a light's depth map. On any miss (ray
+    // exits the previous frame's screen bounds, goes behind its camera, or
+    // never crosses geometry within the step budget) the caller's analytic
+    // `fallback` (skyReflect) is returned unchanged.
+    "vec3 ssrTrace(vec3 ro, vec3 rd, vec3 fallback, out bool hit){\n"
+    "  hit = false;\n"
+    "  float t = 0.5;\n"
+    "  for(int i=0; i<8; i++){\n"
+    "    vec3 wp = ro + rd*t;\n"
+    "    vec4 pp = prevVP*vec4(wp,1.0);\n"
+    "    if(pp.w <= 0.001) break;\n"
+    "    vec3 ndc = pp.xyz/pp.w;\n"
+    "    if(ndc.x<-1.0||ndc.x>1.0||ndc.y<-1.0||ndc.y>1.0||ndc.z<-1.0||ndc.z>1.0) break;\n"
+    "    vec2 puv = ndc.xy*0.5+0.5;\n"
+    "    vec2 suv = vec2(puv.x, 1.0-puv.y);\n"
+    "    float storedZ  = texture(prevSceneDepth, suv).r;\n"
+    "    float marchedZ = ndc.z*0.5+0.5;\n"
+    "    if(storedZ < marchedZ - 0.0015){\n"
+    "      hit = true;\n"
+    "      return texture(prevSceneColor, suv).rgb;\n"
+    "    }\n"
+    "    t = t*1.8 + 0.35;\n"
+    "  }\n"
+    "  return fallback;\n"
     "}\n"
     "vec3 waterShade(vec3 baseCol, float rawSh, float foam){\n"
     "  vec3 V = normalize(viewPos - fragWorld);\n"
@@ -290,6 +406,18 @@ static const char *SHADOW_FS =
     "    const float METAL_REFLECT_STRENGTH = 0.35;\n"
     "    vec3 Rm = reflect(-V, N);\n"
     "    vec3 metalRefl = skyReflect(Rm);\n"
+    // Only trace against the previous frame when one actually exists in the
+    // shape this shader expects: legacyTonemap>0.5 marks the two call sites
+    // (KEY_T live path-trace preview, offline path-trace --shot overlay) that
+    // draw straight onto an already-tonemapped LDR backbuffer outside the
+    // gPostFX sceneRT ping-pong entirely -- prevSceneColor/prevSceneDepth
+    // aren't meaningfully bound there, so skip the trace and keep the
+    // analytic-only fallback exactly as before for those two paths.
+    "    if(legacyTonemap < 0.5){\n"
+    "      bool ssrHit = false;\n"
+    "      vec3 ssrCol = ssrTrace(fragWorld, Rm, metalRefl, ssrHit);\n"
+    "      if(ssrHit) metalRefl = ssrCol;\n"
+    "    }\n"
     "    float NoV2 = max(dot(N,V), 0.0);\n"
     "    float fresM = clamp(0.04 + 0.96*pow(1.0-NoV2, 5.0), 0.04, 0.85);\n"
     "    col = mix(col, metalRefl, sheen*fresM*METAL_REFLECT_STRENGTH);\n"
@@ -341,12 +469,14 @@ struct ShadowSys {
     int locShadowMap[SHADOW_CASCADES] = {-1,-1,-1};
     int locShadowTexel[SHADOW_CASCADES] = {-1,-1,-1};
     int locInvRange[SHADOW_CASCADES]  = {-1,-1,-1};
+    int locPcssTexelWorld[SHADOW_CASCADES] = {-1,-1,-1};
     int locCascadeSplit0=-1, locCascadeSplit1=-1, locShadowFocus=-1;
     int locLightDir=-1, locViewPos=-1;
     int locSun=-1, locSky=-1, locGround=-1, locDepthMVP=-1, locTime=-1;
     int locFogEnd=-1, locFogCol=-1, locFogColLinear=-1;
     int locRailTangent=-1, locRailUVRange=-1;
     int locLegacyTonemap=-1;
+    int locPrevSceneColor=-1, locPrevSceneDepth=-1, locPrevVP=-1;
     Matrix lightVP[SHADOW_CASCADES]{};
     float invRange[SHADOW_CASCADES]{};
     Vector3 focus{};   // last point cascades were centred on -- shaders must select cascades by distance from THIS, not the camera
@@ -358,11 +488,22 @@ struct ShadowSys {
         const char *mapNames[SHADOW_CASCADES]   = { "shadowMap0", "shadowMap1", "shadowMap2" };
         const char *texelNames[SHADOW_CASCADES] = { "shadowTexel0", "shadowTexel1", "shadowTexel2" };
         const char *rangeNames[SHADOW_CASCADES] = { "invRange0", "invRange1", "invRange2" };
+        const char *pcssNames[SHADOW_CASCADES]  = { "pcssTexelWorld0", "pcssTexelWorld1", "pcssTexelWorld2" };
         for (int i = 0; i < SHADOW_CASCADES; i++) {
             locLightVP[i]     = GetShaderLocation(lit, vpNames[i]);
             locShadowMap[i]   = GetShaderLocation(lit, mapNames[i]);
             locShadowTexel[i] = GetShaderLocation(lit, texelNames[i]);
             locInvRange[i]    = GetShaderLocation(lit, rangeNames[i]);
+            locPcssTexelWorld[i] = GetShaderLocation(lit, pcssNames[i]);
+        }
+        // World metres per shadow-map texel (XY) is fixed for the lifetime of
+        // the program (derived purely from the compile-time SHADOW_CASCADE_R/SM
+        // tables, never changes frame to frame like lightVP/invRange do), so
+        // it's set once here rather than every frame in main.cpp's
+        // bindShadowUniforms().
+        for (int i = 0; i < SHADOW_CASCADES; i++) {
+            float texelWorld = (2.0f * SHADOW_CASCADE_R[i]) / (float)SM[i];
+            SetShaderValue(lit, locPcssTexelWorld[i], &texelWorld, SHADER_UNIFORM_FLOAT);
         }
         locCascadeSplit0 = GetShaderLocation(lit, "cascadeSplit0");
         locCascadeSplit1 = GetShaderLocation(lit, "cascadeSplit1");
@@ -379,6 +520,9 @@ struct ShadowSys {
         locRailTangent = GetShaderLocation(lit, "railTangent");
         locRailUVRange = GetShaderLocation(lit, "railUVRange");
         locLegacyTonemap = GetShaderLocation(lit, "legacyTonemap");
+        locPrevSceneColor = GetShaderLocation(lit, "prevSceneColor");
+        locPrevSceneDepth = GetShaderLocation(lit, "prevSceneDepth");
+        locPrevVP         = GetShaderLocation(lit, "prevVP");
         for (int i = 0; i < SHADOW_CASCADES; i++) {
             fbo[i] = rlLoadFramebuffer();
             rlEnableFramebuffer(fbo[i]);
@@ -844,7 +988,16 @@ struct PostFX {
     int locAO_Radius=-1, locAO_Bias=-1, locAO_NTexel=-1;
     int locAOB_AoTex=-1, locAOB_DepthTex=-1, locAOB_TexelStep=-1, locAOB_Near=-1, locAOB_Far=-1;
 
-    RenderTexture2D sceneRT{};
+    // Ping-ponged: sceneRT[sceneCur] is the target this frame renders into;
+    // sceneRT[sceneCur^1] still holds last frame's fully-resolved linear HDR
+    // scene (color+depth), the source the metal-reflection SSR trace in
+    // SHADOW_FS samples from (see prevSceneColor/prevSceneDepth/prevVP there).
+    // lastFrameVP is the view-projection matrix that rendered whichever
+    // buffer is currently "previous" -- needed to reproject SSR ray samples
+    // back into that buffer's own screen space.
+    RenderTexture2D sceneRT[2]{};
+    int sceneCur = 0;
+    Matrix lastFrameVP = MatrixIdentity();
     RenderTexture2D bloomRT[2]{};
     RenderTexture2D aoRT[2]{};
     int sceneW=0, sceneH=0, bloomW=0, bloomH=0;
@@ -884,7 +1037,22 @@ struct PostFX {
         bloomW = w / BLOOM_DOWNSCALE; if (bloomW < 1) bloomW = 1;
         bloomH = h / BLOOM_DOWNSCALE; if (bloomH < 1) bloomH = 1;
 
-        makeColorTarget(sceneRT,    sceneW, sceneH, true);
+        makeColorTarget(sceneRT[0], sceneW, sceneH, true);
+        makeColorTarget(sceneRT[1], sceneW, sceneH, true);
+        // Clear both ping-pong buffers up front: sceneRT[sceneCur^1] (the
+        // "previous frame") is sampled by the SSR trace above from the very
+        // first frame, before anything has ever rendered into it. An
+        // uncleared color texture is fine either way (SSR only trusts a
+        // sample after a depth hit), but leaving the depth texture with
+        // undefined GPU garbage risks a stray near-zero value reading as a
+        // false "hit" on frame 1 -- clearing depth to the standard far
+        // value (1.0) up front guarantees every SSR tap misses cleanly
+        // (falls back to the analytic skyReflect()) until a real previous
+        // frame exists.
+        BeginTextureMode(sceneRT[0]); ClearBackground(BLACK); EndTextureMode();
+        BeginTextureMode(sceneRT[1]); ClearBackground(BLACK); EndTextureMode();
+        sceneCur = 0;
+        lastFrameVP = MatrixIdentity();
         makeColorTarget(bloomRT[0], bloomW, bloomH, false);
         makeColorTarget(bloomRT[1], bloomW, bloomH, false);
         // AO renders/blurs at the same low resolution as bloom (see AO_FS's
@@ -954,10 +1122,27 @@ struct PostFX {
         SetShaderValue(aoBlur, locAOB_Far,  &aoFar,  SHADER_UNIFORM_FLOAT);
     }
 
-    // Sky + opaque + water all render between these two, into sceneRT instead
-    // of the backbuffer, so their fragment shaders can stay in linear HDR.
-    void beginScene() { BeginTextureMode(sceneRT); }
+    // Sky + opaque + water all render between these two, into sceneRT[sceneCur]
+    // instead of the backbuffer, so their fragment shaders can stay in linear HDR.
+    void beginScene() { BeginTextureMode(sceneRT[sceneCur]); }
     void endScene()   { EndTextureMode(); }
+
+    // Previous frame's fully-resolved scene (color+depth) -- the source the
+    // opaque pass's SSR metal-reflection trace samples from. Call this AFTER
+    // beginScene() has been called for the frame that's about to render (so
+    // sceneCur already points at THIS frame's target and sceneCur^1 is
+    // guaranteed to be last frame's completed buffer, never the one currently
+    // bound as the render target -- no read/write hazard).
+    RenderTexture2D &prevScene() { return sceneRT[sceneCur ^ 1]; }
+
+    // Call once per frame after resolve() (or anywhere after the frame's SSR
+    // sampling is done): records this frame's view-projection matrix as next
+    // frame's "previous" reprojection matrix, then flips the ping-pong so the
+    // next frame renders into the buffer that just became "previous".
+    void endFrame(Matrix vpThisFrame) {
+        lastFrameVP = vpThisFrame;
+        sceneCur ^= 1;
+    }
 
     // Bloom extract+blur (cheap: low-res throughout) then the single
     // fullscreen composite pass, written to whatever framebuffer is currently
@@ -984,7 +1169,7 @@ struct PostFX {
             SetShaderValue(brightpass, locBP_SrcTexel, srcTexel, SHADER_UNIFORM_VEC2);
             BeginShaderMode(brightpass);
                 SetShaderValue(brightpass, locBP_SceneTex, &SCENE_UNIT, SHADER_UNIFORM_INT);
-                rlActiveTextureSlot(SCENE_UNIT); rlEnableTexture(sceneRT.texture.id);
+                rlActiveTextureSlot(SCENE_UNIT); rlEnableTexture(sceneRT[sceneCur].texture.id);
                 rlActiveTextureSlot(0);
                 DrawRectangle(0, 0, bloomW, bloomH, WHITE);
                 rlDrawRenderBatchActive();
@@ -1023,7 +1208,7 @@ struct PostFX {
             SetShaderValue(aoGen, locAO_NTexel, nTexel, SHADER_UNIFORM_VEC2);
             BeginShaderMode(aoGen);
                 SetShaderValue(aoGen, locAO_DepthTex, &DEPTH_UNIT, SHADER_UNIFORM_INT);
-                rlActiveTextureSlot(DEPTH_UNIT); rlEnableTexture(sceneRT.depth.id);
+                rlActiveTextureSlot(DEPTH_UNIT); rlEnableTexture(sceneRT[sceneCur].depth.id);
                 rlActiveTextureSlot(0);
                 DrawRectangle(0, 0, bloomW, bloomH, WHITE);
                 rlDrawRenderBatchActive();
@@ -1039,7 +1224,7 @@ struct PostFX {
                 SetShaderValue(aoBlur, locAOB_AoTex, &AO_UNIT, SHADER_UNIFORM_INT);
                 SetShaderValue(aoBlur, locAOB_DepthTex, &DEPTH_UNIT, SHADER_UNIFORM_INT);
                 rlActiveTextureSlot(AO_UNIT); rlEnableTexture(aoRT[0].texture.id);
-                rlActiveTextureSlot(DEPTH_UNIT); rlEnableTexture(sceneRT.depth.id);
+                rlActiveTextureSlot(DEPTH_UNIT); rlEnableTexture(sceneRT[sceneCur].depth.id);
                 rlActiveTextureSlot(0);
                 DrawRectangle(0, 0, bloomW, bloomH, WHITE);
                 rlDrawRenderBatchActive();
@@ -1062,7 +1247,7 @@ struct PostFX {
             SetShaderValue(composite, locCP_SceneTex, &SCENE_UNIT, SHADER_UNIFORM_INT);
             SetShaderValue(composite, locCP_BloomTex, &BLOOM_UNIT, SHADER_UNIFORM_INT);
             SetShaderValue(composite, locCP_AoTex, &AO_UNIT, SHADER_UNIFORM_INT);
-            rlActiveTextureSlot(SCENE_UNIT); rlEnableTexture(sceneRT.texture.id);
+            rlActiveTextureSlot(SCENE_UNIT); rlEnableTexture(sceneRT[sceneCur].texture.id);
             rlActiveTextureSlot(BLOOM_UNIT); rlEnableTexture(bloomRT[0].texture.id);
             rlActiveTextureSlot(AO_UNIT); rlEnableTexture(aoRT[1].texture.id);
             rlActiveTextureSlot(0);

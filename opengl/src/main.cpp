@@ -2869,6 +2869,39 @@ int main(int argc, char **argv) {
             rlActiveTextureSlot(0);
         };
 
+        // SSR (metal reflections, see SHADOW_FS's ssrTrace()) reprojection matrix
+        // + previous-frame color/depth texture units. ssrThisFrameVP is built
+        // from the SAME camera the main pass renders with this frame, mirroring
+        // exactly what BeginMode3D builds internally (MatrixPerspective with
+        // rlgl's default near/far -- reused here via AO_CAM_NEAR/FAR, the same
+        // constants SSAO already assumes for this same "never overridden"
+        // reason) -- it's recorded via gPostFX.endFrame() below and read back
+        // NEXT frame as prevVP, once the buffer it describes has become "the
+        // previous frame". Only meaningful for the main (!liveRT) gPostFX path;
+        // the KEY_T live/offline path-trace overlay draws never bind these, and
+        // SHADOW_FS's legacyTonemap>0.5 gate skips sampling them there.
+        int rwSSR = GetRenderWidth(), rhSSR = GetRenderHeight();
+        float aspSSR = (rhSSR > 0) ? (float)rwSSR / (float)rhSSR : 1.0f;
+        Matrix ssrView = MatrixLookAt(cam.position, cam.target, cam.up);
+        Matrix ssrProj = MatrixPerspective(cam.fovy * DEG2RAD, aspSSR, AO_CAM_NEAR, AO_CAM_FAR);
+        Matrix ssrThisFrameVP = MatrixMultiply(ssrView, ssrProj);
+        static const int PREV_SCENE_COLOR_UNIT = 20, PREV_SCENE_DEPTH_UNIT = 21;
+        auto bindPrevScene = [&]() {
+            Matrix prevVP = gPostFX.lastFrameVP;
+            SetShaderValueMatrix(gShadow.lit, gShadow.locPrevVP, prevVP);
+            SetShaderValue(gShadow.lit, gShadow.locPrevSceneColor, &PREV_SCENE_COLOR_UNIT, SHADER_UNIFORM_INT);
+            SetShaderValue(gShadow.lit, gShadow.locPrevSceneDepth, &PREV_SCENE_DEPTH_UNIT, SHADER_UNIFORM_INT);
+            RenderTexture2D &prevRT = gPostFX.prevScene();
+            rlActiveTextureSlot(PREV_SCENE_COLOR_UNIT); rlEnableTexture(prevRT.texture.id);
+            rlActiveTextureSlot(PREV_SCENE_DEPTH_UNIT); rlEnableTexture(prevRT.depth.id);
+            rlActiveTextureSlot(0);
+        };
+        auto unbindPrevScene = [&]() {
+            rlActiveTextureSlot(PREV_SCENE_COLOR_UNIT); rlDisableTexture();
+            rlActiveTextureSlot(PREV_SCENE_DEPTH_UNIT); rlDisableTexture();
+            rlActiveTextureSlot(0);
+        };
+
         if (!liveRT) {
         // Sky + opaque + water all render into the offscreen linear-HDR scene
         // target now, instead of straight to the backbuffer -- gPostFX.resolve()
@@ -2931,9 +2964,11 @@ int main(int argc, char **argv) {
         double tMain0 = diagTiming ? GetTime() : 0.0;
         BeginShaderMode(gShadow.lit);
         bindShadowTextures();
+        bindPrevScene();
         drawWorld(false);
         EndShaderMode();
         unbindShadowTextures();
+        unbindPrevScene();
         if (diagTiming) {
             rlDrawRenderBatchActive();
             dMainAcc += (GetTime() - tMain0) * 1000.0;
@@ -3087,6 +3122,10 @@ int main(int argc, char **argv) {
             float asp = (float)rw / (float)rh;
             gPostFX.resolve(rw, rh, (float)GetTime(), th, asp);
         }
+        // Record this frame's scene (and the VP that produced it) as "previous"
+        // for next frame's SSR trace, then flip the ping-pong -- see
+        // PostFX::endFrame()/prevScene() and SHADOW_FS's ssrTrace().
+        gPostFX.endFrame(ssrThisFrameVP);
         } else {
 
             int rw = GetRenderWidth(), rh = GetRenderHeight();
