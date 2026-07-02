@@ -1643,6 +1643,16 @@ int main(int argc, char **argv) {
         float railU1 = (T_RAIL * 16 + 15.5f) / (float)(TILE_N * 16);
         float ruv[2] = { railU0, railU1 };
         SetShaderValue(gShadow.lit, gShadow.locRailUVRange, ruv, SHADER_UNIFORM_VEC2);
+
+        // Same pattern, but spanning the whole contiguous T_GOLD..T_RAIL run
+        // (atlas indices 6-8) -- the authoritative "genuine metal" signal the
+        // fragment shader uses for a proper high-F0 metal Fresnel, distinct
+        // from bright/pale non-metal surfaces the heuristic `sheen` mask
+        // still lightly highlights.
+        float metalU0 = (T_GOLD * 16 + 0.5f) / (float)(TILE_N * 16);
+        float metalU1 = (T_RAIL * 16 + 15.5f) / (float)(TILE_N * 16);
+        float muv[2] = { metalU0, metalU1 };
+        SetShaderValue(gShadow.lit, gShadow.locMetalUVRange, muv, SHADER_UNIFORM_VEC2);
     }
 
     std::vector<float> ptBakeBuf;
@@ -1809,7 +1819,9 @@ int main(int argc, char **argv) {
             if (frame == 901) camMode = 2;
         }
         if (rttestMode) { camMode = 2; liveRT = (gPT.rt.id != 0); }
-        bool shotFrame = shotMode && (orbitShot ? (frame == 5 || frame == 700 || frame == 1600 || frame == 3000)
+        static int dbgOrbitFrame = getenv("MC_ORBIT_FRAME") ? atoi(getenv("MC_ORBIT_FRAME")) : -1;
+        bool shotFrame = shotMode && (orbitShot ? (dbgOrbitFrame > 0 ? (frame == dbgOrbitFrame)
+                                                  : (frame == 5 || frame == 700 || frame == 1600 || frame == 3000))
                                                 : (frame == 200 || frame == 600 || frame == 900 || frame == 1150));
         bool rtShot = rttestMode && (frame == 420 || frame == 460 || frame == 500 || frame == 560);
 

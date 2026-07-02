@@ -42,6 +42,15 @@ static const char *SHADOW_FS =
     // to just the rail quads without forcing a GPU flush around every one of
     // the ~1000+ rail samples drawn per frame).
     "uniform vec3 railTangent; uniform vec2 railUVRange;\n"
+    // Authoritative "is this fragment genuine metal" signal: the atlas-space U
+    // range spanning T_GOLD..T_RAIL (contiguous tile indices), set once at
+    // startup exactly like railUVRange above. Unlike the `sheen` mask below
+    // (a brightness/desaturation heuristic that also fires on any bright,
+    // low-saturation surface -- white paint, pale stone, sun-washed concrete
+    // -- making metal and non-metal read as "one material"), this is real
+    // tile identity, so metal can get a materially different Fresnel curve
+    // from everything else `sheen` still lightly highlights.
+    "uniform vec2 metalUVRange;\n"
     // Real screen-space reflection source for bare metal (rails/iron/gold, see
     // the `sheen` mix near the end of main() below): this is a single-pass
     // forward renderer with no G-buffer, so a fragment can't sample the
@@ -154,13 +163,24 @@ static const char *SHADOW_FS =
     // (~0.005) so the penumbra is actually visible at this game's scale
     // rather than a few sub-pixel texels, matching the "soft with distance"
     // look this pass is going for without pretending to be physically exact.
+    // Was 0.06 (~13x real) with an 11-texel cap: for an elevated blocker like
+    // the coaster/train riding high above the ground (hilltop, loop apex),
+    // worldZDiff grows into the tens of metres and the filter radius pinned
+    // at its max almost immediately -- with only 12 fixed PCF taps spread
+    // over that large a disk, the result undersamples into a blotchy, more
+    // solid-looking dark patch under the train rather than a smooth soft
+    // edge, and it visibly swells/shrinks as the coaster's height changes
+    // (reported as "a fake circular shadow chasing the coaster" / "darker
+    // for no reason, depends on y level"). Toned both knobs down so the
+    // penumbra still softens with height but stays far short of the
+    // undersampling regime at any height this track reaches.
     // MIN/MAX clamp the resulting filter radius in texels: MIN keeps a touch
     // of softness even for near-contact blockers (avoids a hard PCF-sized
     // edge right where the penumbra should be tightest), MAX stops the filter
     // from growing into a blurry mess for distant/large occluders.
-    "const float PCSS_ANGULAR_TAN = 0.06;\n"
+    "const float PCSS_ANGULAR_TAN = 0.022;\n"
     "const float PCSS_MIN_TEXELS = 1.1;\n"
-    "const float PCSS_MAX_TEXELS = 11.0;\n"
+    "const float PCSS_MAX_TEXELS = 6.0;\n"
     "const float PCSS_SEARCH_TEXELS = 5.0;\n"
     // Split per-cascade so every call site passes a compile-time-known cascade --
     // no runtime idx branch (the old single shadowCascade(idx,N) re-tested idx on
@@ -402,8 +422,10 @@ static const char *SHADOW_FS =
     // extra brightness into the post-process bloom threshold. METAL_REFLECT_STRENGTH
     // caps the blend well under 1 (max ~0.30 at full sheen and grazing angle) -- a
     // hint of reflectivity, not a mirror finish.
-    "  if(sheen > 0.001){\n"
+    "  bool genuineMetal = fragTexCoord.x > metalUVRange.x && fragTexCoord.x < metalUVRange.y;\n"
+    "  if(sheen > 0.001 || genuineMetal){\n"
     "    const float METAL_REFLECT_STRENGTH = 0.35;\n"
+    "    const float GENUINE_METAL_STRENGTH = 0.65;\n"
     "    vec3 Rm = reflect(-V, N);\n"
     "    vec3 metalRefl = skyReflect(Rm);\n"
     // Only trace against the previous frame when one actually exists in the
@@ -419,8 +441,22 @@ static const char *SHADOW_FS =
     "      if(ssrHit) metalRefl = ssrCol;\n"
     "    }\n"
     "    float NoV2 = max(dot(N,V), 0.0);\n"
-    "    float fresM = clamp(0.04 + 0.96*pow(1.0-NoV2, 5.0), 0.04, 0.85);\n"
-    "    col = mix(col, metalRefl, sheen*fresM*METAL_REFLECT_STRENGTH);\n"
+    // Two distinct Fresnel curves, not one shared 0.04-baseline dielectric ramp:
+    // genuine metal (real tile identity, above) uses a HIGH, near-angle-independent
+    // F0 (Schlick with F0~0.6, tinted toward the surface's own albedo the way real
+    // metals have a colored specular response -- gold trim reflects gold-tinted
+    // sky, steel rail stays near-neutral), so it reads reflective even head-on.
+    // Everything only flagged by the coarse brightness/desaturation `sheen` mask
+    // (pale paint, sun-washed concrete -- NOT real metal) keeps the old low
+    // dielectric-style ramp, further dampened so it no longer competes visually
+    // with genuine metal and reads as a subtle satin hint instead.
+    "    vec3 F0metal = mix(vec3(0.6), albedo, 0.55);\n"
+    "    vec3 fresMetal = F0metal + (vec3(1.0)-F0metal)*pow(1.0-NoV2, 5.0);\n"
+    "    float fresDielectric = clamp(0.04 + 0.30*pow(1.0-NoV2, 5.0), 0.04, 0.34);\n"
+    "    vec3 fresM = genuineMetal ? fresMetal : vec3(fresDielectric);\n"
+    "    float strength = genuineMetal ? GENUINE_METAL_STRENGTH : METAL_REFLECT_STRENGTH;\n"
+    "    float mask = genuineMetal ? 1.0 : sheen;\n"
+    "    col = mix(col, metalRefl, mask*fresM*strength);\n"
     "  }\n"
     "  if(legacyTonemap > 0.5){\n"
     "    col = aces(col*0.94);\n"
@@ -474,7 +510,7 @@ struct ShadowSys {
     int locLightDir=-1, locViewPos=-1;
     int locSun=-1, locSky=-1, locGround=-1, locDepthMVP=-1, locTime=-1;
     int locFogEnd=-1, locFogCol=-1, locFogColLinear=-1;
-    int locRailTangent=-1, locRailUVRange=-1;
+    int locRailTangent=-1, locRailUVRange=-1, locMetalUVRange=-1;
     int locLegacyTonemap=-1;
     int locPrevSceneColor=-1, locPrevSceneDepth=-1, locPrevVP=-1;
     Matrix lightVP[SHADOW_CASCADES]{};
@@ -519,6 +555,7 @@ struct ShadowSys {
         locFogColLinear = GetShaderLocation(lit, "fogColLinear");
         locRailTangent = GetShaderLocation(lit, "railTangent");
         locRailUVRange = GetShaderLocation(lit, "railUVRange");
+        locMetalUVRange = GetShaderLocation(lit, "metalUVRange");
         locLegacyTonemap = GetShaderLocation(lit, "legacyTonemap");
         locPrevSceneColor = GetShaderLocation(lit, "prevSceneColor");
         locPrevSceneDepth = GetShaderLocation(lit, "prevSceneDepth");
