@@ -666,7 +666,7 @@ struct Track {
         // gT budgets raised (big 5.0->6.5, small 3.0->4.0): with the higher capK/dyawGeo the turn-rate
         // cap now BINDS at band speed and delivers ~6 g lateral, which the heartline bank rotates into
         // the seat -> ~6 g sustained in-seat on a fully-built big turn (was ~3.4 sustained at gT 5.0).
-        if (big) { turnMag = turnMagFor(6.5f, 0.025f, 0.55f); bankT = 0.15f; remain = irnd(8, 12); }   // big TURN: small over-bank past its heartline for a dramatic hard-turn lean
+        if (big) { turnMag = turnMagFor(8.0f, 0.025f, 0.62f); bankT = 0.15f; remain = irnd(8, 12); }   // big TURN: small over-bank past its heartline for a dramatic hard-turn lean
         else     { turnMag = turnMagFor(4.0f, 0.015f, 0.24f); bankT = 0.0f; remain = irnd(6, 9);  }   // small TURN: pure heartline
     }
     void initHelix() {
@@ -708,7 +708,7 @@ struct Track {
         // no longer caps entry speed -- and re-flattened the curve straight back into
         // the +13/-16g bug this budget was chosen to fix); now stays out of the way
         // up to the genV hard clamp.
-        turnMag = turnMagFor(6.0f, 0.02f, 0.60f);
+        turnMag = turnMagFor(6.8f, 0.02f, 0.60f);
         bankT   = 0.10f;   // HELIX: slight over-bank on top of its gT=6 heartline, continuous over the coil
 
         float R = SEG_LEN / turnMag;
@@ -737,7 +737,7 @@ struct Track {
         // so 6.0 was clearing -6 at hot entry speeds (--gaudit, 60+ seeds). lo floor
         // lowered (was 0.11, reached below 87 m/s) so it stays out of the way up to
         // the genV hard clamp instead of re-flattening the curve at extreme speed.
-        turnMag   = turnMagFor(6.0f, 0.025f, 0.44f);   // budget 5.0->6.0: each banked half of the S holds ~5-6 g in-seat
+        turnMag   = turnMagFor(7.5f, 0.025f, 0.52f);   // budget 5.0->6.0: each banked half of the S holds ~5-6 g in-seat
         bankT     = 0.0f;   // SCURVE: pure heartline -- the roll now sweeps continuously through 0 at the S inflection
         scurveLen = irnd(10, 15);   // longer (was 6-10): each half of the S now holds its banked plateau instead of being all-ramp, so sustained lateral builds before the inflection flips it
         remain    = scurveLen;
@@ -746,7 +746,7 @@ struct Track {
         mode = M_DIVE;
         setClearance(4.0f, 24.0f);
         turnDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        turnMag = turnMagFor(5.5f, 0.02f, 0.46f);   // budget 4.0->5.5: the diving turn holds ~5-6 g in-seat once banked (was ~2.8 sustained)
+        turnMag = turnMagFor(7.0f, 0.02f, 0.54f);   // budget 4.0->5.5: the diving turn holds ~5-6 g in-seat once banked (was ~2.8 sustained)
         bankT   = 0.20f;   // DIVE: over-bank fraction -> past-vertical lean for the diving turn, eased by shape
         remain  = irnd(7, 11);   // longer (was 4-7): the diving turn holds its plateau instead of averaging down over an all-ramp element
     }
@@ -1213,9 +1213,16 @@ struct Track {
             // arc-collapse geometry guard raised to 0.20 (R_horiz = 14/0.20 = 70 m) so it does not bind
             // before capK at mid-band speed (~60 m/s), where a 6 g turn genuinely needs a ~62 m radius;
             // 70 m is still ~5x the ~14 m felt-g arc-collapse point, so the -29.9G-class spike stays impossible.
-            float capK    = (mode == M_HELIX) ? 6.5f : 6.0f;
+            // Caps are per-mode. The dedicated HIGH-G turns (TURN/DIVE/SCURVE/HELIX) get raised caps
+            // so they HOLD ~5-6 g sustained (user target): the plateau ceiling must be ~7-8 g for the
+            // ramp-averaged interior to land at 5-6; brief peaks may reach ~9-11 g (within 6+6/t's
+            // 10-12 brief allowance). The AIRTIME / other banked modes (HILLS/BANKAIR/WAVE/WINGOVER)
+            // KEEP the proven-safe 6.0 / 0.26 values -- raising their geometry destabilized the du-window
+            // on their combined vertical-crest + bank and produced -16..-19 g arc-collapse spikes.
+            bool gElem = (mode == M_TURN || mode == M_DIVE || mode == M_SCURVE);
+            float capK    = (mode == M_HELIX) ? 6.8f : (gElem ? 7.5f : 6.0f);
             float dyawG   = capK * SEG_LEN * GRAV / fmaxf(genV * genV, 100.0f);
-            float dyawGeo = (mode == M_HELIX) ? 0.260f : 0.260f;   // R_horiz >= 54 m; lifts the LOW-SPEED turn g (below ~57 m/s, where capK's dyawG doesn't bind) so a turn entered at 125-180 km/h still holds ~3-5 g instead of ~2 -- raises the whole-ride average toward 1.5-2x real. 54 m is still ~4x the ~14 m felt-g arc-collapse point.
+            float dyawGeo = (mode == M_HELIX) ? 0.270f : (gElem ? 0.275f : 0.260f);
             float dyawMax = fminf(dyawG, dyawGeo);
             dyaw = Clamp(dyaw, -dyawMax, dyawMax);
             genPrevDyaw = dyaw;
