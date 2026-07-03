@@ -918,12 +918,31 @@ struct Track {
             default:          return 1.0f;
         }
     }
+    // Speed-of-slot preference. The free banked turns self-limit their g by speed-scaling their
+    // radius, so they're eligible at any speed and, left to rarity+recency alone, land at a middling
+    // average entry speed -- which caps their SUSTAINED g (a turn entered near the 125 km/h floor
+    // physically can't hold more than ~3 g). Real designers put the hard sustained-g turns where the
+    // train is FAST (right after a drop) and the airtime hills where it's slower. Bias selection the
+    // same way: high-g banked elements get weighted UP as genV rises, airtime/float filler UP when
+    // slow. Pure weighting -- the physics safety gates (eligibleElem) are untouched. `spd` is 0 at
+    // the band floor and 1 near the top (~85 m/s / 306 km/h).
+    static float elemSpeedPref(SegMode m, float spd) {
+        switch (m) {
+            case M_TURN: case M_DIVE: case M_SCURVE: case M_HELIX: case M_WINGOVER:
+                return 0.35f + 1.60f * spd;    // hard sustained-g turns: strongly favored when fast
+            case M_HILLS: case M_BANKAIR: case M_WAVE: case M_DIP:
+                return 1.25f - 0.70f * spd;    // airtime/filler: favored when slower
+            default:
+                return 1.0f;
+        }
+    }
     SegMode pickFromPool(const SegMode *pool, int n) const {
         SegMode valid[32]; float w[32]; int vc = 0; float wsum = 0;
         for (int i = 0; i < n && vc < 32; i++) {
             if (!eligibleElem(pool[i])) continue;
             float age = (float)(elemSeq - lastUsedAt[pool[i]]) + 1.0f;
-            valid[vc] = pool[i]; w[vc] = elemRarityWeight(pool[i]) * age * age; wsum += w[vc]; vc++;
+            float spd = Clamp((genV - 34.72f) / 50.0f, 0.0f, 1.0f);   // 0 at 125 km/h floor, ~1 near 306 km/h
+            valid[vc] = pool[i]; w[vc] = elemRarityWeight(pool[i]) * age * age * elemSpeedPref(pool[i], spd); wsum += w[vc]; vc++;
         }
         if (vc == 0) {
             // Full eligibleElem() found nothing (variety constraint exhausted the pool) --
@@ -1182,7 +1201,7 @@ struct Track {
             // 70 m is still ~5x the ~14 m felt-g arc-collapse point, so the -29.9G-class spike stays impossible.
             float capK    = (mode == M_HELIX) ? 6.5f : 6.0f;
             float dyawG   = capK * SEG_LEN * GRAV / fmaxf(genV * genV, 100.0f);
-            float dyawGeo = (mode == M_HELIX) ? 0.205f : 0.200f;   // R_horiz >= 68/70 m; well clear of arc-collapse
+            float dyawGeo = (mode == M_HELIX) ? 0.260f : 0.260f;   // R_horiz >= 54 m; lifts the LOW-SPEED turn g (below ~57 m/s, where capK's dyawG doesn't bind) so a turn entered at 125-180 km/h still holds ~3-5 g instead of ~2 -- raises the whole-ride average toward 1.5-2x real. 54 m is still ~4x the ~14 m felt-g arc-collapse point.
             float dyawMax = fminf(dyawG, dyawGeo);
             dyaw = Clamp(dyaw, -dyawMax, dyawMax);
             genPrevDyaw = dyaw;
