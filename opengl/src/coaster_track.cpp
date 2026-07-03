@@ -615,7 +615,12 @@ struct Track {
         // ~7-8 s, giving a duration-scaled gMax(t) ~= 6+6/7.5 =~ 6.8 real -- current natural vert
         // was only ~5.0-5.2, so there was real headroom under that target; a modest nudge (not the
         // full jump, since hillH itself -- the dominant term -- is untouched here) moves toward it.
-        { float gT = 3.7f;
+        // gT 3.7->5.2: this is the DESIGN crest g -- higher shortens hillLen for the same hillH,
+        // sharpening the crest so airtime deepens toward the -6 target (baseline felt ~-4.4). The
+        // crest is at the TOP of the hill, away from terrain, so this does NOT worsen the ground
+        // clearance offenders (which are HELIX/STENGEL/FLAT over rising terrain, a separate issue).
+        // The vertical dlim clamp and the felt-g safety net still backstop the peak.
+        { float gT = 5.2f;
           float L  = 2.0f * PI * hillBumps * genV * sqrtf(0.5f * hillH / (gT * GRAV));
           hillLen  = Clamp((int)(L / SEG_LEN), hillBumps * 3, 40); }
         // Per-step lateral turn rate, sized from the ACTUAL entry speed like turnMag
@@ -732,7 +737,7 @@ struct Track {
         // gT raised 3.3->3.7 and lateral budget 1.2->1.5 planar, same duration-scaled reasoning as
         // initHills() (natural BANKAIR duration ~6.7-6.9 s -> gMax(t) ~6.9 real; natural vert/lat
         // were only ~5.6-7.1/~3.9-5.6, real headroom under that target).
-        { float gT = 3.7f; float L = 2.0f*PI*hillBumps*genV*sqrtf(0.5f*hillH/(gT*GRAV)); hillLen = Clamp((int)(L/SEG_LEN), hillBumps*3, 36); }
+        { float gT = 5.2f; float L = 2.0f*PI*hillBumps*genV*sqrtf(0.5f*hillH/(gT*GRAV)); hillLen = Clamp((int)(L/SEG_LEN), hillBumps*3, 36); }   // gT 3.7->5.2: sharper crest -> airtime toward -6 (BankAir/Wave)
         // Speed-scaled per-step turn (see initHills) so lateral g holds ~1.2g
         // regardless of entry speed instead of growing with v^2 on a hot entry
         // (1.4 still cleared -6 at the top of the speed range across 150 seeds).
@@ -749,7 +754,7 @@ struct Track {
         hillH     = fminf(hillH, maxAirH());
         // gT raised 3.3->3.7, same duration-scaled reasoning as initHills()/initBankAir() (natural
         // WAVE duration ~6.4-6.5 s -> gMax(t) ~6.9 real; natural vert was only ~5.2, real headroom).
-        { float gT = 3.7f; float L = 2.0f*PI*hillBumps*genV*sqrtf(0.5f*hillH/(gT*GRAV)); hillLen = Clamp((int)(L/SEG_LEN), hillBumps*3, 36); }
+        { float gT = 5.2f; float L = 2.0f*PI*hillBumps*genV*sqrtf(0.5f*hillH/(gT*GRAV)); hillLen = Clamp((int)(L/SEG_LEN), hillBumps*3, 36); }   // gT 3.7->5.2: sharper crest -> airtime toward -6 (BankAir/Wave)
         turnDir   = (rnd01() < 0.5f) ? -1.0f : 1.0f;
         // Speed-scaled per-step turn (see initHills): a fixed rate held over the
         // longer, faster-entry waves this hot-entry track now reaches pushed lateral
