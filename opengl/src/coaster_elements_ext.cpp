@@ -52,7 +52,7 @@
         float aheadMax = sdBase.y - 14.0f;
         for (int la = 1; la <= 26; la++)
             for (int ls = -1; ls <= 1; ls++) {
-                float latOff = ls * 0.22f * (la * SEG_LEN);   // matches sdSpan = L*0.22 at this reach
+                float latOff = ls * 0.20f * (la * SEG_LEN);   // matches sdSpan = L*0.20 at this reach
                 aheadMax = fminf(aheadMax, sdBase.y - groundTopAt(
                     sdBase.x + sdF.x * SEG_LEN * la + sdSide.x * latOff,
                     sdBase.z + sdF.z * SEG_LEN * la + sdSide.z * latOff) - 14.0f);
@@ -95,7 +95,7 @@
                    atanf(sdStraightDrop / fmaxf(straightSteps * SEG_LEN, 1e-3f)) * 180.0f / PI);
         float L   = sdSteps * SEG_LEN;
 
-        sdSpan    = L * 0.22f;
+        sdSpan    = L * 0.20f;   // slightly narrower lateral bow (with the 1.95 rad bank cap) keeps peak lateral ~2x the real Stengel's instead of the measured 8+
         remain    = sdSteps;
     }
     Vector3 stepStengel() {
@@ -131,7 +131,7 @@
             0,
             sdF.z + sdSide.z * (sdSpan / L) * PI * 0.5f * sinf(PI * t) });
 
-        float beta = 2.18f * 0.5f * (1.0f - cosf(2.0f * PI * t));
+        float beta = 1.95f * 0.5f * (1.0f - cosf(2.0f * PI * t));   // ~112 deg over-bank at the crest: real overbanks run 100-122 deg; the old 125 deg projected crest curvature into a 24 g lateral spike at speed
         Vector3 latAx = Vector3Normalize(Vector3CrossProduct(H, WUP));
         float sgn = (Vector3CrossProduct(H, WUP).x * sdSide.x +
                      Vector3CrossProduct(H, WUP).z * sdSide.z) >= 0 ? 1.0f : -1.0f;

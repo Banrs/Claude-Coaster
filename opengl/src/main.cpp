@@ -39,7 +39,7 @@ static const float CHAIN_V   = 22.0f;
 static const float MIN_V     = 42.0f;
 static const float MAX_V     = 82.0f;
 static const float LAUNCH_V  = 108.0f;  // asymptote ~389 km/h; drag-limited TOP speed ~350 km/h by physics (no cap).
-static const float CLIMB_V   = 22.0f;   // crest speed off a lift/top-hat (~79 km/h): the drop supplies the speed, not the lift.
+static const float CLIMB_V   = 27.0f;   // crest speed off a lift/top-hat (~97 km/h): the drop supplies the speed, not the lift. Raised from 22 so the long rounded crowns never dip under the 26 m/s crawl threshold.
 // Speed is fully physics-driven: no re-power floor and no top cap. Speed is whatever launch
 // thrust + gravity + friction/drag produce; low points may occasionally dip into a real stall.
 // Only V_GUARD remains, a pure numeric floor so du/dt stays finite.
@@ -49,7 +49,7 @@ static float       BOOST_V   = 62.0f;
 // re-launches/re-boosts (uniformly, regardless of what element comes next -- this is pure
 // pacing, not an inversion-reactive brake). Kept low enough that genV can coast down through
 // an inversion's eligible speed window before the ride re-powers.
-static float       BOOST_TRIG = 77.0f;   // re-power below ~277 km/h so the whole-ride AVERAGE holds ~275 km/h.
+static float       BOOST_TRIG = 84.0f;   // re-power below ~302 km/h: holds the ride average near ~265-270 km/h now that the slow windows are shared with the entry-gated inversions (nextMode's wantBoost hook) and boosts wait for the ground-hug drop first.
 
 static const Vector3 WUP = { 0, 1, 0 };
 
@@ -1281,6 +1281,7 @@ int main(int argc, char **argv) {
                 if (tg == M_LAUNCH) v += 112.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;   // punchy LSM thrust, fades to 0 near ~320 (no clamp)
                 else if (tg == M_CLIMB && !t.chainAt(u) && v < CLIMB_V) v = fminf(v + 44.0f * dt, CLIMB_V);
                 if (tg == M_BOOST) v += 160.0f * fmaxf(0.0f, 1.0f - v / 86.0f) * dt;   // Do-Dodonpa-class boost punch (0-200 km/h ~0.7 s), asymptote ~310 km/h
+                if (v < 30.0f && tg != M_STATION) v += 60.0f * fmaxf(0.0f, 1.0f - v / 34.0f) * dt;   // anti-stall kicker tires (real coasters drive slow sections): only ever active under ~108 km/h, holds forced terrain climbs at ~30+ m/s
                 if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fminf(v + 20 * dt, CHAIN_V);
 
                 // No speed floor or cap beyond this: fully physics-driven; only the V_GUARD
@@ -1290,7 +1291,16 @@ int main(int argc, char **argv) {
                     if (tg == M_BOOST) gBoostF++; if (tg == M_LAUNCH) gLaunchF++;
                     if (tg != prevTag && Track::isHardInversion((SegMode)tg)) gInv++;
                     if (v < minV) minV = v;
-                    if (v < 26.0f) { if (++run > maxRun) { maxRun = run; stallTag = tg; stallPrev = prevTag2; } } else run = 0;
+                    if (v < 26.0f) { if (++run > maxRun) { maxRun = run; stallTag = tg; stallPrev = prevTag2; }
+                        if (getenv("MC_STALLDBG") && run == 1) {
+                            Vector3 Ps = t.pos(u);
+                            const char* SNM[] = {"FLAT","CLIMB","DROP","HILLS","TURN","LOOP","ROLL","STN","DIP","LAUNCH","HELIX","BOOST","IMMEL","SCURVE","DIVE","BANKAIR","WAVE","STALL","DIVELOOP","COBRA","WINGOVER","HEARTLINE","PRETZEL","STENGEL","BANANA"};
+                            printf("[stalldbg] f=%d u=%.1f v=%.1f y=%.1f gt=%.1f tag=%s | cps:\n", f, u, v, Ps.y, groundTopAt(Ps.x, Ps.z), (tg < M_COUNT) ? SNM[tg] : "?");
+                            for (int k = (int)u - 8; k <= (int)u + 10 && k < (int)t.cp.size(); k++) {
+                                if (k < 0) continue;
+                                printf("    cp%+d %-9s y=%.1f gt=%.1f gv=%.0f\n", k - (int)u, SNM[t.kind[k]], t.cp[k].y, groundTopAt(t.cp[k].x, t.cp[k].z), t.gvlog[k]);
+                            }
+                        } } else run = 0;
                     prevTag2 = (tg != prevTag) ? prevTag : prevTag2;
                     if (tg == M_CLIMB && prevTag == M_LAUNCH && v > topHatV) topHatV = v;
                     if (tg == M_BOOST && v > boostV) boostV = v;
@@ -1330,6 +1340,9 @@ int main(int argc, char **argv) {
                    seed, avg * 3.6, maxV * 3.6, topHatV * 3.6,
                    (dropN?dropPkMin:0) * 3.6, (dropN?dropPkSum/dropN:0) * 3.6, dropV * 3.6, dropN,
                    lhCrestY, lhBottomY<1e8f?lhBottomY:0, lhCrestY-(lhBottomY<1e8f?lhBottomY:lhCrestY), lhDropPk * 3.6, maxRun);
+            if (maxRun > 0 && stallTag < M_COUNT)
+                printf("         ^ stall inside %s (element before it: %s)\n",
+                       NM[stallTag], stallPrev < M_COUNT ? NM[stallPrev] : "?");
         }
         printf("SIMTEST DONE (no hang)  -> OVERALL AVG RIDE SPEED = %.1f m/s (%.0f km/h)  | powered duty: boost %.1f%% launch %.1f%% | inversions: %ld over 8 seeds (~%.1f/ride)\n",
                gNV ? gSumV / gNV : 0.0, gNV ? gSumV / gNV * 3.6 : 0.0,
@@ -1733,6 +1746,7 @@ int main(int argc, char **argv) {
                 if (tg == M_LAUNCH) v += 112.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;   // punchy LSM thrust, fades to 0 near ~320 (no clamp)
                 else if (tg == M_CLIMB && !t.chainAt(u) && v < CLIMB_V) v = fminf(v + 44.0f * dt, CLIMB_V);
                 if (tg == M_BOOST) v += 160.0f * fmaxf(0.0f, 1.0f - v / 86.0f) * dt;   // Do-Dodonpa-class boost punch (0-200 km/h ~0.7 s), asymptote ~310 km/h
+                if (v < 30.0f && tg != M_STATION) v += 60.0f * fmaxf(0.0f, 1.0f - v / 34.0f) * dt;   // anti-stall kicker tires (real coasters drive slow sections): only ever active under ~108 km/h, holds forced terrain climbs at ~30+ m/s
                 if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fminf(v + 20 * dt, CHAIN_V);
                 // No speed floor or cap beyond this: fully physics-driven; only the V_GUARD
                 // numeric floor below keeps du/dt finite.
@@ -1926,6 +1940,7 @@ int main(int argc, char **argv) {
                 v += acc * dt;
                 if (t.tagAt(u) == M_LAUNCH) v += 112.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;   // punchy LSM thrust, fades near ~320 (no clamp)
                 if (t.tagAt(u) == M_BOOST)  v += 160.0f * fmaxf(0.0f, 1.0f - v / 86.0f) * dt;   // Do-Dodonpa-class boost punch (0-200 km/h ~0.7 s), asymptote ~310 km/h
+                if (v < 30.0f && t.tagAt(u) != M_STATION) v += 60.0f * fmaxf(0.0f, 1.0f - v / 34.0f) * dt;   // anti-stall kicker tires -- see the simtest copy
                 v = fmaxf(v, V_GUARD);
 
                 sinceStation += dt;
@@ -2311,6 +2326,7 @@ int main(int argc, char **argv) {
                 v = fminf(v + 44.0f * dt, CLIMB_V);
 
             if (tg == M_BOOST) v += 160.0f * fmaxf(0.0f, 1.0f - v / 86.0f) * dt;   // Do-Dodonpa-class boost punch (0-200 km/h ~0.7 s), asymptote ~310 km/h
+            if (v < 30.0f && tg != M_STATION) v += 60.0f * fmaxf(0.0f, 1.0f - v / 34.0f) * dt;   // anti-stall kicker tires -- see the simtest copy
 
             bool onLift = trk.chainAt(u);
             if (onLift && slope > 0.05f) {
@@ -2707,6 +2723,32 @@ int main(int argc, char **argv) {
         {
         const bool depthPass = false;
         waterCells.clear();
+
+        // Carve-aware neighbour probe for the thin-skin face culling below. Returns the
+        // neighbour column's EFFECTIVE solid profile so we can wall MY column wherever it
+        // abuts the neighbour's AIR rather than trusting a raw height compare: its surface
+        // hEff (clamped by that column's forceTop, exactly like the local clamp at the top
+        // of the loop), its bored cavity band [nLo,nHi] (valid only when the neighbour lies
+        // inside the ±TERRA_R carve ring AND the cavity actually opens, nHi>nLo), and its
+        // deepened floor colBot (h-42, dropped by carveDeep). Outside the ring there is no
+        // carve data, so the neighbour reads as a plain full column: no clamp, no cavity.
+        struct EffCol { float hEff; bool hasCav; float nLo, nHi; float colBot; };
+        auto effCol = [&](int cx, int cz, int dx, int dz) -> EffCol {
+            EffCol e; e.hasCav = false; e.nLo = 1e9f; e.nHi = -1e9f;
+            float hh = (float)gHCache.get(cx, cz);
+            float cb = hh - 42.0f;   // colDepth, matching the local column's h-42 bottom
+            if (dx >= -TERRA_R && dx <= TERRA_R && dz >= -TERRA_R && dz <= TERRA_R) {
+                int ci = (dz + TERRA_R) * carveW + (dx + TERRA_R);
+                float ft = forceTop[ci];
+                if (ft < 1e8f && hh > ft) hh = floorf(ft);   // same clamp as ~2726-2728
+                if (carveDeep[ci] < cb) cb = carveDeep[ci];
+                float lo = carveLo[ci], hi = carveHi[ci];
+                if (hi > lo) { e.hasCav = true; e.nLo = lo; e.nHi = hi; }
+            }
+            e.hEff = hh; e.colBot = cb;
+            return e;
+        };
+
         for (int dz = -TERRA_R; dz <= TERRA_R; dz++) {
             for (int dx = -TERRA_R; dx <= TERRA_R; dx++) {
                 int cx = ccx + dx, cz = ccz + dz;
@@ -2790,20 +2832,42 @@ int main(int argc, char **argv) {
                     const float SKIRT = 0.06f;
                     drawCubeTex(capTile, Vector3{ wx, h + 0.5f, wz }, cellSz, 1, cellSz, cap);
 
-                    if (cHi <= cLo) {   // no local carve cavity complicating the column here
-                        int hN[4] = { gHCache.get(cx + 1, cz), gHCache.get(cx - 1, cz),
-                                      gHCache.get(cx, cz + 1), gHCache.get(cx, cz - 1) };
-                        unsigned fc[4] = { CFACE_PX, CFACE_NX, CFACE_PZ, CFACE_NZ };
+                    if (cHi <= cLo) {   // no local carve cavity: MY column is one solid span
+                        // Interval-based exposure. MY solid is [colBot, top]; for each of the
+                        // 4 planar neighbours I emit a wall wherever that solid overlaps the
+                        // neighbour's AIR. A neighbour's air is (a) everything above its cap
+                        // top (hEffN+1 .. +inf) and (b), if it is bored through, its cavity
+                        // (nLo .. nHi). The old code only tested raw neighbour height, so an
+                        // uncarved column sitting next to a tunnel (or below a forceTop cliff)
+                        // never walled the gap and you saw void through the tunnel/cliff. I
+                        // clip the cavity slice to below the cap top so (a) and (b) never
+                        // double-cover; and because rect (a) bottoms out at hEffN+1, a
+                        // neighbour of equal-or-greater height collapses it to zero -- same
+                        // cull as before, no z-fighting quad at a flush seam.
+                        const int  nx[4]  = { cx + 1, cx - 1, cx, cx };
+                        const int  nz[4]  = { cz, cz, cz + 1, cz - 1 };
+                        const int  ndx[4] = { dx + 1, dx - 1, dx, dx };
+                        const int  ndz[4] = { dz, dz, dz + 1, dz - 1 };
+                        unsigned   fc[4]  = { CFACE_PX, CFACE_NX, CFACE_PZ, CFACE_NZ };
                         for (int n = 0; n < 4; n++) {
-                            if (hN[n] >= h) continue;                       // hidden: neighbour same height or taller
-                            float rawTop = top, rawBot = fmaxf((float)hN[n] + 1.0f, colBot);
-                            float rawH = rawTop - rawBot;
-                            if (rawH < 0.02f) continue;
-                            bool ledge = rawH <= 1.05f;   // a 1-unit step reads as a grassy ledge, matching the cap
-                            float faceTop = rawTop + SKIRT, faceBot = rawBot - SKIRT;
-                            drawCubeTexFace(ledge ? capTile : T_GRAIN,
-                                            Vector3{ wx, (faceBot + faceTop) * 0.5f, wz },
-                                            cellSz + SKIRT, faceTop - faceBot, cellSz + SKIRT, ledge ? cap : col, fc[n]);
+                            EffCol e = effCol(nx[n], nz[n], ndx[n], ndz[n]);
+                            float capTop = e.hEff + 1.0f;   // neighbour cap cube spans [hEff, hEff+1]
+                            // rect 0: my solid above the neighbour's cap top.
+                            // rect 1: the cavity slice, clamped under capTop (rect 0 owns above).
+                            float aBot[2] = { fmaxf(colBot, capTop),
+                                              e.hasCav ? fmaxf(colBot, e.nLo) : 1e9f };
+                            float aTop[2] = { top,
+                                              e.hasCav ? fminf(top, fminf(e.nHi, capTop)) : -1e9f };
+                            for (int r = 0; r < 2; r++) {
+                                float rawBot = aBot[r], rawTop = aTop[r];
+                                float rawH = rawTop - rawBot;
+                                if (rawH < 0.02f) continue;
+                                bool ledge = rawH <= 1.05f;   // a 1-unit step reads as a grassy ledge, matching the cap
+                                float faceTop = rawTop + SKIRT, faceBot = rawBot - SKIRT;
+                                drawCubeTexFace(ledge ? capTile : T_GRAIN,
+                                                Vector3{ wx, (faceBot + faceTop) * 0.5f, wz },
+                                                cellSz + SKIRT, faceTop - faceBot, cellSz + SKIRT, ledge ? cap : col, fc[n]);
+                            }
                         }
                     } else {
                         // A carve cavity touches this column (rare -- only near specific

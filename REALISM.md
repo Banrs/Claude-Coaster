@@ -1,58 +1,52 @@
 # Realism scaling — how to size MINECOASTER
 
-> ⚠️ **PARTIALLY OUTDATED.** The project has since moved to a fully **arcadey** target
-> (uncapped g, top-hats biased ~250 m, airtime hills >50 m/hump, top speed ~350 km/h).
-> The "never more than +75%", "+10 g ceiling", and "drops ~195 m max" limits below are
-> **no longer enforced**. The **world-record anchor table is still the reference** the
-> element-sizing code uses (`recCapMul`/`invSpec` in `opengl/src/coaster_track.cpp`,
-> now scaling 1.5×–2× WR). See `HANDOFF.md` for the current direction and open items.
+MINECOASTER is **arcadey but grounded in realism**. Every quantity is anchored to a
+**researched real-world record**, then scaled by a fixed design rule:
 
-MINECOASTER is **realistic-but-arcadey**. Every quantity is anchored to a real-world
-coaster **record**, then (historically) allowed to push **+25% to +75% beyond** that
-record. Where in that band a quantity sits is a design choice, biased like this:
+| Rule | Value |
+|---|---|
+| **Element size/height** | 1.0–1.75x the element's WR, scaling **inversely with size**: small elements (corkscrew ~6 m radius) may reach 1.75x, the biggest (Immelmann 66 m, top hat 139 m) cap at ~1.25x. `recCapMul()` in `opengl/src/coaster_track.cpp` implements the taper. |
+| **Entry speed per element** | ~1.5–2.2x that element's REAL entry speed (not the ride's top speed). Enforced by `invVMax()`/`invVMinFrac()` entry windows + the slow-window scheduler in `nextMode`. |
+| **Sustained felt g** | ≥ ~1.75x the element's real sustained value (measured via `--gaudit` SUSTAINED table). |
+| **Peak felt g** | ≤ ~4x the element's real peak; in practice lands 2.2–3x. Vertical HUD peaks ≈ +9..+11, airtime ≥ −4, lateral ≤ ~6. |
+| **Jerk / transitions** | curvature + jerk budgets derived from ~2x the ~15 g/s real onset guideline (clothoid-style linear curvature ramps via `jlim`/`dlimPos`/`dlimNeg` in `stepGeneric`). |
+| **Top speed** | ~350–370 km/h (≈1.7–1.8x Kingda Ka's 206), average ~255 km/h. |
 
-| Quantity            | Real-world record (anchor)        | Push toward | Practical ceiling |
-|---------------------|-----------------------------------|-------------|-------------------|
-| **Speed**           | ~240 km/h (Formula Rossa, 67 m/s) | **+75%**    | 100 m/s (360 km/h)|
-| **Drop height**     | ~155 m (Falcon's Flight)          | **+25%**    | ~1.25–1.3× (~195 m)|
-| **Element size** (loop/cobra/helix radius) | real B&M/Intamin radii | **+25%** | ~1.3× record |
-| **Vertical g**      | ~+6 g sustained                   | mid–high    | **+10 g**         |
-| **Airtime (−g)**    | ~−1.5 g                           | high        | **−6 g**          |
-| **Lateral g**       | ~1.8 g (kept low for comfort)     | mid         | keep modest (≤~6 g) |
-| **Launch accel**    | ~2.7 g (Dodonpa)                  | **+75%+**   | ~5 g              |
+## WR anchor table (researched 2026-07, in `invSpec`/init functions)
 
-Bias: **size and height stay near the realistic end (+25%)** so the ride *looks* real;
-**speed and launch punch go to the arcadey end (+75%)** so it *feels* exciting.
+| Element | Real record | Anchor in code |
+|---|---|---|
+| Vertical loop | Full Throttle 48.8 m (Tormenta 54.6 m claimed 2026) | rMaxRec 22 (height ≈ 2.6x lR as built) |
+| Immelmann | Tormenta Rampaging Run 66.4 m | rMaxRec 33 |
+| Dive loop | Steel Curtain 60 m | rMaxRec 28 |
+| Pretzel loop | Tatsu 38 m | rMaxRec 19 |
+| Corkscrew/roll | ~5–6 m radius real | rMaxRec 6, hardcoded 6–10 m ranges |
+| Top hat | Kingda Ka 139 m | mega climbTop frnd(139, 174) |
+| Big drop | Falcon's Flight ~158 m | drop heights emerge from hats + terrain |
+| Airtime hill | tallest real camelbacks ~60 m | hillH frnd(50, 78) |
+| Zero-g stall | RMC (Goliath SFGA etc.) | quartic ballistic crest, self-sized |
+| Helix | Goliath SFMM 4.5 g sustained 6 s | turnMagFor(10.5) → measured ~7.5 sustained |
+| g standards | ASTM F2291 ≈ +6 g <1 s, ~−2 g, ±2 lat; ~15 g/s onset | budgets at ~2x |
 
 ## Hard rules (do not break)
 
-1. **Earth-real gravity.** `GRAV = 9.81 m/s²` everywhere. The g a rider feels is in true
-   Earth g (the meter/audit divide by GRAV). 1 voxel = 1 m.
-2. **Speed dictates size.** Size every element from its *entry speed* so the felt-g lands
-   in the envelope: `R = v² / ((g_target − 1)·GRAV)`. Faster → bigger element.
-3. **Never cap speed for g.** Manage g by *reshaping geometry* (bigger radii, easing the
-   seams), never by braking the train or pinning a speed. No trim brakes for g.
-4. **g envelope: +10 g / −6 g vertical**, lateral kept modest. Hold it with the generator's
-   relaxer + per-point curvature clamp + clothoid seam easing — applied to *all*
-   up/down/lateral transitions, not just isolated drops.
-
-## Where the knobs are (`src/coaster_track.cpp`)
-
-- `invSpec(mode)` → per-element `gT` (target felt-g), `rMin`, `rMaxRec` (record radius;
-  the size cap is ~1.3× this). Lower `gT` or raise the radius cap to ease an element.
-- `turnMagFor(gT, lo, hi)` / `invR(gT, lo, hi)` → heading-rate / radius for a lateral or
-  vertical `gT`. GRAV-parameterised, so they re-derive automatically when GRAV changes.
-- Vertical relaxer `Gmax / Gmin` and the per-point clamp `Clamp(sd, −Gmin·k, +Gmax·k)`
-  (`k` is GRAV-aware → the coefficients are the g-values). These hold the envelope by
-  reshaping height; keep their exemptions minimal (LAUNCH/BOOST must be smoothed too).
-- `genV` is the generator's forward-sim speed used to size everything; physics constants
-  (`GRAV/DRAG/LAUNCH_V/BOOST_V/...`) live at the top of `main.cpp`.
+1. **Earth-real gravity.** `GRAV = 9.81`; 1 voxel = 1 m. Felt g is true Earth g.
+2. **Speed dictates size.** Elements are sized from live entry speed (`genV`):
+   `r = v²/((gT−1)·G·gMul)` clamped to the WR band. Loop family also carries a
+   **top-speed constraint** (`invRAt` lossPerR): the crest must still carry ≥30 m/s.
+3. **Never brake for g.** g is managed by geometry (radius, entry windows, crest-g-sized
+   hill lengths), never by trimming speed. The only assists are powered (LSM/boost/kicker).
+4. **No unpowered 100 m+ climbs.** Terrain walls ≥55 m convert FLAT/DROP into a powered
+   CLIMB; an anti-stall kicker (real friction-tire practice) holds ≥~30 m/s everywhere
+   outside stations.
+5. **Elements live near the ground.** `maxTrickHeight` bands + cliff/canyon footprint
+   gates in `eligibleElem`; height comes from terrain and the once-per-lap top hat.
 
 ## Verify (headless, no GPU)
 
 ```sh
-./minecoaster --simtest   # avg speed / inversions / stalls over 8 seeds
-./minecoaster --gaudit    # per-element felt-g vs the +10/−6 envelope + worst offenders
+./minecoaster --simtest    # MUST be stall=0f on all 8 seeds; avg ~250-260, max ~350-370
+./minecoaster --gaudit 4   # HUD peaks: vert <= ~+11 / >= ~-5, lat <= ~6; SUSTAINED >= 1.75x real per element
+./minecoaster --profile N  # hills: vDelta 50-78 with hSpan ~300-500 (long parabolic humps), net ~0
 ```
-A change is good when `--gaudit` shows every element inside +10/−6 (vertical) with modest
-lateral, and `--simtest` keeps a brisk average with **0 stalls**.
+`MC_STALLDBG=1 ./minecoaster --simtest` dumps the cp neighbourhood of any crawl-stall.

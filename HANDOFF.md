@@ -1,111 +1,99 @@
 # Claude-Coaster — Handoff for next agent
 
 Procedural roller-coaster voxel game. OpenGL backend under `opengl/src/`.
-Intent has evolved to **arcadey spectacle** ("fun to watch, you can't sit on it"),
-top speed ~350 km/h, avg ~275 km/h, ground-hugging track with tunnels, big
-airtime, all inversions restored.
+Direction: **arcadey but grounded in realism** — every element anchored to a researched
+real-world record, sized 1.0–1.75x WR (small→big taper), entered at ~1.5–2.2x its real
+entry speed, felt g 1.75–3x real sustained / ≤4x peak. See `REALISM.md` (rewritten this
+session — it is CURRENT again) for the full rule table and WR anchors.
 
 ## Repo / build / test
-- Working dir: `/home/user/Claude-Coaster`, build in `opengl/`.
-- Build: `cd opengl && cmake --build build -j`  (do NOT use build.sh — zsh fails).
-- Binary: `opengl/minecoaster`.
-- Headless tools (primary verification — no interactive GL run has been done):
-  - `./minecoaster --profile SEED` → per-element table (cp, elem, dist, **vDelta**,
-    **net** [exit−entry Y], clrMin, clrMax, hSpan) + `profile_seedN.svg` side view.
-    `net` column was added this session for label auditing; `vDelta`=ymax−ymin.
-  - `./minecoaster --simtest` → avg/max speed, drop stats, inversions/ride.
-  - `--gaudit N`, `--elemsust`, `--bench`, `--gtrace`, `--gtest ELEM [speed]`.
-- **A next agent should actually run the game** to visually confirm HUD labels and
-  geometry — everything so far is verified only via profile/simtest.
+- macOS local build (no cmake needed): raylib is vendored. One-time:
+  `cd src/vendor/raylib/src && make PLATFORM=PLATFORM_DESKTOP -j8`
+  then: `cd opengl && clang++ -std=c++17 -O2 -o minecoaster src/main.cpp
+  -I../src/vendor/raylib/src -L../src/vendor/raylib/src -lraylib
+  -framework Cocoa -framework IOKit -framework CoreVideo -framework OpenGL
+  -framework CoreAudio -framework AudioToolbox`
+- Headless verification (primary): `--simtest` (stall=0f on ALL seeds is a hard gate; a
+  per-seed `^ stall inside ELEM` line prints when violated; `MC_STALLDBG=1` dumps the cp
+  neighbourhood), `--gaudit N` (raw + HUD + SUSTAINED + jerk tables), `--profile N`
+  (per-element vDelta/net/clr/hSpan), `--elemsust ELEM SPEED` (isolated element).
+- **A next agent should actually run the game** to visually confirm the carve-aware
+  terrain culling (tunnel interiors) — everything else is verified headless.
 
-## Git
-- Designated branch: `claude/windows-rtx-ray-tracing-pkif4h`. Develop + push there.
-- Push: `git push -u origin claude/windows-rtx-ray-tracing-pkif4h` (retry w/ backoff on net err).
-- Do NOT open PRs unless asked. Commit trailer:
-  `Co-Authored-By: Claude <noreply@anthropic.com>` +
-  `Claude-Session: https://claude.ai/code/session_01MXp34fKTzHEZESAa93AQfZ`.
-- GitHub scope restricted to `banrs/claude-coaster`.
-- Prior sessions also mirrored to `vulkan-port-alpha-pkif4h` and `main` (via
-  `git merge --no-edit -X theirs`); current instructions say designated branch only —
-  confirm with user before touching the others.
-- Latest pushed commit: `3cc951d`.
+## DONE this session (major rewrite)
+- **Carve-aware terrain culling** (main.cpp ~2725-2874): interval-based side-face
+  exposure — my solid span vs neighbour AIR spans (above the neighbour's forceTop-clamped
+  cap, plus its carve cavity [carveLo,carveHi]). Fixes the tunnel/cliff VOID the old raw
+  `hN >= h` neighbour test produced. `effCol` lambda holds the neighbour probe.
+- **g-budget geometry engine** (stepGeneric): directional curvature limits from the felt-g
+  envelope — dlimPos (+10..12 felt troughs/pullouts), dlimNeg (−2.5..−3.5 crests), jerk
+  ~2x the 15 g/s real guideline. M_HILLS exemptions all removed; relax pass restored at
+  Gmax +14/Gmin −4.5; felt-g net restored at +16/−7/lat 7. DROP uses a continuous
+  height-proportional pullout schedule (real drops flare over ~1/3 of their height).
+- **Hills fixed** (the +25 g spike bug): bump length now derived from a crest-g target
+  (−3.2 felt) via `hillLenFor` — a 70 m hill runs ~380 m/bump instead of the old 98 m
+  clamp. Height 50–78 m (~1.25x the ~60 m WR camelback), minus terrain-rise ahead.
+- **WR anchor re-pin + 1.25–1.75x band** (`invSpec`/`recCapMul`): LOOP 22 (Full Throttle
+  48.8 m), IMMEL 33 (Tormenta 66.4 m), DIVELOOP 28 (Steel Curtain 60 m), PRETZEL 19
+  (Tatsu 38 m), ROLL/HEARTLINE 6. Top hats frnd(139,174) = 1.0–1.25x Kingda Ka.
+- **Entry-speed windows + slow-window scheduling**: `invVMax()` back-solves each gated
+  element's max entry from the 4x-real top-g cap; `invVMinFrac` (0.83 loop-family / 0.68)
+  floors it. Inversions are taken in the natural run-down windows (nextMode wantBoost
+  hook, ≤3 per window then a boost re-powers — `invSlotUsed`). LOOP family also carries a
+  top-speed radius constraint in `invRAt` (crest must keep ≥30 m/s; lossPerR ~103/55/60).
+- **Stall elimination** (0/8 seeds, was chronic): quartic zero-slope stall profile
+  (`initStall`, apex at +0.25 g floater); crest rounding INSIDE M_CLIMB with apex handoff
+  to DROP (assist thrust is tag-gated); FLAT/DROP → powered CLIMB conversion at ≥55 m
+  terrain walls; closed-form footprint gate (no inversion from a tunnel or against a
+  rising hillside); anti-stall kicker tires in all 4 physics copies (60·(1−v/34) under
+  30 m/s, not in stations) — genV floor 30 matches it.
+- **Flat/launch realism** (user): launches gated to flat corridors at grade (postpone up
+  to 6 elements, corridor-lift fallback); boosts wait for the ground-hug drop and skip
+  rising corridors unless genV<66; elemLimit 17–24 (~28% fewer elements/lap).
+- **Sustained g raised to ≥~1.75x real** (user): TURN 8.0 → measured 5.4-5.8; HELIX
+  10.5 → 7.5; LOOP 6.5; IMMEL 5.7; DIVE 4.6; ROLL GCAP 9.5; SCURVE 4.2 (bankBase 0.62);
+  WINGOVER 4.5; banked-exit positional seam-ease (killed 12–16 g lateral seam spikes).
+- STENGEL bank 2.18→1.95 rad + span 0.20 (lat 24.5→~4); STALL/STENGEL entry gates 48/62;
+  STENGEL needs ≥30 m dive room; CLIMB_V 22→27; BOOST_TRIG 77→84; boost len 5–8 cps.
 
-## DONE this session (pushed)
-- **Airtime hills >50 m/hump, correctly a hill** (was the "hills are drops" bug):
-  root cause = hills offered up to 72 m in the air, hump clipped by the
-  `gt+climbTop` build ceiling → only the descending half survived → net drop.
-  Fixes: `maxTrickHeight(M_HILLS)` 72→22 (fire near ground); exclude M_HILLS from
-  the climb-ceiling clip, the crest-relaxation, the neighbor-midpoint smoother, the
-  jlim/dlim jerk clamp, and the per-step vertical-g cap; drop the `maxAirH` clamp;
-  `hillH=frnd(58,96)`. Measured net-from-true-entry ~0, vDelta 55–105 m.
-- **Cobra roll removed** (rarity 0, out of pick pools).
-- **WINGOVER over-bank tamed**: bankT 0.70→0.48 (~148°→~124°), bankLim 2.70→2.15.
-- **WR size cap scales per-element**: `recCapMul(rMaxRec)` = 2.0× (small) → 1.5×
-  (tall), used by the radius clamp (replaces flat 1.25×).
-- **Dives always descend**: `M_DIVE` dy clamped ≤ −2; gated to fire only with
-  clearance ≥ 20 m and no steep (≤28 m) rising terrain ahead.
-- **HUD names by actual pitch** for terrain-sensitive tags CLIMB/DROP/DIVE
-  (`tangent(u).y`): a DROP the clearance floor shoves up a hillside now shows
-  "CLIMB"/"AIRTIME", never a false "DROP". Signature shapes keep their tag name.
-- Speed intact: avg ~273 km/h, max ~330–373, ~28 inversions/ride, boost duty ~10.7%.
+## Current measured state (all 8 seeds)
+- stall=0f everywhere; avg ~254 km/h; max 351–367; LAUNCH-HAT drops 130–215 m,
+  crests ≤ ~174 m above base; inversions ~5–6.5/ride.
+- HUD felt-g: vert +4.8..+10.5 max per element, min ≥ −4.1 (BOOST −3.6), lat ≤ 5.8.
+- SUSTAINED: LOOP 6.5, IMMEL 5.7, TURN 5.4, HELIX 7.5, DIVE 4.6 (≈1.7–1.9x real each).
 
-## OPEN / TENTATIVE (needs decisions or work)
-1. **DIVE frequency (~2/8 seeds).** Structurally starved — elevated moments are
-   consumed by the mandatory post-inversion M_DROP (via `enterDrop`) before
-   `chooseElement` can offer a dive. The 2 that appear are correct. To make dives
-   common you'd restructure when chooseElement runs at elevation. User asked whether
-   to do this — **awaiting answer.**
-2. **WR baseline precision.** `recCapMul` scales the cap correctly, but the absolute
-   record radii (`rMaxRec` in `invSpec`) are from earlier research. A few land hot:
-   IMMEL ~113 m, LOOP ~106 m (incl. lead-in) ≈ 1.8–2.3× WR. If the user supplies
-   authoritative WR numbers, pin `rMaxRec` to them. User wants "smaller elements ~2×,
-   taller approaching 1.5×."
-3. **"Remove ALL caps" — still partial.** Removed for hills. STILL ACTIVE for other
-   elements: `jlim`/`dlim` jerk-curvature clamp, min-clearance floors, tunnel-lip
-   rounder, exit-taper, and the felt-g safety net (trigger raised to 900, i.e.
-   effectively off). Removing globally risks ground-clipping / broken tunnels —
-   decide element-by-element with the user.
-4. **Hill base height.** Actual Y change per hump is >50 m, but some hills ride
-   elevated terrain (base ~+28 m rather than +5 m), so it's 28→99 not the "5→70"
-   shape the user once described. Separate base-clamp change if wanted.
-5. **Roll-taming scope.** Only WINGOVER was tamed. BANKAIR/WAVE/DIVE are already
-   modest (~35–40°). Confirm if any others should be reduced.
-6. **Jerk-smoothing research (clothoid / parabola crest).** Researched earlier
-   (κ=s/a², L=v³·Δκ/j_max, parabola crest y=y0−(g/2v_x²)x², teardrop loop
-   R≥v²/((n−1)g)), NOT applied. Awaiting go/no-go. Would reduce jerk without changing
-   general geometry.
-7. **Per-hump vs per-instance measurement.** `--profile` reports vDelta across a
-   whole element instance; there's no strict per-hump (individual camelback) readout.
-   Add one if a guarantee needs proving for multi-bump hills.
-
-## Longer-standing open tasks (from the task list)
-- Fix severe underground track dives (#24) — tunnels intentional now; verify no
-  genuine deep clips remain.
-- Support-tower gap for STALL/HEARTLINE (#28) — COBRA no longer generated.
-- Fix helix: tight descending spiral, no overtighten (#41).
-- Cloud raymarch tiling artifact (#25).
-- Vulkan port work (#14 render_fx.cpp, #15 pathtrace→Vulkan, #16 DXR/DLSS seam,
-  #19 graphics+FPS to Vulkan), #12 on-foot mode. (Separate backend, lower priority.)
+## OPEN / TENTATIVE
+1. **Visual pass**: carve-aware culling + long parabolic hills + rounded hat crowns are
+   verified by numbers/logic only — run the game and look (tunnels, crests, launch decks).
+2. **Inversion count** ~5-6/ride (was 28 at ±25 g). More would need wider windows
+   (raises g) or lower cruise speed. User decision.
+3. `--gaudit` min clearance worst-case ~−17 m: deep carved tunnels (bored, walls render
+   now); flag if a genuinely unbored clip shows up visually.
+4. Jerk table peaks (~80–160 g/s at seams) still above the 30 threshold the audit prints —
+   sub-cp spline granularity; only fixable with denser cps or seam-specific easing.
+5. DIVE frequency still structurally low (~2/8 seeds); helix #41, cloud tiling #25,
+   Vulkan/on-foot ports — unchanged from before.
 
 ## Key code map (opengl/src/coaster_track.cpp unless noted)
-- Element enum `SegMode` is in **main.cpp:973**; name arrays mirror it (verified
-  in-order — no dispatch mislabel).
-- `initHills()` ~518, M_HILLS dy ~1190, other airtime dy (BANKAIR/WAVE/WINGOVER) ~1195+.
-- `maxTrickHeight` ~730, `eligibleElem`/`eligibleSafety` ~792/815 (DIVE gate here),
-  `invSpec`/`recCapMul`/`invRAt` ~475–516.
-- Smoothing/relaxation/felt-g-net passes ~1611–1713 (M_HILLS excluded).
-- jlim/dlim + per-step g-cap ~1246–1336 (M_HILLS excluded).
-- `ceilY` clip ~1301 (M_HILLS excluded).
-- Closed-form step fns: stepLoop/Immel/Stall/DiveLoop/Cobra/Pretzel/Stengel/
-  Banana/Heartline ~1390–1530; dispatch in `genPoint` ~1541.
-- HUD element banner: **main.cpp ~3841** (pitch-based relabel added here).
-- Felt-g pipeline (3 copies): main.cpp ~1508/1745/2402 (`arc` floor 13, lowpass 3 Hz).
-- Speed constants: main.cpp ~41 (LAUNCH_V 108, CLIMB_V 22, BOOST_TRIG 77; boost
-  thrust `160*fmaxf(0,1-v/86)*dt`). g-ball HUD ~3933 (scale R/10).
+- WR anchors/sizing: `invSpec`/`recCapMul`/`invVMax`/`invVMinFrac`/`invRAt` ~475-600.
+- `hillLenFor`/`hillRiseAhead` ~580-600; initHills ~600.
+- Entry gates + footprint/canyon/cliff gates: `eligibleElem` ~860-940.
+- Slow-window inversion hook + wall-aware launch/boost: `nextMode` default branch ~1150-1260.
+- g budgets + crest lead + wall→CLIMB conversion: `stepGeneric` ~1290-1450.
+- Relax/net/floor passes ~1800-1900 (ground guard added in relax).
+- Terrain skin culling: main.cpp `effCol` + interval emission ~2725-2874.
+- Anti-stall kicker: 4 copies (simtest ~1284, gaudit ~1748, bench ~1944, ride ~2330) —
+  keep in sync BY HAND like the thrust lines around them.
+- SegMode enum main.cpp:973; physics constants main.cpp:36-55.
 
 ## Lessons
-- Don't give edit-capable subagents the same file concurrently — they clobbered
-  coaster_track.cpp once. Scope them to distinct files or read-only.
-- felt-g NUMBERS can mislead; `--profile` geometry (vDelta/net/clr) is ground truth.
-- Terrain-vs-element conflicts (a descender floored up a rising hillside) are the
-  main source of remaining label drift — handled at the HUD via actual pitch.
+- Don't give edit-capable subagents the same file concurrently.
+- The generator's genV floor MUST equal the ride's operative assist floor (now the
+  kicker's ~30): higher hides run-down (loops offered that crawl), lower under-sizes
+  elements the assisted train overflies.
+- Closed-form elements need OFFER-time footprint checks; the shared clearance floor will
+  otherwise drag their rigid shapes up any hillside (66 m loop → 134 m climb stall).
+- Python str.replace on code: beware substring matches across indentation variants (a
+  12-space pattern matched inside 16-space lines and double-inserted the kicker).
+- `--simtest` stall attribution + `MC_STALLDBG` cp dumps found every root cause fast;
+  felt-g numbers alone would have misled.
