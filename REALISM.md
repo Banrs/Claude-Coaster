@@ -1,8 +1,15 @@
 # Realism scaling — how to size MINECOASTER
 
+> ⚠️ **PARTIALLY OUTDATED.** The project has since moved to a fully **arcadey** target
+> (uncapped g, top-hats biased ~250 m, airtime hills >50 m/hump, top speed ~350 km/h).
+> The "never more than +75%", "+10 g ceiling", and "drops ~195 m max" limits below are
+> **no longer enforced**. The **world-record anchor table is still the reference** the
+> element-sizing code uses (`recCapMul`/`invSpec` in `opengl/src/coaster_track.cpp`,
+> now scaling 1.5×–2× WR). See `HANDOFF.md` for the current direction and open items.
+
 MINECOASTER is **realistic-but-arcadey**. Every quantity is anchored to a real-world
-coaster **record**, then allowed to push **+25% to +75% beyond** that record — never more.
-Where in that band a quantity sits is a design choice, biased like this:
+coaster **record**, then (historically) allowed to push **+25% to +75% beyond** that
+record. Where in that band a quantity sits is a design choice, biased like this:
 
 | Quantity            | Real-world record (anchor)        | Push toward | Practical ceiling |
 |---------------------|-----------------------------------|-------------|-------------------|
