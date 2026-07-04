@@ -61,16 +61,40 @@
         sdDrop    = Clamp(0.55f * v, 30.0f, 55.0f);
         sdDrop    = fminf(sdDrop, fmaxf(avail, 10.0f));
 
+        // A real Stengel dive is defined by a near-vertical drop -- almost all the height loss
+        // happens on a STRAIGHT run (zero curvature -> zero g cost beyond normal gravity, so it
+        // can be as steep as it likes), with g only spent on the short bend rotating the track
+        // from level into that dive and the pullout rotating it back to level. The old single
+        // half-cosine spanning the WHOLE crest-to-bottom drop spent its entire g budget getting
+        // shallow curvature over the FULL sdDrop distance -- worked out to ~12 degrees average,
+        // nowhere near "dive". Splitting the SAME g budget across two short bends (each only
+        // covering a fraction of the total drop) instead of one long one lets each bend complete
+        // its rotation in far less distance for the same gBot, freeing the middle for a genuinely
+        // steep straight run.
         const float gBot = 6.5f;
-        float Ld  = PI * v * sqrtf(sdDrop / ((gBot - 1.0f) * GRAV));
-        int   diveSteps = Clamp((int)(Ld / SEG_LEN), 8, 22);
+        const float fracBend = 0.18f;   // each bend covers this fraction of the total crest-to-bottom drop
         int   crestSteps = 4;
-        sdSteps   = crestSteps + diveSteps;
-        sdCrestT  = (float)crestSteps / (float)sdSteps;
-        float L   = sdSteps * SEG_LEN;
-
         float Lc  = crestSteps * SEG_LEN;
         sdH       = Clamp(2.0f * GRAV * Lc * Lc / (v * v * PI * PI), 5.0f, 14.0f);
+        float D   = sdH + sdDrop;                  // total vertical drop from crest apex to the bottom
+        sdBendDrop = D * fracBend;
+        float LdBend = PI * v * sqrtf(sdBendDrop / ((gBot - 1.0f) * GRAV));
+        int   bendSteps = Clamp((int)(LdBend / SEG_LEN), 3, 9);
+        sdStraightDrop = D - 2.0f * sdBendDrop;      // zero-curvature, no g cost regardless of steepness
+        // Target steepness for the straight run: 58 degrees (tan~1.6) -- dramatically steeper than
+        // the old ~12 degree average, still shy of literally vertical so the corridor scan above
+        // (which assumes a roughly-linear-in-t forward advance) stays a reasonable approximation.
+        int   straightSteps = Clamp((int)((sdStraightDrop / 1.6f) / SEG_LEN), 2, 14);
+        sdSteps   = crestSteps + 2 * bendSteps + straightSteps;
+        sdCrestT  = (float)crestSteps / (float)sdSteps;
+        sdB1T     = (float)(crestSteps + bendSteps) / (float)sdSteps;
+        sdB2T     = (float)(crestSteps + bendSteps + straightSteps) / (float)sdSteps;
+        if (getenv("MC_DUMP_STENGEL"))
+            printf("[stengel] v=%.1f sdDrop=%.1f sdH=%.1f D=%.1f bendDrop=%.1f bendSteps=%d straightDrop=%.1f straightSteps=%d angleDeg=%.1f\n",
+                   v, sdDrop, sdH, D, sdBendDrop, bendSteps, sdStraightDrop, straightSteps,
+                   atanf(sdStraightDrop / fmaxf(straightSteps * SEG_LEN, 1e-3f)) * 180.0f / PI);
+        float L   = sdSteps * SEG_LEN;
+
         sdSpan    = L * 0.22f;
         remain    = sdSteps;
     }
@@ -81,9 +105,22 @@
         float L   = sdSteps * SEG_LEN;
         float ff  = L * t;
 
+        // Four phases: gentle crest rise, a short g-budgeted bend into the dive, a straight
+        // (zero-curvature) steep run, and a short g-budgeted pullout bend back to level. See the
+        // long comment in initStengel() for why this replaces the old single whole-drop cosine.
         float fU;
-        if (t < tc) fU = sdH * 0.5f * (1.0f - cosf(PI * (t / tc)));
-        else        fU = sdH - (sdH + sdDrop) * 0.5f * (1.0f - cosf(PI * ((t - tc) / (1.0f - tc))));
+        if (t < tc) {
+            fU = sdH * 0.5f * (1.0f - cosf(PI * (t / tc)));
+        } else if (t < sdB1T) {
+            float s = (t - tc) / (sdB1T - tc);
+            fU = sdH - sdBendDrop * 0.5f * (1.0f - cosf(PI * s));
+        } else if (t < sdB2T) {
+            float s = (t - sdB1T) / (sdB2T - sdB1T);
+            fU = (sdH - sdBendDrop) - sdStraightDrop * s;
+        } else {
+            float s = (t - sdB2T) / (1.0f - sdB2T);
+            fU = (sdH - sdBendDrop - sdStraightDrop) - sdBendDrop * 0.5f * (1.0f - cosf(PI * s));
+        }
         float fS  = sdSpan * 0.5f * (1.0f - cosf(PI * t));
         gpos = { sdBase.x + sdF.x * ff + sdSide.x * fS,
                  sdBase.y + fU,
