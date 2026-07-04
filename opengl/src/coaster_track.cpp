@@ -683,7 +683,7 @@ struct Track {
         // gT is now the PLANAR lateral-g target ~= 2x the real banked-turn sustained (~2 g -> 4).
         // At the ~1.5x-WR design speed this holds ~2x-WR felt g on a WR-radius (~40 m) turn.
         bankBase = 1.0f;   // hard turn: full heartline, all lateral load into the seat
-        if (big) { turnMag = turnMagFor(4.0f, 0.015f, 0.55f); bankT = 0.0f; remain = irnd(8, 12); }   // big banked turn
+        if (big) { turnMag = turnMagFor(4.5f, 0.015f, 0.60f); bankT = 0.0f; remain = irnd(8, 12); }   // big banked turn: gT ~= 2x the ~2-2.5 g real hard turn
         else     { turnMag = turnMagFor(3.0f, 0.012f, 0.45f); bankT = 0.0f; remain = irnd(6, 9);  }   // small banked turn
     }
     void initHelix() {
@@ -725,11 +725,10 @@ struct Track {
         // no longer caps entry speed -- and re-flattened the curve straight back into
         // the +13/-16g bug this budget was chosen to fix); now stays out of the way
         // up to the genV hard clamp.
-        // gT is the planar lateral-g target. A literal 2x-WR helix (~9 g) needs an ~23 m radius at
-        // ride speed, which collapses the felt-g du-window into jerky ±15 g kinks (see the dyawGeo
-        // note in stepGeneric). 6.5 holds a CLEAN ~6-7 g -- still a greyout-class sustained coil,
-        // above the real ~4.5 g WR -- without the collapse. The g-limiter keeps g ~= gT as speed varies.
-        turnMag = turnMagFor(6.5f, 0.02f, 0.42f);
+        // gT = 2x the real helix sustained (~4.5 g -> 9), a LITERAL 2x WR (user accepts the jerk that
+        // the resulting ~23-27 m coil radius produces via du-window collapse). The g-limiter keeps
+        // g ~= gT as speed varies; the raised dyawGeo/capK in stepGeneric allow the tight radius.
+        turnMag = turnMagFor(9.0f, 0.02f, 0.60f);
         bankT   = 0.0f;    // NO over-bank: a 9 g helix already heartlines to ~83deg; any over-bank crosses vertical -> the "helix on its side" bug. The sub-vertical clamp backstops it too.
         bankBase = 1.0f;   // full heartline: hold the coil g in the seat (positive-g greyout element)
 
@@ -786,7 +785,7 @@ struct Track {
         mode = M_DIVE;
         setClearance(4.0f, 24.0f);
         turnDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        turnMag = turnMagFor(5.0f, 0.018f, 0.55f);   // gT = 2x the real diving-turn sustained (~2.5 g -> 5)
+        turnMag = turnMagFor(5.5f, 0.018f, 0.58f);   // gT ~= 2x the real diving-turn sustained (~2.5-2.75 g -> 5.5)
         bankT   = 0.05f;   // a whisper of over-bank for the diving lean; the sub-vertical clamp keeps it upright
         bankBase = 1.0f;   // full heartline base
         remain  = irnd(7, 11);   // longer (was 4-7): the diving turn holds its plateau instead of averaging down over an all-ramp element
@@ -1344,14 +1343,13 @@ struct Track {
             // to ALLOW it. capK is the felt-g plateau ceiling: the marquee turn-family targets
             // ~2x WR sustained (helix WR 4.5 -> ~9), so capK is lifted to match; airtime/other
             // banked modes keep the gentle 6.0 / 0.26.
-            // Radius floors (dyawGeo) are the arc-collapse guard: below ~R=33 m the felt-g du-window
-            // collapses into ±15 g sign-flip kinks (measurement + real jerk). A CLEAN ~6-7 g helix
-            // beats a jerky "9 g" one, so the geometric ceiling holds the radius at/above the
-            // collapse point even though that caps sustained short of a literal 2x WR. capK is the
-            // felt-g plateau ceiling.
-            float capK    = (mode == M_HELIX) ? 7.5f : (gElem ? 7.0f : 6.0f);
+            // Pushed toward a LITERAL 2x WR (user: "accept some jerk"). The tighter radius these
+            // higher ceilings allow lets the felt-g du-window collapse into occasional ±g kinks below
+            // ~R=33 m -- that is the accepted price of a real ~9 g (2x WR) helix. Airtime/other banked
+            // modes keep the gentle, collapse-free 6.0 / 0.26.
+            float capK    = (mode == M_HELIX) ? 9.8f : (gElem ? 8.2f : 6.0f);
             float dyawG   = capK * SEG_LEN * GRAV / fmaxf(genV * genV, 100.0f);
-            float dyawGeo = (mode == M_HELIX) ? 0.42f : (gElem ? 0.42f : 0.260f);
+            float dyawGeo = (mode == M_HELIX) ? 0.60f : (gElem ? 0.50f : 0.260f);
             float dyawMax = fminf(dyawG, dyawGeo);
             dyaw = Clamp(dyaw, -dyawMax, dyawMax);
             genPrevDyaw = dyaw;
