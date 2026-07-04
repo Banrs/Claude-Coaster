@@ -21,6 +21,7 @@ struct Track {
     bool    chainMode = false;
     int     elems = 0;
     int     elemLimit = 3;
+    bool    mcbrDone = false;   // mid-course brake run fired this lap yet? (a real coaster's ~halfway flat brake section -- adds realistic "catch your breath" idle track)
     int     forcedElem = -1;   // headless test hook (--elemsust): when >=0, chooseElement always emits this element so a single element can be measured in isolation at a controlled entry speed
     float   genPrevDy = 0;
     float   genPrevCurv = 0;
@@ -132,7 +133,7 @@ struct Track {
         gpos = { 0, maxG + 6.0f, 0 };
         startPos = gpos; startYaw = gyaw;
         mode = M_FLAT; remain = 3; turnDir = 1; turnMag = 0.4f; mega = false; elems = 0;
-        elemLimit = irnd(24, 34); queuedInv = 0; launchElem = M_CLIMB;   // long, element-dense laps (~2-3 min of ride between platforms) instead of a station every ~11 elements
+        elemLimit = irnd(24, 34); queuedInv = 0; launchElem = M_CLIMB; mcbrDone = false;   // long, element-dense laps (~2-3 min of ride between platforms) instead of a station every ~11 elements
         lastElem = M_FLAT; prevElem = M_FLAT; helixDrop = -3.4f; genV = LAUNCH_V;
         genPrevDy = 0; genPrevCurv = 0; genPrevDyaw = 0; genFloorY = -1e9f; genFloorVy = 0;
         setClearance(10.0f, 24.0f);
@@ -145,7 +146,7 @@ struct Track {
         }
 
         mode = M_CLIMB; mega = false; chainMode = false; remain = irnd(10, 13);
-        climbTop = frnd(85.0f, 105.0f);   // lift-hill height for a real-coaster energy budget: a ~95 m drop off a slow (CLIMB_V=20) crest reaches ~47 m/s (~170 km/h), the cruise speed the retune targets. Was 140-175, which fed the 270 km/h ride.
+        climbTop = frnd(105.0f, 135.0f);   // lift-hill height: a ~120 m drop off a slow crest recovers toward the fast ~180 km/h cruise the ride now targets.
         ensureAhead(24);
     }
 
@@ -507,7 +508,7 @@ struct Track {
     }
 
     void startLaunch() {
-        elems = 0; elemLimit = irnd(24, 34); chainMode = false; launchElem = pickLaunchExit();   // long element-dense laps (~2-3 min between platforms)
+        elems = 0; elemLimit = irnd(24, 34); chainMode = false; launchElem = pickLaunchExit(); mcbrDone = false;   // long element-dense laps (~2-3 min between platforms)
         setClearance(10.0f, 36.0f);
         mode = M_LAUNCH; remain = irnd(7, 9);   // ~98-126 m launch (real-life LSM length); longer than boost -> reaches the ~310 cap before a top-hat
         // M_LAUNCH rides dead flat (dy is always 0.0f in stepGeneric -- a real LSM launch track
@@ -1163,8 +1164,8 @@ struct Track {
                     {
                         float vCrest = mega ? 30.0f : 38.0f;
                         float reach  = (genV * genV - vCrest * vCrest) / (2.0f * GRAV) - 10.0f;
-                        float want   = mega ? frnd(118.0f, 132.0f) : frnd(85.0f, 105.0f);   // real-coaster energy budget: the mega top-hat (~125 m) is the signature drop -> ~52 m/s (~187 km/h) off a slow crest; regular lift ~95 m -> ~170 km/h. Was 196-206 / 140-175, which fed the 270+ km/h ride.
-                        climbTop = Clamp(fminf(want, reach), 40.0f, 135.0f);
+                        float want   = mega ? frnd(155.0f, 185.0f) : frnd(105.0f, 135.0f);   // the mega top-hat (~170 m) is the signature drop; the LAUNCH itself (LAUNCH_V=72 -> ~256 km/h) supplies the >250 km/h TOP speed, and the tall drop keeps the cruise fast.
+                        climbTop = Clamp(fminf(want, reach), 40.0f, 190.0f);
                     }
                     remain = mega ? irnd(11, 14) : irnd(6, 8);   // enough steps to actually reach ~200 m
                 }
@@ -1225,6 +1226,13 @@ struct Track {
                 // heartline bank is C1 across the seam because dyaw carries over via genPrevDyaw
                 // and jerk-limits into the next element's curvature. So only unwind before a
                 // genuine power section; otherwise go straight to the next element.
+                // MID-COURSE BRAKE RUN: once, ~halfway through the lap, when the track is low and not
+                // banked, drop a flat brake straight -- the "catch your breath" section every long
+                // real coaster has. Adds realistic idle track and paces the ride.
+                if (!mcbrDone && elems >= elemLimit / 2 && h < 40.0f && !wasBanked) {
+                    mcbrDone = true; mode = M_FLAT; remain = irnd(7, 11); levelHold = remain;
+                    break;
+                }
                 bool wantLaunch = (elems >= elemLimit) || (slow && h < 22.0f);
                 bool wantBoost  = slow && !wantLaunch;
                 // REAL-COASTER UNDULATION + altitude management. Before anything else, if the track
@@ -1253,7 +1261,7 @@ struct Track {
                 // is C1 (dyaw carries via genPrevDyaw), but banked->closed-form (loop/roll/stall, which
                 // start from a fresh up-vector) snaps the seat from a live bank to flat -> a jerk kink.
                 // Two steps (was the old dead 3-6) unwinds the bank without the long dead-flat gaps.
-                else if (wasBanked)             { mode = M_FLAT; remain = 2; }
+                else if (wasBanked)             { mode = M_FLAT; remain = 3; }
                 else                            chooseElement(h);
                 break;
             }

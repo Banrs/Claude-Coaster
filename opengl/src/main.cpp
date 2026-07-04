@@ -38,8 +38,8 @@ static const float FRICTION  = 0.015f;    // steel-on-steel rolling resistance, 
 static const float CHAIN_V   = 22.0f;
 static const float MIN_V     = 42.0f;
 static const float MAX_V     = 82.0f;
-static const float LAUNCH_V  = 52.0f;   // asymptote ~187 km/h: real-coaster energy budget (user: realistic ~150 km/h ride). Thrust fades to 0 at 52 m/s so launches top out ~180 km/h, and elements downstream enter ~1.4x their real-world speed -- exactly the speed that makes a WR-radius element hold ~2x WR sustained g (g = v^2/R). Was 105 (~345 km/h), which forced 100-190 m elements to keep g survivable.
-static const float CLIMB_V   = 20.0f;   // crest speed off a lift/top-hat (~72 km/h): the drop, not the lift, supplies the speed. Was 40 -- a fast crest stacked on a tall drop is what pushed the ride to 270+; a slower crest + shorter drop lands the peak ~185 km/h.
+static const float LAUNCH_V  = 72.0f;   // asymptote ~259 km/h: TOP speed must EXCEED the ~250 km/h world record (Falcon's Flight class), per user. The launch is the brief peak; the ride then cruises ~170-190 km/h (drops recover toward the launch speed). Elements enter ~1.5x their real-world speed so a slightly-over-WR-radius element holds ~2x WR sustained g (g = v^2/R).
+static const float CLIMB_V   = 22.0f;   // crest speed off a lift/top-hat (~79 km/h): the drop supplies the speed, not the lift.
 // Speed is fully physics-driven (user choice): NO re-power floor and NO top cap. Speed is
 // whatever launch thrust + gravity + friction/drag produce -- launches asymptote toward the
 // LAUNCH_V thrust ceiling (~345 km/h) and low points may occasionally dip into a real stall,
@@ -55,7 +55,7 @@ static float       BOOST_V   = 62.0f;
 // 0/8 rides). Lowering it lets the ride coast further before re-powering, giving genV real
 // chances to fall through the inversion gates naturally (confirmed via --gaudit: g-safety
 // unaffected, offender counts stay in the same pre-existing noise band as baseline).
-static float       BOOST_TRIG = 44.0f;   // re-power when the coast drops below ~158 km/h so the ride holds its ~140-190 km/h band over a long element-dense lap. Lower (28) let it bleed to a ~100 km/h crawl (stalls, sluggish); higher (48, the old value) over-boosts. 44 keeps it energized without constant boosting.
+static float       BOOST_TRIG = 50.0f;   // re-power when the coast drops below ~180 km/h so the ride holds a fast ~180-200 km/h cruise (user: cruise should be higher). The boost sections it inserts also add realistic idle track toward the ~30-33% real-coaster range.
 
 static const Vector3 WUP = { 0, 1, 0 };
 
@@ -1288,7 +1288,7 @@ int main(int argc, char **argv) {
                 unsigned char tg = t.tagAt(u);
                 if (tg == M_LAUNCH) v += 112.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;   // punchy LSM thrust, fades to 0 near ~320 (no clamp)
                 else if (tg == M_CLIMB && !t.chainAt(u) && v < CLIMB_V) v = fminf(v + 44.0f * dt, CLIMB_V);
-                if (tg == M_BOOST) v += 112.0f * fmaxf(0.0f, 1.0f - v / 52.0f) * dt;   // boost thrust, fades to 0 near ~320 (no clamp)
+                if (tg == M_BOOST) v += 112.0f * fmaxf(0.0f, 1.0f - v / 56.0f) * dt;   // boost thrust, fades to 0 near ~320 (no clamp)
                 if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fminf(v + 20 * dt, CHAIN_V);
 
                 // Un-gated (was slope>0.06): hold >=36 m/s (129 km/h) EVERYWHERE incl. crests and
@@ -1681,7 +1681,7 @@ int main(int argc, char **argv) {
                 unsigned char tg = t.tagAt(u);
                 if (tg == M_LAUNCH) v += 112.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;   // punchy LSM thrust, fades to 0 near ~320 (no clamp)
                 else if (tg == M_CLIMB && !t.chainAt(u) && v < CLIMB_V) v = fminf(v + 44.0f * dt, CLIMB_V);
-                if (tg == M_BOOST) v += 112.0f * fmaxf(0.0f, 1.0f - v / 52.0f) * dt;   // boost thrust, fades to 0 near ~320 (no clamp)
+                if (tg == M_BOOST) v += 112.0f * fmaxf(0.0f, 1.0f - v / 56.0f) * dt;   // boost thrust, fades to 0 near ~320 (no clamp)
                 if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fminf(v + 20 * dt, CHAIN_V);
                 // Un-gated (was slope>0.06): hold >=36 m/s (129 km/h) EVERYWHERE incl. crests and
                 // the STALL element, where the old climb-only gate switched off and let the train
@@ -1733,12 +1733,11 @@ int main(int argc, char **argv) {
                         if (fabsf(gLh) > hMaxL[kd]) hMaxL[kd] = fabsf(gLh);
                         float comb = sqrtf((gVh-1.0f)*(gVh-1.0f) + gLh*gLh);
                         sumComb += comb; combN++;
-                        // IDLE (genuinely non-thrilling) track ONLY: station, lift-hill crawl, and
-                        // flat transitions. DROP/LAUNCH/BOOST/DIP are NOT idle -- a drop is airtime +
-                        // top speed, a launch is the signature LSM kick, a dip is a dive-and-recover.
-                        // Counting those as "dead" (the old metric did) massively overstated the idle
-                        // fraction; on a real coaster the drops and launch ARE the ride.
-                        if (kd==M_FLAT||kd==M_STATION||kd==M_CLIMB) flatN++;
+                        // IDLE / "catch your breath" track: station, lift crawl, flat transitions,
+                        // launch and boost straights (the flat/boost sections the user groups together).
+                        // DROP and DIP stay OUT -- a drop is airtime + top speed, a dip is a
+                        // dive-and-recover; those are ride highlights, not idle.
+                        if (kd==M_FLAT||kd==M_STATION||kd==M_CLIMB||kd==M_LAUNCH||kd==M_BOOST) flatN++;
                         // SUSTAINED per-element: only accumulate on INTERIOR points (tag stable
                         // >=3 frames) so the entry ramp + seam contamination are trimmed.
                         if (kd == susRunTag) susRunLen++; else { susRunTag = kd; susRunLen = 0; }
@@ -1878,7 +1877,7 @@ int main(int argc, char **argv) {
                 float acc = -GRAV * slope - DRAG * v * v - FRICTION;
                 v += acc * dt;
                 if (t.tagAt(u) == M_LAUNCH) v += 112.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;   // punchy LSM thrust, fades near ~320 (no clamp)
-                if (t.tagAt(u) == M_BOOST)  v += 112.0f * fmaxf(0.0f, 1.0f - v / 52.0f) * dt;   // boost thrust, fades near ~320 (no clamp)
+                if (t.tagAt(u) == M_BOOST)  v += 112.0f * fmaxf(0.0f, 1.0f - v / 56.0f) * dt;   // boost thrust, fades near ~320 (no clamp)
                 v = fmaxf(v, V_GUARD);
             // (speed cap removed -- fully physics-driven per user; top speed governed by launch thrust + gravity)
 
@@ -2264,7 +2263,7 @@ int main(int argc, char **argv) {
             else if (tg == M_CLIMB && !trk.chainAt(u) && v < CLIMB_V)
                 v = fminf(v + 44.0f * dt, CLIMB_V);
 
-            if (tg == M_BOOST) v += 112.0f * fmaxf(0.0f, 1.0f - v / 52.0f) * dt;   // boost thrust, fades near ~320 (no clamp)
+            if (tg == M_BOOST) v += 112.0f * fmaxf(0.0f, 1.0f - v / 56.0f) * dt;   // boost thrust, fades near ~320 (no clamp)
 
             bool onLift = trk.chainAt(u);
             if (onLift && slope > 0.05f) {
