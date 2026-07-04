@@ -51,19 +51,15 @@ static const char *SHADOW_FS =
     // tile identity, so metal can get a materially different Fresnel curve
     // from everything else `sheen` still lightly highlights.
     "uniform vec2 metalUVRange;\n"
-    // Real screen-space reflection source for bare metal (rails/iron/gold, see
-    // the `sheen` mix near the end of main() below): this is a single-pass
-    // forward renderer with no G-buffer, so a fragment can't sample the
-    // CURRENT frame's own still-being-drawn scene color/depth (chicken/egg --
-    // the pixel a reflection ray would land on may not have rendered yet this
-    // frame). Instead it samples the PREVIOUS frame's fully-resolved scene
-    // color/depth (see PostFX's sceneRT[2] ping-pong in main.cpp) via a
-    // screen-space ray march -- a temporally-reprojected SSR, one frame of
-    // lag, invisible in practice at any reasonable frame rate for a subtle
-    // metal highlight -- so rails genuinely reflect nearby geometry/sky
-    // instead of only the analytic skyReflect() gradient. prevVP is the
-    // view-projection matrix that rendered THAT previous frame, used to
-    // reproject each marched world-space sample back into its screen space.
+    // Previous-frame scene color/depth + its view-projection matrix. These once
+    // fed a screen-space reflection ray march for bare metal (rails/iron/gold),
+    // but that trace was removed: its coarse hit/miss result flickered and banded
+    // the rail reflection frame-to-frame as the camera moved (see the removed-
+    // ssrTrace note further down). The metal reflection is now the stable analytic
+    // sky (skyReflect) only. These uniforms are consequently no longer sampled by
+    // the shader, but are LEFT DECLARED so main.cpp's existing bind calls (which
+    // still set them each frame) remain valid harmless no-ops -- an unused uniform
+    // resolves to an inactive location (-1) that SetShaderValue silently ignores.
     "uniform sampler2D prevSceneColor; uniform sampler2D prevSceneDepth; uniform mat4 prevVP;\n"
     // The main gameplay pass now renders into an offscreen linear-HDR target
     // (see PostFX below / main.cpp) that tonemaps + gamma-encodes once,
@@ -298,40 +294,19 @@ static const char *SHADOW_FS =
     "  float sunGlow = pow(max(dot(R, lightDir), 0.0), 8.0);\n"
     "  return mix(sky, sunCol*0.55, 0.30*sunGlow);\n"
     "}\n"
-    // Screen-space ray march against the PREVIOUS frame's color/depth (see the
-    // prevSceneColor/prevSceneDepth/prevVP comment above). Starts the march
-    // half a metre off the surface (thin rail cross-sections, ~0.18 m, are
-    // almost always clear of their own geometry by the first step) and grows
-    // the step size geometrically so a handful of taps still reach tens of
-    // metres out to catch nearby structure/terrain/sky. `hit` reports whether
-    // a real surface was found in front of the marched point (a crossing, the
-    // classic screen-space-raymarch hit test) -- exactly the same NDC-depth
-    // comparison pattern the shadow cascades above use, just against last
-    // frame's own render instead of a light's depth map. On any miss (ray
-    // exits the previous frame's screen bounds, goes behind its camera, or
-    // never crosses geometry within the step budget) the caller's analytic
-    // `fallback` (skyReflect) is returned unchanged.
-    "vec3 ssrTrace(vec3 ro, vec3 rd, vec3 fallback, out bool hit){\n"
-    "  hit = false;\n"
-    "  float t = 0.5;\n"
-    "  for(int i=0; i<8; i++){\n"
-    "    vec3 wp = ro + rd*t;\n"
-    "    vec4 pp = prevVP*vec4(wp,1.0);\n"
-    "    if(pp.w <= 0.001) break;\n"
-    "    vec3 ndc = pp.xyz/pp.w;\n"
-    "    if(ndc.x<-1.0||ndc.x>1.0||ndc.y<-1.0||ndc.y>1.0||ndc.z<-1.0||ndc.z>1.0) break;\n"
-    "    vec2 puv = ndc.xy*0.5+0.5;\n"
-    "    vec2 suv = vec2(puv.x, 1.0-puv.y);\n"
-    "    float storedZ  = texture(prevSceneDepth, suv).r;\n"
-    "    float marchedZ = ndc.z*0.5+0.5;\n"
-    "    if(storedZ < marchedZ - 0.0015){\n"
-    "      hit = true;\n"
-    "      return texture(prevSceneColor, suv).rgb;\n"
-    "    }\n"
-    "    t = t*1.8 + 0.35;\n"
-    "  }\n"
-    "  return fallback;\n"
-    "}\n"
+    // NOTE: a screen-space ray march (ssrTrace) used to live here, tracing the
+    // rail reflection against the previous frame's color/depth. It was removed.
+    // With only a handful of coarse geometric taps, its hit/miss result toggled
+    // frame-to-frame as the camera moved, and a single coarse hit HARD-replaced
+    // the reflection color -- so the rail reflection flickered and banded
+    // between near-black (a coarse hit landing on a shadowed support/ground) and
+    // blown-out bright (a miss falling back to sky). Rails now reflect the
+    // deterministic analytic sky (skyReflect) ONLY: a pure function of the
+    // reflection vector, so it is perfectly temporally stable and cannot band.
+    // The prevSceneColor/prevSceneDepth/prevVP uniforms declared above are no
+    // longer sampled; they are left declared (and main.cpp keeps binding them)
+    // so nothing breaks -- unused uniforms resolve to inactive locations (-1)
+    // and the bind calls become harmless no-ops.
     "vec3 waterShade(vec3 baseCol, float rawSh, float foam){\n"
     "  vec3 V = normalize(viewPos - fragWorld);\n"
     "  vec2 w = fragWorld.xz;\n"
@@ -448,41 +423,37 @@ static const char *SHADOW_FS =
     "  vec3 col = albedo*(ambient + direct) + sunCol*(spec + aniso*0.85) + skyCol*rim;\n"
     // Metal reflection: bare iron/gold surfaces (rails, spine, ties, trim -- anything
     // the existing `sheen` mask already flags as "shiny", the same mask spec/rim already
-    // use) get a sky reflection blended in via Fresnel, reusing skyReflect() from
-    // waterShade above rather than a second copy of the sky approximation. Blended
-    // (mix), not additive, so it stays energy-conserving and doesn't feed spurious
-    // extra brightness into the post-process bloom threshold. METAL_REFLECT_STRENGTH
-    // caps the blend well under 1 (max ~0.30 at full sheen and grazing angle) -- a
-    // hint of reflectivity, not a mirror finish.
+    // use) get the analytic sky reflection blended in via Fresnel, reusing skyReflect()
+    // from waterShade above rather than a second copy of the sky approximation. Blended
+    // (mix), not additive, so it stays energy-conserving and doesn't feed spurious extra
+    // brightness into the post-process bloom threshold. The reflection is now purely
+    // analytic (no screen-space trace -- see the removed-ssrTrace note above), so it is
+    // temporally stable: it depends only on the reflection vector, never on last frame's
+    // render, so there is no flicker and no view-dependent dark/bright banding.
+    // GENUINE_METAL_STRENGTH was lowered 0.65 -> 0.35 so rails read as brushed/polished
+    // metal, not a chrome mirror; METAL_REFLECT_STRENGTH caps the weaker sheen-only
+    // (paint/concrete) satin hint the same way.
     "  bool genuineMetal = fragTexCoord.x > metalUVRange.x && fragTexCoord.x < metalUVRange.y;\n"
     "  if(sheen > 0.001 || genuineMetal){\n"
     "    const float METAL_REFLECT_STRENGTH = 0.35;\n"
-    "    const float GENUINE_METAL_STRENGTH = 0.65;\n"
+    "    const float GENUINE_METAL_STRENGTH = 0.35;\n"
     "    vec3 Rm = reflect(-V, N);\n"
     "    vec3 metalRefl = skyReflect(Rm);\n"
-    // Only trace against the previous frame when one actually exists in the
-    // shape this shader expects: legacyTonemap>0.5 marks the two call sites
-    // (KEY_T live path-trace preview, offline path-trace --shot overlay) that
-    // draw straight onto an already-tonemapped LDR backbuffer outside the
-    // gPostFX sceneRT ping-pong entirely -- prevSceneColor/prevSceneDepth
-    // aren't meaningfully bound there, so skip the trace and keep the
-    // analytic-only fallback exactly as before for those two paths.
-    "    if(legacyTonemap < 0.5){\n"
-    "      bool ssrHit = false;\n"
-    "      vec3 ssrCol = ssrTrace(fragWorld, Rm, metalRefl, ssrHit);\n"
-    "      if(ssrHit) metalRefl = ssrCol;\n"
-    "    }\n"
     "    float NoV2 = max(dot(N,V), 0.0);\n"
     // Two distinct Fresnel curves, not one shared 0.04-baseline dielectric ramp:
-    // genuine metal (real tile identity, above) uses a HIGH, near-angle-independent
-    // F0 (Schlick with F0~0.6, tinted toward the surface's own albedo the way real
-    // metals have a colored specular response -- gold trim reflects gold-tinted
-    // sky, steel rail stays near-neutral), so it reads reflective even head-on.
-    // Everything only flagged by the coarse brightness/desaturation `sheen` mask
-    // (pale paint, sun-washed concrete -- NOT real metal) keeps the old low
-    // dielectric-style ramp, further dampened so it no longer competes visually
-    // with genuine metal and reads as a subtle satin hint instead.
-    "    vec3 F0metal = mix(vec3(0.6), albedo, 0.55);\n"
+    // genuine metal (real tile identity, above) uses a moderate F0 (Schlick with
+    // F0~0.45, tinted toward the surface's own albedo the way real metals have a
+    // colored specular response -- gold trim reflects gold-tinted sky, steel rail
+    // stays near-neutral), so it still reads reflective head-on but no longer as a
+    // full mirror; the Schlick term keeps grazing angles noticeably more reflective
+    // than head-on (F0~0.45 head-on ramping to ~1.0 at grazing). F0 was lowered
+    // 0.6 -> 0.45 alongside the strength cut so the sky reflection can't blow past
+    // scene brightness and bloom. Everything only flagged by the coarse
+    // brightness/desaturation `sheen` mask (pale paint, sun-washed concrete -- NOT
+    // real metal) keeps the old low dielectric-style ramp, further dampened so it
+    // no longer competes visually with genuine metal and reads as a subtle satin
+    // hint instead.
+    "    vec3 F0metal = mix(vec3(0.45), albedo, 0.55);\n"
     "    vec3 fresMetal = F0metal + (vec3(1.0)-F0metal)*pow(1.0-NoV2, 5.0);\n"
     "    float fresDielectric = clamp(0.04 + 0.30*pow(1.0-NoV2, 5.0), 0.04, 0.34);\n"
     "    vec3 fresM = genuineMetal ? fresMetal : vec3(fresDielectric);\n"
