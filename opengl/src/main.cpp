@@ -33,29 +33,23 @@ static const float BUILD_MAX  = 430.0f;
 static const float TERRA_MAX  = 320.0f;
 static const float GRAV      = 9.81f;
 
-static float       DRAG      = 0.00028f;  // realistic aero drag: ~1.8 m/s^2 at 80 m/s (a ~10t train, ~5 m^2, Cd~0.7). The old 0.00048 was ~2x reality and was capping tall drops at ~296; lower drag lets drops recover their crest-height speed (~300+).
-static const float FRICTION  = 0.015f;    // steel-on-steel rolling resistance, realistic: Crr~0.0015 * g ~= 0.015 m/s^2 constant decel. Steel coasters genuinely coast efficiently (that's why they hold speed) -- air DRAG below dominates the speed bleed at ride speed. Kept realistic per spec rather than exaggerated for feel; the dynamic speed variation comes from gravity over the hills + drag, not from an unrealistic friction term.
+static float       DRAG      = 0.00028f;  // realistic aero drag: ~1.8 m/s^2 at 80 m/s (a ~10t train, ~5 m^2, Cd~0.7)
+static const float FRICTION  = 0.015f;    // steel-on-steel rolling resistance: Crr~0.0015 * g ~= 0.015 m/s^2 constant decel; air DRAG dominates speed bleed at ride speed
 static const float CHAIN_V   = 22.0f;
 static const float MIN_V     = 42.0f;
 static const float MAX_V     = 82.0f;
-static const float LAUNCH_V  = 95.0f;   // asymptote ~342 km/h: TOP speed ~320 km/h by physics (no cap), per user.
+static const float LAUNCH_V  = 95.0f;   // asymptote ~342 km/h thrust ceiling; no top speed cap
 static const float CLIMB_V   = 22.0f;   // crest speed off a lift/top-hat (~79 km/h): the drop supplies the speed, not the lift.
-// Speed is fully physics-driven (user choice): NO re-power floor and NO top cap. Speed is
-// whatever launch thrust + gravity + friction/drag produce -- launches asymptote toward the
-// LAUNCH_V thrust ceiling (~345 km/h) and low points may occasionally dip into a real stall,
-// both accepted for realism. Only V_GUARD remains, a pure numeric floor so du/dt stays finite.
+// Speed is fully physics-driven: no re-power floor and no top cap. Speed is whatever launch
+// thrust + gravity + friction/drag produce; low points may occasionally dip into a real stall.
+// Only V_GUARD remains, a pure numeric floor so du/dt stays finite.
 static const float V_GUARD   =  6.0f;    // numeric-only floor (prevents v<=0 -> NaN du)
 static float       BOOST_V   = 62.0f;
 // Ambient re-power threshold: below this speed the ride considers itself "run down" and
 // re-launches/re-boosts (uniformly, regardless of what element comes next -- this is pure
-// pacing, not an inversion-reactive brake). Was 58.0, which sat ABOVE every hard-inversion's
-// speed gate (eligibleElem()'s invSpec-derived gates run ~36.5-54.2 m/s), so the ride always
-// got re-powered before genV could ever coast down into an inversion's eligible window --
-// LOOP/ROLL/IMMEL/DIVELOOP/COBRA/PRETZEL/HEARTLINE were structurally unreachable (measured:
-// 0/8 rides). Lowering it lets the ride coast further before re-powering, giving genV real
-// chances to fall through the inversion gates naturally (confirmed via --gaudit: g-safety
-// unaffected, offender counts stay in the same pre-existing noise band as baseline).
-static float       BOOST_TRIG = 70.0f;   // re-power below ~252 km/h so the whole-ride AVERAGE sits in the 225-250 km/h band (user).
+// pacing, not an inversion-reactive brake). Kept low enough that genV can coast down through
+// an inversion's eligible speed window before the ride re-powers.
+static float       BOOST_TRIG = 70.0f;   // re-power below ~252 km/h so the whole-ride average sits in the 225-250 km/h band
 
 static const Vector3 WUP = { 0, 1, 0 };
 
@@ -692,15 +686,13 @@ struct TerrainMesh {
 
     // Upload-spreading state (see finish()): once the worker's CPU build is done, GPU
     // uploads for the (possibly hundreds of) new chunk buckets are throttled to a few per
-    // frame instead of all at once, exactly like the project's earlier chunked renderer did
-    // (git: "perf: spread chunk uploads across frames") -- one full-ring rebuild uploading
-    // every bucket in a single frame is the "insane fps spike" on every rebuild.
+    // frame instead of all at once, to avoid a large fps spike on every rebuild.
     std::vector<CapBucket> pendingBuckets;
     std::vector<TerrainChunk> pendingChunks;
     size_t uploadCursor = 0;
     static const int UPLOAD_BUDGET = 12;   // chunks uploaded per frame once the world is already live
 
-    static const int REBUILD_CELLS = 40;   // re-centre the mesh every ~40 m (was 12 -> rebuilt ~7x/sec at speed)
+    static const int REBUILD_CELLS = 40;   // re-centre the mesh every ~40 m
     static const int REBUILD_U     = 8;
     bool needsRebuild(int cx, int cz, int uIdx) const {
         if (building) return false;
@@ -1291,15 +1283,9 @@ int main(int argc, char **argv) {
                 if (tg == M_BOOST) v += 160.0f * fmaxf(0.0f, 1.0f - v / 80.0f) * dt;   // Do-Dodonpa-class boost punch (0-200 km/h ~0.7 s), asymptote ~288 km/h
                 if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fminf(v + 20 * dt, CHAIN_V);
 
-                // Un-gated (was slope>0.06): hold >=36 m/s (129 km/h) EVERYWHERE incl. crests and
-                // the STALL element, where the old climb-only gate switched off and let the train
-                // coast down to the 20 m/s hard floor (72 km/h) -- the reported "stalling". Only
-                // fires when v<36; on descents v>36 so it never engages. Bounded +28 m/s^2, capped
-                // at 36, continuous in v -> kappa*v^2 rises smoothly, no felt-g jerk. Kept in
-                // lock-step with the live player loop so --gaudit reflects the real ride.
-                // (speed floor removed -- fully physics-driven per user; only the V_GUARD numeric floor below keeps du/dt finite)
+                // No speed floor or cap beyond this: fully physics-driven; only the V_GUARD
+                // numeric floor below keeps du/dt finite.
                 v = fmaxf(v, V_GUARD);
-            // (speed cap removed -- fully physics-driven per user; top speed governed by launch thrust + gravity)
                 if (f > 120) { sumV += v; nV++; gSumV += v; gNV++; if (v > maxV) maxV = v;
                     if (tg == M_BOOST) gBoostF++; if (tg == M_LAUNCH) gLaunchF++;
                     if (tg != prevTag && Track::isHardInversion((SegMode)tg)) gInv++;
@@ -1386,11 +1372,7 @@ int main(int argc, char **argv) {
         // g at each point uses the LOCAL speed from energy conservation (v(y) = sqrt(v0^2 -
         // 2*g*(y-y0)), floored so a too-high climb doesn't go imaginary) rather than a constant
         // genV -- the real ride slows down climbing and speeds up descending, and using a fixed
-        // speed everywhere overstates g exactly at the highest points (where real speed is
-        // lowest) and understates it at the lowest points. This was the actual bug in the first
-        // version of this tool and the reason the earlier COBRA redesign attempt looked far more
-        // dangerous than it may really be -- its "spike" landed right at peak height, precisely
-        // where a constant-speed estimate is most wrong.
+        // speed everywhere overstates g at the highest points and understates it at the lowest.
         float maxG = 0, maxY = -1e9f, minY = 1e9f; int maxK = -1;
         for (int k = 1; k < (int)t.cbPts.size() - 1; k++) {
             Vector3 p0 = t.cbPts[k-1], p1 = t.cbPts[k], p2 = t.cbPts[k+1];
@@ -1751,15 +1733,9 @@ int main(int argc, char **argv) {
                 else if (tg == M_CLIMB && !t.chainAt(u) && v < CLIMB_V) v = fminf(v + 44.0f * dt, CLIMB_V);
                 if (tg == M_BOOST) v += 160.0f * fmaxf(0.0f, 1.0f - v / 80.0f) * dt;   // Do-Dodonpa-class boost punch (0-200 km/h ~0.7 s), asymptote ~288 km/h
                 if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fminf(v + 20 * dt, CHAIN_V);
-                // Un-gated (was slope>0.06): hold >=36 m/s (129 km/h) EVERYWHERE incl. crests and
-                // the STALL element, where the old climb-only gate switched off and let the train
-                // coast down to the 20 m/s hard floor (72 km/h) -- the reported "stalling". Only
-                // fires when v<36; on descents v>36 so it never engages. Bounded +28 m/s^2, capped
-                // at 36, continuous in v -> kappa*v^2 rises smoothly, no felt-g jerk. Kept in
-                // lock-step with the live player loop so --gaudit reflects the real ride.
-                // (speed floor removed -- fully physics-driven per user; only the V_GUARD numeric floor below keeps du/dt finite)
+                // No speed floor or cap beyond this: fully physics-driven; only the V_GUARD
+                // numeric floor below keeps du/dt finite.
                 v = fmaxf(v, V_GUARD);
-            // (speed cap removed -- fully physics-driven per user; top speed governed by launch thrust + gravity)
                 int ki = (int)u;
                 if (ki > lastK) { for (int q = lastK + 1; q <= ki && q < n; q++) vAt[q] = v; lastK = ki; }
 
@@ -1791,7 +1767,7 @@ int main(int argc, char **argv) {
                         int kj = t.tagAt(u); if (kj < 0 || kj >= M_COUNT) kj = 0;
                         if (jV > hJerkV[kj]) hJerkV[kj] = jV;
                         if (jL > hJerkL[kj]) hJerkL[kj] = jL;
-                        if (jV > 200.0f || jL > 200.0f) jerkOffenders++;   // 200 g/s = a true C1 collapse (the -29.9G class); raw iv carries ~50-110 g/s du-window sampling noise even on smooth elements, so a lower gate is meaningless
+                        if (jV > 200.0f || jL > 200.0f) jerkOffenders++;   // 200 g/s = a true C1 collapse; raw iv carries ~50-110 g/s du-window sampling noise even on smooth elements, so a lower gate is meaningless
                     }
                     ivPrev = iv; ilPrev = il;
                     if (f > 30) {
@@ -1852,11 +1828,9 @@ int main(int argc, char **argv) {
                 if (gV < kMinV[kd]) kMinV[kd] = gV;
                 if (fabsf(gL) > kMaxL[kd]) kMaxL[kd] = fabsf(gL);
                 if (gV > seedMaxV) { seedMaxV = gV; seedMaxK = k; }
-                // Threshold raised to the BROKEN line (>16 g vert / >13 g lat), not the old +9.8/-6
-                // human-comfort line: the user targets a LITERAL 2x WR (helix ~9-11 g by design),
-                // which the old line flagged en masse as "offenders" even though it is exactly the
-                // intent. What's left here is genuinely-broken geometry (an arc-collapse that spikes
-                // well past even the 2x-WR target). The JERK metric above is the primary defect signal.
+                // Threshold is the BROKEN-geometry line (>16 g vert / >13 g lat), well past the
+                // ~9-11 g design target for a helix -- what's left here is genuinely-broken
+                // geometry (an arc-collapse spike). The JERK metric above is the primary defect signal.
                 if (gV > 16.0f || gV < -6.5f || gL > 13.0f || gL < -6.5f)
                     offenders.push_back({gV, sd, k, kd, (int)t.kind[k-1], (int)t.kind[k+1], vAt[k], p1.y, gL});
             }
@@ -1952,7 +1926,6 @@ int main(int argc, char **argv) {
                 if (t.tagAt(u) == M_LAUNCH) v += 112.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;   // punchy LSM thrust, fades near ~320 (no clamp)
                 if (t.tagAt(u) == M_BOOST)  v += 160.0f * fmaxf(0.0f, 1.0f - v / 80.0f) * dt;   // Do-Dodonpa-class boost punch (0-200 km/h ~0.7 s), asymptote ~288 km/h
                 v = fmaxf(v, V_GUARD);
-            // (speed cap removed -- fully physics-driven per user; top speed governed by launch thrust + gravity)
 
                 sinceStation += dt;
                 if (sinceStation > 6.0f && !t.stationPending && !t.stationActive)
@@ -2345,12 +2318,9 @@ int main(int argc, char **argv) {
                 if (v < liftV) v = fminf(v + 20.0f * dt, liftV);
             }
 
-            // Un-gated (was slope>0.06): hold >=36 m/s (129 km/h) at crests/STALL too, not only
-            // on climbs -- see the matching comment in the --gaudit sim. Continuous +28 m/s^2 to a
-            // 36 cap, no felt-g jerk.
-            // (speed floor removed -- fully physics-driven per user)
+            // No speed floor or cap beyond this: fully physics-driven; only the V_GUARD
+            // numeric floor keeps du/dt finite.
             v = fmaxf(v, V_GUARD);
-            // (speed cap removed -- fully physics-driven per user; top speed governed by launch thrust + gravity)
             if (gForceSpeed > 0.0f) v = gForceSpeed;
 
             if (benchMode) {   // launch top-hat drop, measured on the REAL physics path (== live ride)
@@ -3930,7 +3900,7 @@ int main(int argc, char **argv) {
 
         if (dispatched && !onFoot) {
             Vector2 gc = { (float)(sw - 96), (float)(shh - 150) };
-            float R = 48.0f, scale = R / 10.0f;   // g-ball scaled to +-10 g (was 4.5): the ride now pulls well past 4.5 g, so the dot needs the full human range
+            float R = 48.0f, scale = R / 10.0f;   // g-ball scaled to +-10 g to cover the ride's full range
             DrawCircleV(gc, R + 6.0f, Color{ 12, 15, 24, 150 });
             DrawRing(gc, R + 2.0f, R + 5.0f, 0, 360, 48, Color{ 80, 90, 110, 210 });
             for (int gg = 2; gg <= 10; gg += 2)

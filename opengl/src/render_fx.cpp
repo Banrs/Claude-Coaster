@@ -51,15 +51,11 @@ static const char *SHADOW_FS =
     // tile identity, so metal can get a materially different Fresnel curve
     // from everything else `sheen` still lightly highlights.
     "uniform vec2 metalUVRange;\n"
-    // Previous-frame scene color/depth + its view-projection matrix. These once
-    // fed a screen-space reflection ray march for bare metal (rails/iron/gold),
-    // but that trace was removed: its coarse hit/miss result flickered and banded
-    // the rail reflection frame-to-frame as the camera moved (see the removed-
-    // ssrTrace note further down). The metal reflection is now the stable analytic
-    // sky (skyReflect) only. These uniforms are consequently no longer sampled by
-    // the shader, but are LEFT DECLARED so main.cpp's existing bind calls (which
-    // still set them each frame) remain valid harmless no-ops -- an unused uniform
-    // resolves to an inactive location (-1) that SetShaderValue silently ignores.
+    // Previous-frame scene color/depth + its view-projection matrix. Unused by
+    // this shader (the metal reflection uses the analytic sky, skyReflect,
+    // only) but LEFT DECLARED so main.cpp's existing bind calls remain valid
+    // harmless no-ops -- an unused uniform resolves to an inactive location
+    // (-1) that SetShaderValue silently ignores.
     "uniform sampler2D prevSceneColor; uniform sampler2D prevSceneDepth; uniform mat4 prevVP;\n"
     // The main gameplay pass now renders into an offscreen linear-HDR target
     // (see PostFX below / main.cpp) that tonemaps + gamma-encodes once,
@@ -108,11 +104,10 @@ static const char *SHADOW_FS =
     "  vec2(-0.326,-0.406),vec2(-0.840,-0.074),vec2(-0.696, 0.457),vec2(-0.203, 0.621),\n"
     "  vec2( 0.962,-0.195),vec2( 0.473,-0.480),vec2( 0.519, 0.767),vec2( 0.185,-0.893),\n"
     "  vec2( 0.507, 0.064),vec2( 0.896, 0.412),vec2(-0.322,-0.933),vec2(-0.792,-0.598));\n"
-    // radiusScale is now a PARAMETER (texel count), not a fixed 1.4 -- PCSS
-    // (below) varies it per-fragment based on blocker distance, so shadows go
-    // tight right at the occluding edge and soften with distance from it
-    // (the visual signature of a ray-traced soft shadow) instead of every
-    // cascade using one uniform softness everywhere.
+    // radiusScale is a per-fragment texel-count parameter -- PCSS (below)
+    // varies it based on blocker distance, so shadows go tight right at the
+    // occluding edge and soften with distance from it (the visual signature
+    // of a ray-traced soft shadow) instead of one uniform softness everywhere.
     "float pcfTap(sampler2D sm, vec2 texel, vec3 p, float bias, float radiusScale){\n"
     "  float ang = fract(sin(dot(fragWorld.xz, vec2(12.9898,78.233)))*43758.5453)*6.2831853;\n"
     "  float ca=cos(ang), sa=sin(ang); mat2 rot=mat2(ca,-sa,sa,ca);\n"
@@ -149,56 +144,34 @@ static const char *SHADOW_FS =
     "  n = cnt;\n"
     "  avgBlocker = (cnt > 0) ? sum/float(cnt) : 0.0;\n"
     "}\n"
-    // Bias tuned in world metres (matches the old single-map 1.4-3.2 m range,
-    // now comfortably clearing the ~1 m terrain height steps regardless of
-    // which cascade is sampled); converted to each cascade's normalized units
-    // by the caller via invRangeN.
+    // Bias tuned in world metres, comfortably clearing the ~1 m terrain height
+    // steps regardless of which cascade is sampled; converted to each
+    // cascade's normalized units by the caller via invRangeN.
     "float worldBias(float NoL){ return clamp(1.4 + 1.75*(1.0-NoL), 1.4, 3.2); }\n"
     // PCSS tuning: PCSS_ANGULAR_TAN stands in for the sun's apparent angular
     // size (tan of its half-angle) -- deliberately larger than the real sun
     // (~0.005) so the penumbra is actually visible at this game's scale
     // rather than a few sub-pixel texels, matching the "soft with distance"
     // look this pass is going for without pretending to be physically exact.
-    // The penumbra half-width is now clamped in WORLD METRES, then converted to
-    // texels PER CASCADE at each use site -- this is the real fix for the
-    // "dark circle whose radius depends on the coaster's y-level".
-    //
-    // The old clamp was in TEXELS (MIN=1.1, MAX=6.0), but a texel is a different
-    // world size in each cascade: pcssTexelWorldN = 2*R/SM = 0.031 m (near),
-    // 0.098 m (mid), 0.25 m (far). And cascade selection is by distance from the
-    // focus, so an ELEVATED train pushes the ground beneath it into the far,
-    // coarse cascade -- where the same 6-texel clamp is 6*0.25 = 1.5 m of world
-    // penumbra, vs 0.19 m in the near cascade. As the train climbs it crosses
-    // into coarser cascades and the world penumbra swells 0.19 -> 0.59 -> 1.5 m,
-    // and blockerSearch (a Poisson DISK) isotropically dilates that thin train
-    // shadow into a metre-scale DISC -- exactly the reported circle. Toning
-    // PCSS_ANGULAR_TAN down earlier did nothing because the clamp was pegged at
-    // MAX=6 at every height this ride reaches, so the tan never entered the result.
-    //
-    // Clamping in world metres (MIN=0.04, MAX=0.25 m) and dividing by the
-    // cascade's own texel size gives an identical ~0.25 m soft edge at every
-    // altitude and cascade -- train-shaped, no swelling disc. (Anchoring the
-    // cascade focus near the ground, done in main.cpp, additionally keeps the
-    // ground under a high train in the fine NEAR cascade, so the two fixes
-    // compose.)
+    // The penumbra half-width is clamped in WORLD METRES (MIN/MAX below), then
+    // converted to texels PER CASCADE at each use site, so the softness stays
+    // consistent (~0.25 m soft edge) at every altitude and cascade instead of
+    // scaling with each cascade's own texel size.
     "const float PCSS_ANGULAR_TAN = 0.022;\n"
     "const float PCSS_MIN_WORLD = 0.04;\n"
     "const float PCSS_MAX_WORLD = 0.25;\n"
     "const float PCSS_SEARCH_WORLD = 0.35;\n"
-    // Remove the FAKE cast shadow of a high caster. worldZDiff (below) is the world
-    // distance from the blocker to the receiver it's shadowing -- for the ground
-    // under a train riding high on a hill/top-hat that's the train's altitude. A
-    // real object 100 m+ up casts an essentially invisible, hugely-diffused shadow,
-    // but the shadow map keeps drawing a distinct dark disc there (the reported
-    // "fake circular shadow chasing the coaster", its radius scaling with height via
-    // the penumbra). Fade the shadow to fully-lit as the caster gets far above the
-    // receiver: near-ground shadows (small worldZDiff -- terrain, supports, a train
-    // low to the ground) are untouched; the high-caster disc is deleted.
+    // Fade out the shadow of a high caster. worldZDiff (below) is the world
+    // distance from the blocker to the receiver it's shadowing -- for the
+    // ground under a train riding high on a hill/top-hat that's the train's
+    // altitude. A real object 100 m+ up casts an essentially invisible,
+    // hugely-diffused shadow, so fade the shadow to fully-lit as the caster
+    // gets far above the receiver; near-ground shadows (small worldZDiff --
+    // terrain, supports, a train low to the ground) are untouched.
     "const float SHADOW_FADE_NEAR = 40.0;\n"
     "const float SHADOW_FADE_FAR  = 110.0;\n"
     // Split per-cascade so every call site passes a compile-time-known cascade --
-    // no runtime idx branch (the old single shadowCascade(idx,N) re-tested idx on
-    // every call even though callers always pass a literal 0/1/2).
+    // no runtime idx branch needed since callers always pass a literal 0/1/2.
     "float shadowCascade0(vec3 N){\n"
     "  float NoL = max(dot(N,lightDir),0.0);\n"
     "  vec4 lp = lightVP0*vec4(fragWorld,1.0); vec3 p = lp.xyz/lp.w; p = p*0.5+0.5;\n"
@@ -242,14 +215,10 @@ static const char *SHADOW_FS =
     // box each cascade's computeLightVP builds is centred on the TRAIN's
     // actual 3D position (main.cpp calls computeLightVP(P), not a ground-
     // projected point), so when the train is high up, ground fragments almost
-    // directly below it have a small XZ offset but a huge vertical one. XZ-only
-    // selection picked the small near cascade for those fragments purely
-    // because they're horizontally close, even though the vertical gap alone
-    // could exceed that cascade's half-extent -- the fragment then fails the
-    // light-space bounds check in shadowCascadeN (p.y out of [0,1]) and reads
-    // as fully lit, which is what showed up as the shadow going stale/dropping
-    // near max altitude. 3D distance correctly escalates to a bigger-radius
-    // cascade whenever any axis (including height) is large.
+    // directly below it have a small XZ offset but a huge vertical one. 3D
+    // distance correctly escalates to a bigger-radius cascade whenever any
+    // axis (including height) is large, so those fragments still land inside
+    // the chosen cascade's light-space bounds.
     // Soft-blending across a band near each split keeps the cascade seam from
     // ever being a visible hard line; right at each band's inner/outer edge t
     // is ~0 or ~1 and the far/near tap contributes negligibly -- skip it there
@@ -283,9 +252,8 @@ static const char *SHADOW_FS =
     "  return mix(mix(wh2(i),wh2(i+vec2(1,0)),f.x), mix(wh2(i+vec2(0,1)),wh2(i+vec2(1,1)),f.x), f.y); }\n"
 
     // Analytic sky-gradient reflection sample, tinted toward the sun near R==lightDir.
-    // Originally lived only inside waterShade (duplicated inline); factored out so the
-    // new metal-reflection term below (bare iron/gold "sheen" surfaces) can reuse the
-    // exact same sky approximation water already uses, instead of a second copy.
+    // Shared by waterShade and the metal-reflection term below so both reuse the
+    // same sky approximation instead of duplicating it.
     "vec3 skyReflect(vec3 R){\n"
     "  float ry = clamp(R.y, 0.0, 1.0);\n"
     "  vec3 skyZen  = vec3(0.24, 0.46, 0.86);\n"
@@ -294,17 +262,10 @@ static const char *SHADOW_FS =
     "  float sunGlow = pow(max(dot(R, lightDir), 0.0), 8.0);\n"
     "  return mix(sky, sunCol*0.55, 0.30*sunGlow);\n"
     "}\n"
-    // NOTE: a screen-space ray march (ssrTrace) used to live here, tracing the
-    // rail reflection against the previous frame's color/depth. It was removed.
-    // With only a handful of coarse geometric taps, its hit/miss result toggled
-    // frame-to-frame as the camera moved, and a single coarse hit HARD-replaced
-    // the reflection color -- so the rail reflection flickered and banded
-    // between near-black (a coarse hit landing on a shadowed support/ground) and
-    // blown-out bright (a miss falling back to sky). Rails now reflect the
-    // deterministic analytic sky (skyReflect) ONLY: a pure function of the
-    // reflection vector, so it is perfectly temporally stable and cannot band.
-    // The prevSceneColor/prevSceneDepth/prevVP uniforms declared above are no
-    // longer sampled; they are left declared (and main.cpp keeps binding them)
+    // Rails reflect the deterministic analytic sky (skyReflect) only: a pure
+    // function of the reflection vector, so it is perfectly temporally stable.
+    // The prevSceneColor/prevSceneDepth/prevVP uniforms declared above are not
+    // sampled here; they are left declared (and main.cpp keeps binding them)
     // so nothing breaks -- unused uniforms resolve to inactive locations (-1)
     // and the bind calls become harmless no-ops.
     "vec3 waterShade(vec3 baseCol, float rawSh, float foam){\n"
@@ -426,13 +387,11 @@ static const char *SHADOW_FS =
     // use) get the analytic sky reflection blended in via Fresnel, reusing skyReflect()
     // from waterShade above rather than a second copy of the sky approximation. Blended
     // (mix), not additive, so it stays energy-conserving and doesn't feed spurious extra
-    // brightness into the post-process bloom threshold. The reflection is now purely
-    // analytic (no screen-space trace -- see the removed-ssrTrace note above), so it is
-    // temporally stable: it depends only on the reflection vector, never on last frame's
-    // render, so there is no flicker and no view-dependent dark/bright banding.
-    // GENUINE_METAL_STRENGTH was lowered 0.65 -> 0.35 so rails read as brushed/polished
-    // metal, not a chrome mirror; METAL_REFLECT_STRENGTH caps the weaker sheen-only
-    // (paint/concrete) satin hint the same way.
+    // brightness into the post-process bloom threshold. The reflection is purely analytic,
+    // depending only on the reflection vector, so it is temporally stable with no flicker
+    // or view-dependent banding. GENUINE_METAL_STRENGTH keeps rails reading as
+    // brushed/polished metal rather than a chrome mirror; METAL_REFLECT_STRENGTH caps the
+    // weaker sheen-only (paint/concrete) satin hint the same way.
     "  bool genuineMetal = fragTexCoord.x > metalUVRange.x && fragTexCoord.x < metalUVRange.y;\n"
     "  if(sheen > 0.001 || genuineMetal){\n"
     "    const float METAL_REFLECT_STRENGTH = 0.35;\n"
@@ -440,19 +399,14 @@ static const char *SHADOW_FS =
     "    vec3 Rm = reflect(-V, N);\n"
     "    vec3 metalRefl = skyReflect(Rm);\n"
     "    float NoV2 = max(dot(N,V), 0.0);\n"
-    // Two distinct Fresnel curves, not one shared 0.04-baseline dielectric ramp:
-    // genuine metal (real tile identity, above) uses a moderate F0 (Schlick with
-    // F0~0.45, tinted toward the surface's own albedo the way real metals have a
-    // colored specular response -- gold trim reflects gold-tinted sky, steel rail
-    // stays near-neutral), so it still reads reflective head-on but no longer as a
-    // full mirror; the Schlick term keeps grazing angles noticeably more reflective
-    // than head-on (F0~0.45 head-on ramping to ~1.0 at grazing). F0 was lowered
-    // 0.6 -> 0.45 alongside the strength cut so the sky reflection can't blow past
-    // scene brightness and bloom. Everything only flagged by the coarse
-    // brightness/desaturation `sheen` mask (pale paint, sun-washed concrete -- NOT
-    // real metal) keeps the old low dielectric-style ramp, further dampened so it
-    // no longer competes visually with genuine metal and reads as a subtle satin
-    // hint instead.
+    // Two distinct Fresnel curves, not one shared dielectric ramp: genuine metal
+    // (real tile identity, above) uses a moderate F0 (Schlick with F0~0.45, tinted
+    // toward the surface's own albedo the way real metals have a colored specular
+    // response -- gold trim reflects gold-tinted sky, steel rail stays near-neutral),
+    // so it reads reflective head-on but not as a full mirror, ramping to ~1.0 at
+    // grazing angles. Everything only flagged by the coarse brightness/desaturation
+    // `sheen` mask (pale paint, sun-washed concrete -- NOT real metal) keeps a low
+    // dielectric-style ramp instead, reading as a subtle satin hint.
     "    vec3 F0metal = mix(vec3(0.45), albedo, 0.55);\n"
     "    vec3 fresMetal = F0metal + (vec3(1.0)-F0metal)*pow(1.0-NoV2, 5.0);\n"
     "    float fresDielectric = clamp(0.04 + 0.30*pow(1.0-NoV2, 5.0), 0.04, 0.34);\n"
@@ -490,15 +444,13 @@ static const int SHADOW_CASCADES = 3;
 // to TERRA_R=320 m around the camera (main.cpp, 20 chunks @ 16 m/chunk).
 // The far cascade is centred on the TRAIN's own 3D position (computeLightVP(P),
 // main.cpp), not projected to ground level, so its half-extent has to clear
-// the tallest elements' altitude (~250 m) as well as the horizontal footprint
+// the tallest elements' altitude (~250 m) as well as the horizontal footprint,
 // or a fragment almost directly below a high train falls outside the ortho
-// box on its vertical axis and reads as unshadowed -- previously R=245 left
-// under 5 m of margin below that 250 m ceiling, which was visible as the
-// shadow going stale/dropping out near max height. 256 m (16 chunks) clears
+// box on its vertical axis and reads as unshadowed. 256 m (16 chunks) clears
 // it with real margin.
 static const float SHADOW_CASCADE_R[SHADOW_CASCADES] = { 32.0f, 100.0f, 256.0f };
 // Depth-pass draw-call cull radius per cascade: box half-diagonal (R*sqrt2)
-// plus a safety margin, mirroring the old single-map SHADOW_CULL_R pattern.
+// plus a safety margin.
 static const float SHADOW_CASCADE_CULL_R[SHADOW_CASCADES] = {
     SHADOW_CASCADE_R[0] * 1.42f + 15.0f,
     SHADOW_CASCADE_R[1] * 1.42f + 15.0f,
@@ -509,11 +461,9 @@ struct ShadowSys {
     Shader lit{}, depth{};
     unsigned int fbo[SHADOW_CASCADES] = {0,0,0};
     unsigned int depthTex[SHADOW_CASCADES] = {0,0,0};
-    // All three cascades at full 2048 res: with the far cascade's radius now
-    // 8x the near one, keeping resolution uniform (rather than the old
-    // 2048/1536/1024 taper) is what "consistently high quality" means here --
-    // otherwise a bigger far R alone would make distant/high-altitude shadows
-    // visibly blurrier than before even though coverage improved.
+    // All three cascades at full 2048 res: with the far cascade's radius 8x
+    // the near one, uniform resolution keeps distant/high-altitude shadows
+    // from reading visibly blurrier than the near cascade.
     int SM[SHADOW_CASCADES] = { 2048, 2048, 2048 };
     int locLightVP[SHADOW_CASCADES]   = {-1,-1,-1};
     int locShadowMap[SHADOW_CASCADES] = {-1,-1,-1};
@@ -752,9 +702,8 @@ static SkySys gSky;
 // Post-processing: a single offscreen linear-HDR scene target (sky + opaque +
 // water all render into this instead of the backbuffer) followed by one
 // fullscreen composite pass: bloom add -> vignette -> chromatic aberration ->
-// film grain/dither -> ACES tonemap + gamma + saturation. This replaces the 3
-// duplicated inline tonemap copies that used to live in SHADOW_FS's opaque
-// and water branches and in SKY_FS -- now there is exactly one.
+// film grain/dither -> ACES tonemap + gamma + saturation, applied exactly once
+// for the whole frame.
 //
 // Bloom is kept cheap on purpose (this is a software rasterizer sandbox and a
 // prior pass already had to fight hard for a double-digit-percent frame-time
@@ -767,9 +716,9 @@ static SkySys gSky;
 //
 // BLOOM_THRESHOLD is expressed in POST-tonemap luma (0..1), not raw linear
 // HDR magnitude: ordinary sunlit terrain/track already sits at a linear HDR
-// magnitude of ~1-3 in this engine (that's exactly the range the old inline
-// aces(col*0.94) curve was designed to compress down to a pleasant ~0.75-0.95
-// display value), so a raw-linear threshold anywhere near 1.0 caught nearly
+// magnitude of ~1-3 in this engine (that's exactly the range the aces(col*0.94)
+// curve is designed to compress down to a pleasant ~0.75-0.95 display value),
+// so a raw-linear threshold anywhere near 1.0 caught nearly
 // everything lit by the sun and bloomed the whole frame into a haze. Running
 // the same aces() curve inside the bright-pass first and thresholding its
 // *output* isolates only the pixels that would render at the very top of the
@@ -971,11 +920,8 @@ static const char *COMPOSITE_FS =
     "in vec2 uv; out vec4 finalColor;\n"
     "uniform sampler2D sceneTex; uniform sampler2D bloomTex; uniform sampler2D aoTex;\n"
     "uniform float uBloomIntensity, uVignette, uCA, uGrain, uTime, uAOStrength;\n"
-    // Same aces() curve/constants as the old inline copies (SHADOW_FS's
-    // opaque+water branches used *0.94 before this curve; that's the constant
-    // kept here -- SKY_FS used a slightly different *1.08 pre-scale, now
-    // unified to the single canonical value since the whole frame shares one
-    // exposure/tonemap from this point on).
+    // Same aces() curve/constants used everywhere else this shader family
+    // applies its final tonemap, so the whole frame shares one exposure/tonemap.
     "vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }\n"
     "float hashN(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233)))*43758.5453); }\n"
     "void main(){\n"
@@ -1041,11 +987,8 @@ struct PostFX {
 
     // Ping-ponged: sceneRT[sceneCur] is the target this frame renders into;
     // sceneRT[sceneCur^1] still holds last frame's fully-resolved linear HDR
-    // scene (color+depth), the source the metal-reflection SSR trace in
-    // SHADOW_FS samples from (see prevSceneColor/prevSceneDepth/prevVP there).
-    // lastFrameVP is the view-projection matrix that rendered whichever
-    // buffer is currently "previous" -- needed to reproject SSR ray samples
-    // back into that buffer's own screen space.
+    // scene (color+depth). lastFrameVP is the view-projection matrix that
+    // rendered whichever buffer is currently "previous".
     RenderTexture2D sceneRT[2]{};
     int sceneCur = 0;
     Matrix lastFrameVP = MatrixIdentity();
@@ -1178,17 +1121,15 @@ struct PostFX {
     void beginScene() { BeginTextureMode(sceneRT[sceneCur]); }
     void endScene()   { EndTextureMode(); }
 
-    // Previous frame's fully-resolved scene (color+depth) -- the source the
-    // opaque pass's SSR metal-reflection trace samples from. Call this AFTER
+    // Previous frame's fully-resolved scene (color+depth). Call this AFTER
     // beginScene() has been called for the frame that's about to render (so
     // sceneCur already points at THIS frame's target and sceneCur^1 is
     // guaranteed to be last frame's completed buffer, never the one currently
     // bound as the render target -- no read/write hazard).
     RenderTexture2D &prevScene() { return sceneRT[sceneCur ^ 1]; }
 
-    // Call once per frame after resolve() (or anywhere after the frame's SSR
-    // sampling is done): records this frame's view-projection matrix as next
-    // frame's "previous" reprojection matrix, then flips the ping-pong so the
+    // Call once per frame after resolve(): records this frame's view-projection
+    // matrix as next frame's "previous" matrix, then flips the ping-pong so the
     // next frame renders into the buffer that just became "previous".
     void endFrame(Matrix vpThisFrame) {
         lastFrameVP = vpThisFrame;
