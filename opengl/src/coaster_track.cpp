@@ -39,6 +39,7 @@ struct Track {
     int     seamEaseTot = 0;
     int     invSlotUsed = 0;   // slow-window pacing: how many inversions the current run-down window has taken; capped at 2 before the window must go to a re-power BOOST (reset there) so inversions and speed alternate instead of inversion chains starving the boosts
     int     levelHold = 0;
+    float   rollPh = 0.0f;   // phase of the gentle connective-track swell (M_FLAT/M_TURN undulation)
     int     queuedInv = 0;
     SegMode lastElem = M_FLAT, prevElem = M_FLAT;
     SegMode launchElem = M_CLIMB;
@@ -780,6 +781,11 @@ struct Track {
     }
     int elemSeq = 0;
     void rememberElement(SegMode m) {
+        // MC_ELEMDBG=1: log every element pick with its entry speed -- the pick-speed
+        // histogram is how the entry windows (invVMax/invVMinFrac) get aligned with the
+        // speeds nextMode actually samples (same debug-env pattern as MC_STALLDBG).
+        if (getenv("MC_ELEMDBG"))
+            fprintf(stderr, "[elemdbg] pick=%d genV=%.1f\n", (int)m, genV);
         prevElem = lastElem;
         lastElem = m;
         lastUsedAt[m] = ++elemSeq;
@@ -1049,7 +1055,10 @@ struct Track {
     void chooseElement(float h) {
         (void)h;
 
-        if (forcedElem < 0 && fabsf(genPrevDy) > 0.18f * SEG_LEN) { mode = M_FLAT; remain = 3; levelHold = 3; return; }
+        // Steep-entry guard: only defer element choice on a genuinely steep face (>~24 deg),
+        // and let the deferring FLAT terrain-follow (no levelHold) so it undulates instead of
+        // shelving -- the old 0.18/levelHold=3 pair stamped a dead 42 m step after most drops.
+        if (forcedElem < 0 && fabsf(genPrevDy) > 0.45f * SEG_LEN) { mode = M_FLAT; remain = 2; levelHold = 0; return; }
         SegMode pick = (forcedElem >= 0) ? (SegMode)forcedElem : rollElementPick();
 
         rememberElement(pick);
@@ -1135,10 +1144,16 @@ struct Track {
                     {
                         float vCrest = mega ? 30.0f : 38.0f;
                         float reach  = (genV * genV - vCrest * vCrest) / (2.0f * GRAV) - 10.0f;
-                        // WR-anchored: Kingda Ka's 139 m top hat is the tallest real one; the mega
-                        // hat runs 1.0-1.25x that (big elements cap at 1.25x WR per the size rule).
-                        float want   = mega ? frnd(139.0f, 174.0f) : frnd(90.0f, 139.0f);
-                        climbTop = Clamp(fminf(want, reach), 40.0f, 174.0f);
+                        // WR-anchored to Falcon's Flight (Six Flags Qiddiya, opened Dec 2025):
+                        // official drop ELEMENT 158 m at 90 deg; the famous ~195-200 m figure is
+                        // the cliff-assisted total elevation change. climbTop is our STRUCTURAL
+                        // height above terrain, so it runs 1.0-1.25x the 158 m element record --
+                        // the valley/cliff assist then takes measured crest-to-valley drops to
+                        // ~200-270 m, i.e. 1.0-1.25x the real elevation change, exactly like the
+                        // real ride uses its cliff. Non-mega hats stay near the tallest operating
+                        // top-hat tower (Top Thrill 2, 130 m).
+                        float want   = mega ? frnd(160.0f, 198.0f) : frnd(100.0f, 139.0f);
+                        climbTop = Clamp(fminf(want, reach), 40.0f, 198.0f);
                     }
                     remain = mega ? irnd(11, 14) : irnd(6, 8);   // enough steps to actually reach ~200 m
                 }
@@ -1168,7 +1183,13 @@ struct Track {
                 // top-hat; after that, hand back to element generation even if still a bit elevated
                 // (the descend-when-high check and terrain-follow keep bringing it down).
                 if (h > 16.0f && dropRun < 10) { remain = 2; dropRun++; return; }
-                mode = M_FLAT; remain = irnd(2, 3);
+                // FLUID pacing (user: "undulating, not a staircase"): no dead flat shelf after
+                // every drop. Flow straight into the next element most of the time -- the seam
+                // budgets and exit tapers own the transition now. A short breather still appears
+                // occasionally, and a drop that capped out still elevated hands to the
+                // height-tolerant element families instead of shelf-then-drop-again.
+                if (h > 16.0f || rnd01() < 0.65f) chooseElement(h);
+                else { mode = M_FLAT; remain = irnd(1, 2); }
                 break;
             case M_LOOP:
             case M_ROLL:
@@ -1381,10 +1402,17 @@ struct Track {
                     dy = genPrevDy;     // this step stays neutral; the climb takes over next step
                     break;
                 }
-                dy = ((gtLook + 4.0f) - gpos.y) * 0.55f;
+                // Gentle rolling on the connective track (user: fluid/undulating, no staircase):
+                // a ~245 m-wavelength, ~3.5 m swell folded into the ground-follow target. At ride
+                // speed that reads as a +-0.5..1.3 g roll -- alive like a terrain coaster's
+                // transitions, nowhere near the airtime elements' punch. levelHold (station
+                // approaches, the mid-course brake run) still rides dead flat.
+                rollPh += 0.36f;
+                float undul = (levelHold > 0) ? 0.0f : 3.5f * sinf(rollPh);
+                dy = ((gtLook + 4.0f + undul) - gpos.y) * 0.55f;
                 break;
             }
-            case M_TURN:  dy = ((gt + 5.0f) - gpos.y) * 0.50f; break;   // hug the ground
+            case M_TURN:  dy = ((gt + 5.0f + 2.2f * sinf(rollPh += 0.30f)) - gpos.y) * 0.50f; break;   // hug the ground, with a subtler version of FLAT's swell
             case M_HILLS: {
                 int   i  = hillLen - remain;
                 float t0 = (float)i / hillLen, t1 = (float)(i + 1) / hillLen;

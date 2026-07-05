@@ -21,8 +21,8 @@ MINECOASTER is **arcadey but grounded in realism**. Every quantity is anchored t
 | Dive loop | Steel Curtain 60 m | rMaxRec 28 |
 | Pretzel loop | Tatsu 38 m | rMaxRec 19 |
 | Corkscrew/roll | ~5–6 m radius real | rMaxRec 6, hardcoded 6–10 m ranges |
-| Top hat | Kingda Ka 139 m | mega climbTop frnd(139, 174) |
-| Big drop | Falcon's Flight ~158 m | drop heights emerge from hats + terrain |
+| Drop (tallest) | Falcon's Flight ~200 m (Six Flags Qiddiya) | mega climbTop frnd(200, 250) |
+| Top hat tower | tallest operating towers ~128-139 m (TT2 class) | non-mega climbTop frnd(100, 139) |
 | Airtime hill | tallest real camelbacks ~60 m | hillH frnd(50, 78) |
 | Zero-g stall | RMC (Goliath SFGA etc.) | quartic ballistic crest, self-sized |
 | Helix | Goliath SFMM 4.5 g sustained 6 s | turnMagFor(10.5) → measured ~7.5 sustained |
