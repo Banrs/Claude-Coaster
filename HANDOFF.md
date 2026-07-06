@@ -16,9 +16,47 @@ session — it is CURRENT again) for the full rule table and WR anchors.
 - Headless verification (primary): `--simtest` (stall=0f on ALL seeds is a hard gate; a
   per-seed `^ stall inside ELEM` line prints when violated; `MC_STALLDBG=1` dumps the cp
   neighbourhood), `--gaudit N` (raw + HUD + SUSTAINED + jerk tables), `--profile N`
-  (per-element vDelta/net/clr/hSpan), `--elemsust ELEM SPEED` (isolated element).
+  (per-element vDelta/net/clr/hSpan), `--elemsust ELEM SPEED` (isolated element),
+  `--pacing` (per-mode time shares, transit seconds, flat share, element density).
 - **A next agent should actually run the game** to visually confirm the carve-aware
   terrain culling (tunnel interiors) — everything else is verified headless.
+
+## DONE 2026-07-06 (banked-element cadence, real-typical durations, vulkan physics sync)
+User feedback: bank/tilt elements too often vs real life AND too long (few flat/low-tilt
+sections left); many elements take too long; too many dead-flat powered straights.
+Measured baseline via the NEW `--pacing` tool (per-mode time accounting on the simtest
+loop): banked elements ~4.7/min / 30% of ride time (BANKAIR mean 6.4 s, max 11 s; HILLS
+mean 9.1 s, max 18.8 s), 36 BOOST straights/ride (one every ~14 s).
+- **`--pacing` headless tool added** (main.cpp, after --simtest): per-tag instances/ride,
+  mean/max transit seconds, %time, flat-ish share, element density. Use it for any pacing work.
+- **Banked cadence `bankCool`**: after any banked element (TURN/HELIX/DIVE/SCURVE/BANKAIR/
+  WAVE/STENGEL — `isBankedElem`), the next 2 element slots offer only low-tilt elements.
+  Feel gate in eligibleElem; eligibleSafety ignores it. Plus weights trimmed (TURN 2->1.5,
+  SCURVE 1.8->1.1, DIVE 1.8->1.3, WAVE 1.8->1.0, BANKAIR 1.5->0.9, DIP 1.2->1.6) and the
+  fast-slot pref tamed (0.40+1.20*spd, was 0.12+2.60 -- banked turns were ~half of cruise
+  picks). Result: banked ~3/min / ~17% of time, means 2.2-4.3 s.
+- **Real-typical durations** (key physics: at fixed crest-g, hump transit ∝ sqrt(h), speed
+  cancels -- all-record heights = record-long transits at ANY speed): HILLS 65% 26-42 m /
+  35% 52-78 m (record band always single-hump; doubles only on standard band, 25%);
+  BANKAIR/WAVE single hump; HELIX 1.05-1.45 rev (~4-5.5 s); STALL hang 2-3.5 s (cap 13);
+  ROLL doubles 50%->25%; TURN big 9-13 / small 6-9 cps; DIVE 6-9; SCURVE cap 30;
+  DIVELOOP lead-in 14->9 cps + radius draw 0.78-0.95x cap; MCBR 7-10 cps.
+- **Boost cadence `boostCool`**: a boost holds the next 3 element slots un-powered
+  (survival override genV<58); each boost longer (8-12 cps). 36 -> ~20 boosts/ride,
+  flat-ish 15.9% -> 14.3% with proper discharge arcs.
+- **Vulkan physics sync** (vulkan/src/GameCompat.h + Physics.h): the mirrored constants
+  were BADLY stale (DRAG 0.0011 vs 0.00028, LAUNCH_V 100 vs 108, CLIMB_V 40 vs 27,
+  BOOST_V 79 vs 62, BOOST_TRIG 48 vs 84) -- since the SHARED generator reads these, the
+  Vulkan build generated a different, slower, inversion-starved ride (likely why the user
+  saw no improvement there). Thrust model also synced to the current ride loop (asymptotic
+  LSM launch, 160-punch boost, anti-stall kicker, V_GUARD floor only, NO top cap).
+- Docs: REALISM.md rule table (+transit-time, banked-cadence, re-power rows; sustained
+  now honestly ~1.4-2x -- baseline IMMEL was 4.15 not the documented 5.7); RESEARCH.md
+  durations table rewritten to real-typical + new cadence section.
+- Verified: 8/8 seeds stall=0f; avg 247 km/h, max 356-367; inversions ~11.5/ride on the
+  8.3-min simtest window (~5/lap); gaudit HUD peaks vert <=+10.1 / >=-2.9 / lat 5.1,
+  sustained TURN 5.8 HELIX 6.2 IMMEL 3.97 (baseline 4.15); jerk profile unchanged (the
+  IMMEL-entry seam, open item #4, is pre-existing).
 
 ## DONE 2026-07-04 later pass (roll cuts, real durations, pacing grammar)
 - **Roll-element cull (user: disorienting)**: BANANA + HEARTLINE removed (the zero-g
@@ -99,11 +137,14 @@ session — it is CURRENT again) for the full rule table and WR anchors.
 - STENGEL bank 2.18→1.95 rad + span 0.20 (lat 24.5→~4); STALL/STENGEL entry gates 48/62;
   STENGEL needs ≥30 m dive room; CLIMB_V 22→27; BOOST_TRIG 77→84; boost len 5–8 cps.
 
-## Current measured state (all 8 seeds)
-- stall=0f everywhere; avg ~254 km/h; max 351–367; LAUNCH-HAT drops 130–215 m,
-  crests ≤ ~174 m above base; inversions ~5–6.5/ride.
-- HUD felt-g: vert +4.8..+10.5 max per element, min ≥ −4.1 (BOOST −3.6), lat ≤ 5.8.
-- SUSTAINED: LOOP 6.5, IMMEL 5.7, TURN 5.4, HELIX 7.5, DIVE 4.6 (≈1.7–1.9x real each).
+## Current measured state (all 8 seeds, 2026-07-06)
+- stall=0f everywhere; avg ~247 km/h; max 356–367; LAUNCH-HAT drops 183–268 m;
+  inversions ~11.5 per 8.3-min simtest window (~5/lap).
+- Pacing (`--pacing`): banked elems ~3/min, ~17% of time, means 2.2–4.3 s; HILLS mean
+  5.6 s; flat-ish (FLAT+LAUNCH+BOOST+STN) 14.3%; density ~9.6 elements/min.
+- HUD felt-g: vert ≤ +10.1 max per element, min ≥ −2.9, lat ≤ 5.1.
+- SUSTAINED: TURN 5.8, HELIX 6.2, ROLL 5.0, IMMEL 4.0, DIVELOOP 4.0 (~0.9–1.9x real;
+  duration rule binds before the g multiple on the short-coil elements).
 
 ## OPEN / TENTATIVE
 1. **Visual pass**: carve-aware culling + long parabolic hills + rounded hat crowns are

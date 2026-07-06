@@ -1351,6 +1351,76 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    // PACING AUDIT: per-mode TIME accounting as ridden -- the numbers behind "too much flat"
+    // and "elements take too long". Runs the same physics loop as --simtest over 8 seeds and
+    // reports, per tag: instances/ride, mean/max transit seconds, and % of ride time; plus
+    // the aggregate flat share (FLAT+LAUNCH+BOOST+STATION) and element density (elements/min).
+    if (argc > 1 && TextIsEqual(argv[1], "--pacing")) {
+        const char* NM[] = {"FLAT","CLIMB","DROP","HILLS","TURN","LOOP","ROLL","STN","DIP","LAUNCH","HELIX","BOOST","IMMEL","SCURVE","DIVE","BANKAIR","WAVE","STALL","DIVELOOP","COBRA","WINGOVER","HEARTLINE","PRETZEL","STENGEL","BANANA"};
+        long   tagFrames[M_COUNT] = {0};
+        long   tagInst[M_COUNT]   = {0};
+        double tagInstSec[M_COUNT] = {0};
+        float  tagInstMax[M_COUNT] = {0};
+        long   totFrames = 0;
+        for (uint32_t seed = 1; seed <= 8; seed++) {
+            g_rng = seed * 2654435761u | 1u;
+            Track t; t.reset();
+            float u = 0.5f, v = LAUNCH_V;
+            unsigned char curTag = 255; long curRun = 0;
+            const float dt = 1.0f / 60.0f;
+            for (int f = 0; f < 30000; f++) {
+                t.ensureAhead(u + 16);
+                float slope = t.tangent(u).y;
+                float acc = -GRAV * slope - DRAG * v * v - FRICTION;
+                v += acc * dt;
+                unsigned char tg = t.tagAt(u);
+                if (tg == M_LAUNCH) v += 112.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;
+                else if (tg == M_CLIMB && !t.chainAt(u) && v < CLIMB_V) v = fminf(v + 44.0f * dt, CLIMB_V);
+                if (tg == M_BOOST) v += 160.0f * fmaxf(0.0f, 1.0f - v / 86.0f) * dt;
+                if (v < 30.0f && tg != M_STATION) v += 60.0f * fmaxf(0.0f, 1.0f - v / 34.0f) * dt;   // anti-stall kicker tires -- see the simtest copy
+                if (t.chainAt(u) && slope > 0.05f && v < CHAIN_V) v = fmaxf(v, V_GUARD);
+                v = fmaxf(v, V_GUARD);
+                if (f > 120) {
+                    if (tg < M_COUNT) tagFrames[tg]++;
+                    totFrames++;
+                    if (tg != curTag) {
+                        if (curTag < M_COUNT && curRun > 0) {
+                            tagInst[curTag]++; tagInstSec[curTag] += curRun * dt;
+                            tagInstMax[curTag] = fmaxf(tagInstMax[curTag], curRun * dt);
+                        }
+                        curTag = tg; curRun = 0;
+                    }
+                    curRun++;
+                }
+                float du = v * dt / fmaxf(t.speedScale(u), 0.5f);
+                if (!(du == du)) du = 0;
+                u += fminf(du, 1.5f);
+                while (u > 8.0f && (int)t.cp.size() > 12) { t.popFront(); u -= 1.0f; }
+            }
+            if (curTag < M_COUNT && curRun > 0) {
+                tagInst[curTag]++; tagInstSec[curTag] += curRun * dt;
+                tagInstMax[curTag] = fmaxf(tagInstMax[curTag], curRun * dt);
+            }
+        }
+        double totSec = totFrames / 60.0;
+        printf("[pacing] 8 seeds, %.0f s ridden total (%.1f s/seed)\n", totSec, totSec / 8.0);
+        printf("  %-9s %8s %8s %8s %8s\n", "elem", "inst/rd", "mean s", "max s", "%time");
+        long elemInst = 0;
+        for (int m = 0; m < M_COUNT; m++) {
+            if (!tagFrames[m]) continue;
+            bool isElem = !(m == M_FLAT || m == M_CLIMB || m == M_DROP || m == M_LAUNCH ||
+                            m == M_BOOST || m == M_STATION);
+            if (isElem) elemInst += tagInst[m];
+            printf("  %-9s %8.1f %8.1f %8.1f %7.1f%%\n", NM[m], tagInst[m] / 8.0,
+                   tagInst[m] ? tagInstSec[m] / tagInst[m] : 0.0, tagInstMax[m],
+                   100.0 * tagFrames[m] / totFrames);
+        }
+        long flatF = tagFrames[M_FLAT] + tagFrames[M_LAUNCH] + tagFrames[M_BOOST] + tagFrames[M_STATION];
+        printf("  --- flat-ish (FLAT+LAUNCH+BOOST+STN): %.1f%% of time | elements: %.1f/ride, density %.1f/min ---\n",
+               100.0 * flatF / totFrames, elemInst / 8.0, elemInst / (totSec / 60.0));
+        return 0;
+    }
+
     if (argc > 2 && TextIsEqual(argv[1], "--exporttrack")) {
         if (argc > 3) g_rng = (uint32_t)atoi(argv[3]) * 2654435761u | 1u;
         if (argc > 4) DRAG       = (float)atof(argv[4]);

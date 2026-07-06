@@ -35,7 +35,7 @@ struct RideSim {
     //   acc   = -GRAV*slope - DRAG*v*v - FRICTION
     //   v    += acc*dt
     //   then per-segment launch / climb / boost / chain-lift adjustments,
-    //   a small uphill assist, clamp v to [20,100], and advance u by
+    //   the anti-stall kicker, a numeric-only speed floor (no cap), and advance u by
     //   du = v*dt / max(speedScale(u),0.5) (capped at 1.5).
     // Sub-stepped at a fixed 1/240 s for stability (game runs ~1/60).
     void advance(const ::Track& trk, float dt) {
@@ -107,10 +107,15 @@ private:
         float acc = -GRAV * slope - DRAG * v * v - FRICTION;
         v += acc * dt;
 
+        // Thrust model mirrors the OpenGL ride loop (opengl/src/main.cpp ~2393-2410; keep in
+        // sync BY HAND like its four internal copies): punchy asymptotic LSM launch (no clamp),
+        // tag-gated climb assist, Do-Dodonpa-class boost, and the anti-stall kicker tires that
+        // replace the old ad-hoc uphill assist. No top speed cap -- speed is drag-limited.
         unsigned char tg = trk.tagAt(u);
-        if      (tg == M_LAUNCH && v < LAUNCH_V) v = fminf(v + 85.0f * dt, LAUNCH_V);
+        if      (tg == M_LAUNCH) v += 112.0f * fmaxf(0.0f, 1.0f - v / LAUNCH_V) * dt;
         else if (tg == M_CLIMB && !trk.chainAt(u) && v < CLIMB_V) v = fminf(v + 44.0f * dt, CLIMB_V);
-        if (tg == M_BOOST && v < BOOST_V) v = fminf(v + 55.0f * dt, BOOST_V);
+        if (tg == M_BOOST) v += 160.0f * fmaxf(0.0f, 1.0f - v / 86.0f) * dt;
+        if (v < 30.0f && tg != M_STATION) v += 60.0f * fmaxf(0.0f, 1.0f - v / 34.0f) * dt;   // anti-stall kicker tires
 
         // chain lift: pull up the hill toward CHAIN_V (27 on steep lifts)
         bool onLift = trk.chainAt(u);
@@ -119,14 +124,9 @@ private:
             if (v < liftV) v = fminf(v + 20.0f * dt, liftV);
         }
 
-        // small uphill assist on plain track so the train never stalls
-        if (slope > 0.06f && tg != M_LAUNCH && tg != M_BOOST && tg != M_CLIMB && !onLift && v < 36.0f)
-            v = fminf(v + 28.0f * dt, 36.0f);
-
-        // global clamp (matches main.cpp; MIN_V/MAX_V live in GameCompat.h but the
-        // game pins to 20/100 here — keep the game's literals for fidelity)
-        v = fmaxf(v, 20.0f);
-        v = fminf(v, 100.0f);
+        // No speed floor or cap beyond this: fully physics-driven; only a numeric
+        // floor keeps du/dt finite (mirrors main.cpp's V_GUARD).
+        v = fmaxf(v, 6.0f);
 
         float du = v * dt / fmaxf(trk.speedScale(u), 0.5f);
         if (!(du == du)) du = 0.0f;

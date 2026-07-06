@@ -82,4 +82,5 @@ opengl/minecoaster
 ```sh
 opengl/minecoaster --simtest     # ride 8 seeds, report avg speed / inversions / stalls
 opengl/minecoaster --gaudit      # audit per-element felt-g against the envelope
+opengl/minecoaster --pacing      # per-element time shares / transit seconds / flat share / density
 ```

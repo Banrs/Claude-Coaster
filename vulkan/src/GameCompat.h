@@ -65,22 +65,23 @@ static inline Vector3 catmull(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, fl
     return vlerp(B1,B2,(tt-t1)/(t2-t1));
 }
 
-// ---- physics / sizing constants (mirror ../../src/main.cpp top) ----
+// ---- physics / sizing constants (mirror ../../opengl/src/main.cpp top -- keep in sync BY HAND;
+// the shared coaster_track.cpp generator reads LAUNCH_V/CLIMB_V/BOOST_TRIG, so stale values here
+// build a DIFFERENT ride than the OpenGL game, not just a differently-tuned one) ----
 static const float SEG_LEN  = 14.0f;
 static const float BUILD_MAX = 430.0f;
 static const float GRAV     = 9.81f;
-static float       DRAG     = 0.0011f;
-static const float FRICTION = 0.016f;
+static float       DRAG     = 0.00028f;  // realistic aero drag: ~1.8 m/s^2 at 80 m/s (a ~10t train, ~5 m^2, Cd~0.7)
+static const float FRICTION = 0.015f;    // steel-on-steel rolling resistance
 static const float CHAIN_V  = 22.0f;
 static const float MIN_V    = 42.0f;
 static const float MAX_V    = 82.0f;
-static const float LAUNCH_V = 100.0f;
-static const float CLIMB_V  = 40.0f;
-static float       BOOST_V  = 79.0f;
-// Mirrors opengl/src/main.cpp's BOOST_TRIG=48.0f (verified there via --gaudit sweep): 78 sat
-// above every hard-inversion speed gate in the shared coaster_track.cpp, so LOOP/ROLL/IMMEL/
-// DIVELOOP/COBRA/PRETZEL/HEARTLINE were structurally unreachable on this build too.
-static float       BOOST_TRIG = 48.0f;
+static const float LAUNCH_V = 108.0f;  // asymptote ~389 km/h; drag-limited TOP speed ~350 km/h by physics (no cap)
+static const float CLIMB_V  = 27.0f;   // crest speed off a lift/top-hat (~97 km/h): the drop supplies the speed, not the lift
+static float       BOOST_V  = 62.0f;
+// Ambient re-power threshold (below ~302 km/h the generator considers itself run down); the slow
+// windows under it are where the entry-gated inversions live -- see nextMode in coaster_track.cpp.
+static float       BOOST_TRIG = 84.0f;
 static const Vector3 WUP = { 0, 1, 0 };
 
 // ---- RNG (mirror ../../src/main.cpp) ----

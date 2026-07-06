@@ -51,7 +51,7 @@ and peaks **≤4x real** (curvature/jerk budgets). Knob locations are listed per
 - **Kondaa**, Walibi Belgium, 2021, Intamin: 50 m tall, 113 km/h, **15 airtime moments** (steel record) [official].
 - **Zadra**, Energylandia, 2019, RMC: 62.8 m, 121 km/h [official]; RMC ejector ≈ −1 to −1.5 g vs B&M floater 0 to −0.7 [est]. Strongest ejector cited: El Toro "Rolling Thunder" ~−2.2 g, Skyrush ~−2 g [est, untracked officially].
 - Crest-to-crest spacing: unpublished; derived by the crest-g formula the game uses (`hillLenFor`: κ=(1−g_c)·G/v_c², L≈2π√(h/2κ)) — reproduces Mako's ~60 m hills at ~30 m/s crest with −0.5 g.
-- Code: `hillH frnd(50,78)` vs tallest real camelbacks (Falcon's Flight's 163 m first camelback is structure, not a mid-ride hill; mid-ride record class ~34–60 m); crest target −3.2 felt ≈ 2x RMC ejector; hills only offered where ≥36 m is affordable (else the label lies).
+- Code: `hillH` 65% frnd(26,42) standard / 35% frnd(52,78) record-class single humps (vs tallest real camelbacks ~60 m; Falcon's Flight's 163 m first camelback is structure, not a mid-ride hill; typical big-coaster humps are 20–40 m); crest target −3.2 felt ≈ 2x RMC ejector; hills only offered where ≥36 m is affordable (else the label lies). At fixed crest-g, hump transit ∝ √h — the height mix is what keeps hills at real transit times.
 
 ### Stengel dive
 - **Goliath**, Walibi Holland, 2002, Intamin (the original): camelback crest rolling **121° overbanked at the apex** into a 270° descending helix; 46.2 m, 107 km/h [official/wiki].
@@ -67,7 +67,7 @@ and peaks **≤4x real** (curvature/jerk budgets). Knob locations are listed per
 ### Helix
 - **Goliath**, Six Flags Magic Mountain, 2000, Giovanola: **585° descending helix, >4.5 g sustained ~6 s** [official/press] — the definitive sustained-g anchor.
 - **Mindbender**, Galaxyland, 1985, Schwarzkopf (closed 2023): 5.5–5.6 g measured 1987 (in the loop) [measured].
-- Code: `initHelix` coils 1.3–1.8 rev (≈470–650°, ~6–8 s) — was 2–3 rev/11–13 s, cut per user; sustained measured ~7.5 felt ≈ 1.7x Goliath; once-per-lap cap (a helix is a finale, not a recurring element).
+- Code: `initHelix` coils 1.05–1.45 rev (≈380–520°, ~4–5.5 s) — cut twice per user (2–3 rev/11–13 s → 1.3–1.8/6–8 s → current; the record footprint still read as a wall of 80° lean); sustained measured ~6.2 felt ≈ 1.4x Goliath (duration rule binds before the g multiple here); once-per-lap cap (a helix is a finale, not a recurring element).
 
 ### Top hat towers
 - **Top Thrill 2** (above): 130 m, launches to 190 km/h; legacy Dragster 0–190 in 3.8 s ≈ 1.4 g [official].
@@ -90,23 +90,44 @@ and peaks **≤4x real** (curvature/jerk budgets). Knob locations are listed per
 - Code: the g-budget engine (directional curvature limits + ~30 g/s jerk budget = 2x guideline) approximates FVD; connective FLAT/TURN track carries a ~245 m-wavelength ±1 g swell; drops flow directly into elements (no dead shelf); powered flats taper in like a real LSM entry instead of snapping level.
 
 
-## Section durations — matched toward the longer / WR side
+## Section durations — matched to REAL-TYPICAL transits (revised 2026-07-06)
 
-Real transit times per element/section, and where the game sits (deliberately at or a
-little past the record end, per design). Game figures at typical ride speeds.
+An earlier pass matched every duration "toward the WR side" — every hill at record height,
+the helix at the record's 585°, the stall at the record 4.5 s hang. Physics note: at a fixed
+crest-g target a hump's transit is nearly speed-INDEPENDENT (L = 2π·√(h/2κ), κ ∝ 1/v²,
+t ≈ L/v ∝ √h), so all-record-height elements take record-long times no matter how fast the
+ride is — measured 9.1 s per HILLS instance, an 8 s helix, 6+ s banked hills (user: "elements
+take too long", "tilt too long"). Durations now sit at the transit multiple the size/speed
+rules actually imply (~1.25x size at ~2x speed → ~0.6–1x REAL-TYPICAL time), with the
+record-scale piece appearing as the occasional signature, exactly like a real layout.
 
-| Section | Real-world (WR side) | In-game | Knob |
+| Section | Real-world | In-game (measured via `--pacing`) | Knob |
 |---|---|---|---|
 | Full circuit (station to station) | Falcon's Flight **3:25–3:35** over 4,250 m [official]; The Beast **4:10** (all-time longest) [official] | ~3.5–4 min (station trigger 205 s + wait for a low flat spot) | `sinceStation > 205` (main.cpp) |
 | Main launch | Formula Rossa **4.9 s / ~163 m** [official]; Red Force **5.0 s** [official]; TT2 3.8 s [official] | ~3–4 s / 126–168 m from a rolling start | `startLaunch remain irnd(9,12)` |
-| Mid-course LSM boost | Maverick 122 m [official], Taron second launch 118 m [official]; Falcon's Flight runs 3 long segments incl. an inclined lift [official] | ~1.5–2.5 s / 84–140 m, ~45% inclined +4–8° | `startBoost remain irnd(6,10)`, `boostGrade` |
-| Mid-course brake run | typical transit ~3–6 s | ~2–3 s / 126–196 m, dead flat (real MCBRs are) | mcbr `remain irnd(9,14)` |
+| Mid-course LSM boost | Maverick 122 m [official], Taron second launch 118 m [official]; Falcon's Flight runs 3 long segments [official] | ~2–3 s / 112–168 m, ~45% inclined +4–8°; **fewer but longer**: `boostCool` holds the next 3 element slots un-powered (real rides have 1–3 boosts, not one every 14 s) | `startBoost remain irnd(8,12)`, `boostCool` |
+| Mid-course brake run | typical transit ~3–6 s | ~1.5–2 s / 98–140 m, dead flat, once per lap | mcbr `remain irnd(7,10)` |
 | Top hat (climb–crest–drop) | TT2/Kingda Ka tower transit ~8–12 s [est from POV] | ~10–15 s (160–198 m structure) | physics-driven |
-| Airtime hill (per hump) | Fury 325's 34 m hill ~2 s at 150 km/h [derived]; record-class 50–60 m humps ~2.5–3 s | ~4–6 s per hump (1.25x-record heights at 2x speed stretch the arc) — the "longer side" by design | `hillLenFor` crest-g sizing |
-| Vertical loop transit | Full Throttle ~3–5 s [est from POV] | ~4–6 s (1.25–1.45x-record size) | `stepLoop lsteps` |
-| Zero-g stall hang | Wildfire ~2–2.5 s, **ArieForce One ~4.5 s (record)** [est/press] | **2.5–4.5 s** (capped at the record) | `initStall stallLen ≤16` |
-| Helix | **Goliath SFMM 585° held ~6 s (record)** [official/press] | ~6–8 s, 470–650°, once per lap | `initHelix coils 1.3–1.8` |
+| Airtime hill (per hump) | typical big-coaster humps 20–40 m, ~2–3 s (Fury 325's 34 m hill ~2 s at 150 km/h [derived]); record camelbacks ~60 m | 65% standard 26–42 m (~3–4.5 s), 35% record-class 52–78 m single humps (~5–6 s); doubles only on the standard band | `initHills` height mix, `hillLenFor` |
+| Banked turn / S-curve / dive turn | hard turns transit ~2–3 s | ~2–3.5 s means; ≤1 banked element per 3 slots (`bankCool`) | `initTurn/initSCurve/initDive remain`, `bankCool` |
+| Banked airtime (wave / bankair) | one crest (Steel Vengeance's 35 m wave turn) | single hump, ~3.5–4.5 s (was 2-bump, 6–11 s) | `initBankAir/initWave hillBumps=1` |
+| Vertical loop transit | Full Throttle ~3–5 s [est from POV] | ~4 s | `stepLoop lsteps` |
+| Dive loop transit | Valravn class ~4–5 s | ~6 s (lead-in cut 14→9 cps, radius drawn 0.78–0.95x cap) | `initDiveLoop dlLeadSteps/dlR` |
+| Zero-g stall hang | **Wildfire ~2–2.5 s (typical)**; ArieForce One ~4.5 s (record) [est/press] | **~2–3.5 s** (typical, not the record) | `initStall stallLen ≤13` |
+| Helix | typical helices 300–450°; **Goliath SFMM 585° held ~6 s (record)** [official/press] | ~4–5.5 s, 380–520°, once per lap | `initHelix coils 1.05–1.45` |
+| Corkscrew / inline roll | single rotation typical; doubles are signatures | ~75% single, ~25% double | `initRoll` |
 | Inversion cluster / arc | real launch coasters run 1–3 energy arcs per circuit | ~2.5 arcs/lap, signatures at each arc's bleed end | `pickFromPool arcT` |
+
+### Banked-element cadence (added 2026-07-06)
+Real layouts alternate lateral and vertical force events — a hard banked turn is followed by
+a hill/drop/straight pop, not by another banked shape from a different family. The generator
+now enforces that: after any banked-up-vector element (TURN/HELIX/DIVE/SCURVE/BANKAIR/WAVE/
+STENGEL), the next **2** element slots only offer low-tilt elements (`bankCool` in
+`coaster_track.cpp`, a feel gate `eligibleSafety` ignores). Combined with trimmed rarity
+weights and a tamed fast-slot preference (0.40+1.20·spd, was 0.12+2.60 — banked turns were
+~half of all cruise picks), banked elements fell from **~4.7/min, 30% of ride time** (means
+up to 6.4 s, max 11 s) to **~3/min, ~17% of time** (means 2.2–4.3 s) — vs ~1–2/min on real
+rides, i.e. the same ~1.5–2x multiple the speed/size rules use.
 
 ## Known gaps (genuinely unpublished — not research shortfalls)
 - Turn/helix/crest radii: never published by manufacturers; back-solved from speed+g.

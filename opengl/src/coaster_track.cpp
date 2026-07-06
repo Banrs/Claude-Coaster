@@ -40,6 +40,8 @@ struct Track {
     int     seamEaseN = 0;
     int     seamEaseTot = 0;
     int     invSlotUsed = 0;   // slow-window pacing: how many inversions the current run-down window has taken; capped at 2 before the window must go to a re-power BOOST (reset there) so inversions and speed alternate instead of inversion chains starving the boosts
+    int     bankCool = 0;   // BANKED-ELEMENT CADENCE (user: bank/tilt elements too often + too long vs real): after any banked-up-vector element, the next 2 element slots must be low-tilt (straight hills/dips/drops/inversions), matching how real layouts alternate lateral and vertical force events instead of chaining banked shapes back-to-back across families. Decremented per non-banked pick in rememberElement; feel rule only -- eligibleSafety ignores it.
+    int     boostCool = 0;   // RE-POWER CADENCE (user: too many dead-flat sections): a real coaster has 1-3 mid-course boosts, not one every ~14 s -- after a BOOST, skip re-powering for the next few element slots so the ride runs proper discharge arcs (long bleed, then one big recharge) instead of constant flat interruptions. Survival override at genV<58 in nextMode keeps forced climbs alive.
     int     levelHold = 0;
     float   rollPh = 0.0f;   // phase of the gentle connective-track swell (M_FLAT/M_TURN undulation)
     int     queuedInv = 0;
@@ -139,6 +141,7 @@ struct Track {
         startPos = gpos; startYaw = gyaw;
         mode = M_FLAT; remain = 3; turnDir = 1; turnMag = 0.4f; mega = false; elems = 0;
         elemLimit = irnd(17, 24); queuedInv = 0; launchElem = M_CLIMB; mcbrDone = false;   // ~28% fewer elements per lap (see startLaunch): the WR-sized elements each run much longer track
+        bankCool = 0; boostCool = 0;
         lastElem = M_FLAT; prevElem = M_FLAT; helixDrop = -3.4f; genV = LAUNCH_V;
         genPrevDy = 0; genPrevCurv = 0; genPrevDyaw = 0; genFloorY = -1e9f; genFloorVy = 0;
         setClearance(10.0f, 24.0f);
@@ -194,7 +197,9 @@ struct Track {
         // ROLL is invRFor-independent (its own hardcoded radius family), so gT doesn't touch it --
         // these ranges and GCAP below are the actual sizing levers.
         int turns; float stretch;
-        switch (irnd(0, 3)) {
+        // Doubles down-weighted 50% -> ~25% (user: roll tilt too long): most real corkscrews are a
+        // single rotation; the double inline twist is the occasional signature, not a coin flip.
+        switch (rnd01() < 0.25f ? irnd(2, 3) : irnd(0, 1)) {
             case 0: turns = 1; rR = frnd(6.0f,  7.7f);  stretch = frnd(0.45f, 0.65f); break;
             case 1: turns = 1; rR = frnd(8.1f, 10.2f);  stretch = frnd(1.00f, 1.40f); break;
             // turns capped at 2: real inline-twist trains top out around a double roll.
@@ -248,9 +253,10 @@ struct Track {
         h         = fminf(h, maxClearH());
         float vc2 = fmaxf(genV * genV - 2.0f * GRAV * h, 100.0f);
         float L   = 4.0f * sqrtf(h * vc2 / GRAV) * 1.15f;   // +15% span: apex designed at ~+0.25 g (floater) instead of exact 0 -- the real train rides the crest a bit hotter than the genV design speed, and a true-ballistic apex then swung deep negative
-        // Span capped so the inverted hang stays at real record scale (~2.5-4.5 s; ArieForce
-        // One's ~4.5 s is the longest real stall) -- the 34-cp cap hung riders 7-10 s.
-        stallLen  = Clamp((int)(L / SEG_LEN + 0.5f), 8, 16);
+        // Span capped so the inverted hang sits at the TYPICAL real stall (~2-3.5 s, Wildfire
+        // class) rather than pinned at ArieForce One's record 4.5 s -- durations run at the
+        // real-typical multiple now, not the WR side (user: elements take too long).
+        stallLen  = Clamp((int)(L / SEG_LEN + 0.5f), 8, 13);
         float Lf  = stallLen * SEG_LEN;
         stallH    = fminf(GRAV * Lf * Lf / (16.0f * vc2 * 1.32f), maxClearH());   // 1.32 = 1.15^2 keeps the height consistent with the widened span
         stallEntryY = gpos.y;
@@ -271,7 +277,7 @@ struct Track {
         // uses an S-curve (smoothstep) vertical profile that is LEVEL at both ends (zero slope
         // entering AND leaving), matching whatever came before at the start and the loop's own
         // flat-bottom tangent at the end, so there's no discontinuity to spike curvature on.
-        dlLeadSteps = 14;
+        dlLeadSteps = 9;   // was 14 (~2 s of straight plunge before the loop even starts -- the 7.4 s mean transit's main fat); a real dive loop's dive is short and immediate
         float wantDrop = 10.0f;   // total lead-in drop
         auto smooth = [](float t) { return t * t * (3.0f - 2.0f * t); };
         float maxTotalDrop = wantDrop;
@@ -289,7 +295,7 @@ struct Track {
         // from energy conservation (ignoring drag slightly overestimates the gain, erring toward
         // a bigger, safer loop) and size the loop from THAT.
         float vAfterDive = sqrtf(genV * genV + 2.0f * GRAV * dlLeadDrop);
-        { dlR = invRAt(M_DIVELOOP, vAfterDive); dlR *= frnd(0.85f, 1.0f); }
+        { dlR = invRAt(M_DIVELOOP, vAfterDive); dlR *= frnd(0.78f, 0.95f); }   // drawn a shade smaller: full-cap loops transited ~6.3 s vs Valravn's ~4-5 s (user: elements too long); still >= the rMin floor via invRAt's clamp
 
         Vector3 leadEnd = { gpos.x + dlf.x * SEG_LEN * dlLeadSteps,
                              gpos.y - dlLeadDrop,
@@ -471,7 +477,8 @@ struct Track {
     void startBoost() {
         chainMode = false; mode = M_BOOST;
         invSlotUsed = 0;   // re-powered: the next run-down window may go to inversions again
-        remain = irnd(6, 10);   // ~84-140 m, ~1.5-2.5 s: the long end of real mid-course LSM segments (Maverick 122 m, Taron's 118 m second launch; Falcon's Flight runs three long ones) -- durations matched toward the WR side
+        boostCool = 3;   // no re-power for the next 3 element slots (see nextMode): the ride runs a real discharge arc between boosts instead of a dead-flat straight every ~14 s (measured 36 boosts/ride -> ~1/2 of that; real coasters have 1-3 mid-course boosts total)
+        remain = irnd(8, 12);   // ~112-168 m, ~2-3 s: FEWER but LONGER powered segments (Falcon's Flight's three long LSM stretches), recharging enough per boost that the cooldown doesn't sag the ride average
         // INCLINED LSM (~45% of boosts): grade follows the terrain rise over the boost's own
         // footprint (clamped +4-8 deg). No thrust-model change is needed anywhere: both the ride
         // sim and genV integrate the real geometry, so the climb's energy cost stays consistent
@@ -651,12 +658,19 @@ struct Track {
     void initHills() {
         mode = M_HILLS;
         setClearance(7.0f, 38.0f);
-        hillBumps = irnd(1, 2);
-        // 0.85-1.3x the ~60 m tallest real camelbacks (user spec: big elements cap near 1.25x WR),
-        // and never taller than the ballistic budget the entry speed can actually crest.
-        hillH     = frnd(50.0f, 78.0f);
+        // HEIGHT MIX (user: elements take too long). At a fixed crest-g target the hump's transit
+        // time is ~independent of speed and scales with sqrt(h) (L = 2*pi*sqrt(h/2k), k ~ 1/v^2,
+        // t ~ L/v ~ sqrt(h)) -- so a ride whose EVERY hill is 50-78 m spends 5-6 s per hump no
+        // matter how fast it goes (measured mean 9.1 s/instance with 2-bump draws; real camelbacks
+        // transit in ~2.5-3 s). Real layouts are mostly ordinary 20-40 m humps with the occasional
+        // record piece, so draw from that shape: ~65% standard 32-48 m (~3.5-4.5 s), ~35% the
+        // record-class 52-78 m signature (0.85-1.3x the ~60 m WR camelback, per the size spec).
+        hillH     = (rnd01() < 0.65f) ? frnd(26.0f, 42.0f) : frnd(52.0f, 78.0f);
         hillH     = fminf(hillH, maxClearH(34.0f) - hillRiseAhead());
-        hillH     = fmaxf(hillH, 36.0f);   // the eligibleElem gate guarantees >=36 is affordable here
+        hillH     = fmaxf(hillH, 24.0f);   // the eligibleElem gate guarantees >=36 is affordable, so this floor only catches the budget shave; a 24 m hump at crest -3.2 still runs a ~20 deg face (Mako speed-hill class), not a ramp
+        // Double humps only on the standard band (a 2-bump record-height instance ran 18+ s);
+        // record-class hills are a single signature camelback.
+        hillBumps = (hillH < 50.0f && rnd01() < 0.25f) ? 2 : 1;
         // Crest target -3.0 felt: 2x a real RMC ejector (-1.5); the trough side of the same
         // curvature lands ~+6-7 felt at entry speed (~2x a real pullout).
         hillLen   = hillLenFor(hillH, -3.2f);
@@ -686,8 +700,10 @@ struct Track {
         bankBase = 1.0f;   // hard turn: full heartline, all lateral load into the seat
         // Sustained targets at ~1.75-2x the real-world sustained turns (~3-4 g): user spec, and
         // longer plateaus so the interior arc-average actually reaches them.
-        if (big) { turnMag = turnMagFor(8.0f, 0.015f, 0.60f); bankT = 0.0f; remain = irnd(10, 16); }
-        else     { turnMag = turnMagFor(5.0f, 0.012f, 0.45f); bankT = 0.0f; remain = irnd(7, 11);  }
+        // Lengths trimmed a notch (16-cp big turns held the lean ~4-5 s; a real hard turn transits
+        // ~2-3 s): still long enough for a sustained plateau, no longer a quarter-lap of lean.
+        if (big) { turnMag = turnMagFor(8.0f, 0.015f, 0.60f); bankT = 0.0f; remain = irnd(9, 13); }
+        else     { turnMag = turnMagFor(5.0f, 0.012f, 0.45f); bankT = 0.0f; remain = irnd(6, 9);  }
     }
     void initHelix() {
         mode = M_HELIX;
@@ -721,10 +737,12 @@ struct Track {
         // gentle fixed pitch bounded by the height actually available so it never dives underground.
         // A helix that starts low simply descends less (a ground-level coil); one that starts high
         // descends more -- either way it is a proper multi-rotation spiral, not a flat float.
-        // Real-record scale: Goliath SFMM's famous helix is 585 deg (~1.6 rev) held ~6 s. The
-        // old 2-3 full coils ran 830-1080 deg for 11-13 s of sustained 80+ deg bank -- the
-        // "very very timey" disorienting version (user). ~1.3-1.8 revs is the record's footprint.
-        float coils       = frnd(1.3f, 1.8f);
+        // Real-record scale: Goliath SFMM's famous helix is 585 deg (~1.6 rev) held ~6 s -- and
+        // that is the RECORD, not the typical helix. At the game's ~2x entry speeds the transit
+        // multiple the size/speed spec implies is ~0.6-0.8x real, so coil under the record
+        // (~380-520 deg, ~4-5.5 s of held bank) rather than at it: the old 1.3-1.8 rev matched
+        // the record's footprint and read as an 8 s wall of 80 deg lean (user: tilt too long).
+        float coils       = frnd(1.05f, 1.45f);
         remain    = Clamp((int)(coils * stepsPerRev + 0.5f), 12, 44);
         float descPerRev  = Clamp(0.6f * R, 10.0f, 20.0f);            // gentle real-helix pitch
         float totalDesc   = fminf(descPerRev * coils, usable);        // never descend past the ground band
@@ -749,7 +767,7 @@ struct Track {
         float plat = fminf(turnMag, 0.46f);
         int   reversal = (int)ceilf(2.0f * plat / fmaxf(jl, 1e-4f));
         int   halfLen  = reversal + irnd(3, 5);
-        scurveLen  = Clamp(2 * halfLen, 10, 40);
+        scurveLen  = Clamp(2 * halfLen, 10, 30);   // cap trimmed 40->30: the long draws swept side-to-side for 4.5 s (a real S transits ~2-3 s)
         scurveHalf = reversal / 2;
         remain     = scurveLen;
     }
@@ -760,12 +778,12 @@ struct Track {
         turnMag = turnMagFor(6.5f, 0.018f, 0.58f);   // gT ~= 2.4x the real diving-turn sustained (~2.5-2.75 g): lands the measured interior avg ~2x after slew/ramp dilution
         bankT   = 0.05f;   // a whisper of over-bank for the diving lean; the sub-vertical clamp keeps it upright
         bankBase = 1.0f;   // full heartline base
-        remain  = irnd(7, 11);   // long enough that the diving turn holds its plateau instead of averaging down over an all-ramp element
+        remain  = irnd(6, 9);   // long enough that the diving turn holds its plateau instead of averaging down over an all-ramp element, short enough that the lean doesn't outstay a real diving turn's ~2 s
     }
     void initBankAir() {
         mode = M_BANKAIR;
         setClearance(12.0f, 52.0f);
-        hillBumps = irnd(1, 2);
+        hillBumps = 1;   // single banked hump (~3 s): the 2-bump draws held the lean 6-11 s (user: tilt too long); a real RMC wave/banked hill is one crest, not a chain
         hillH     = frnd(22.0f, 38.0f) + (clearanceBase > 38.0f ? frnd(8.0f, 20.0f) : 0.0f);
         hillH     = fminf(hillH, maxAirH() - hillRiseAhead());
         hillH     = fmaxf(hillH, 20.0f);   // the eligibleElem gate guarantees >=20 is affordable here
@@ -781,7 +799,7 @@ struct Track {
     void initWave() {
         mode = M_WAVE;
         setClearance(7.0f, 38.0f);
-        hillBumps = irnd(1, 2);
+        hillBumps = 1;   // single crest, same reasoning as initBankAir (Steel Vengeance's wave turn is ONE 35 m outward-banked hill)
         hillH     = frnd(20.0f, 32.0f) + (clearanceBase > 30.0f ? frnd(6.0f, 16.0f) : 0.0f);
         hillH     = fminf(hillH, maxAirH() - hillRiseAhead());
         hillH     = fmaxf(hillH, 20.0f);   // the eligibleElem gate guarantees >=20 is affordable here
@@ -845,10 +863,23 @@ struct Track {
         lastUsedAt[m] = ++elemSeq;
         if (m == M_HELIX)    helixLap = true;
         if (m == M_WINGOVER) wingLap  = true;
+        // Banked cadence: a banked pick arms the cooldown; each low-tilt pick walks it down.
+        // 2 = two straight/low-tilt elements between banked ones -> banked <= 1/3 of picks
+        // (measured ~2/min vs the old ~4.7/min; real coasters run ~1-2 banked turns/min).
+        bankCool = isBankedElem(m) ? 2 : (bankCool > 0 ? bankCool - 1 : 0);
+        if (boostCool > 0) boostCool--;
         elems++;
     }
     static bool isHardInversion(SegMode m) {
         return m == M_LOOP || m == M_ROLL || m == M_IMMEL || m == M_DIVELOOP || m == M_COBRA || m == M_PRETZEL || m == M_HEARTLINE;
+    }
+    // The elements that hold a big banked/tilted up-vector for their whole span (the heartline
+    // turns plus the overbanked STENGEL crest). Inversions are NOT in here: they're brief
+    // over-and-done rotations, not a sustained lean -- the user's "disorienting tilt" is the
+    // long banked stretches, and this set is what the bankCool cadence rule gates.
+    static bool isBankedElem(SegMode m) {
+        return m == M_TURN || m == M_HELIX || m == M_DIVE || m == M_SCURVE ||
+               m == M_BANKAIR || m == M_WAVE || m == M_WINGOVER || m == M_STENGEL;
     }
     // Real rolls/dives sit at modest height (rarely much past ~50m even on record-sized
     // coasters) -- height comes from hills/drops/launch towers, not from the trick
@@ -946,6 +977,11 @@ struct Track {
         // a wingover a signature trick -- not every-third-element recurring turns.
         if (m == M_HELIX    && helixLap) return false;
         if (m == M_WINGOVER && wingLap)  return false;
+        // Banked cadence (user: banked/tilt elements too often and too long -- few flat/low-tilt
+        // sections left): while the cooldown is armed, banked elements aren't OFFERED, so every
+        // banked stretch is followed by genuinely low-tilt track. Feel rule, not a physics gate --
+        // eligibleSafety deliberately skips it.
+        if (bankCool > 0 && isBankedElem(m)) return false;
         float clr = gpos.y - groundTopAt(gpos.x, gpos.z);
         float trickMax = maxTrickHeight(m);
         if (trickMax > 0.0f && clr > trickMax) return false;
@@ -1035,13 +1071,16 @@ struct Track {
     // than a common element does, rather than showing up on the same cadence.
     static float elemRarityWeight(SegMode m) {
         switch (m) {
+            // Banked-element weights trimmed across the board (user: bank/tilt too often vs real
+            // life): the bankCool cadence rule bounds them structurally, these keep them from
+            // saturating every slot the cooldown does allow. Low-tilt filler (DIP) back up a notch.
             case M_HILLS:     return 13.0f;   // the single most common real coaster element (airtime hills) -- raised so it stays the top pick even where the terrain-affordability gate blocks slots
-            case M_TURN:      return 2.0f;
-            case M_DIP:       return 1.2f;   // trimmed with the airtime speed-pref floor raise; DIP is also a family-4 monopoly (never variety-blocked), so at 1.8 it still topped the pick table at ~2.9/lap
-            case M_SCURVE:    return 1.8f;   // s-curves/waves are the common connective thrills on real launch coasters
-            case M_DIVE:      return 1.8f;
-            case M_WAVE:      return 1.8f;
-            case M_BANKAIR:   return 1.5f;
+            case M_TURN:      return 1.5f;
+            case M_DIP:       return 1.6f;   // low-tilt ground-hug filler -- the "breather" element between banked/inverting tricks
+            case M_SCURVE:    return 1.1f;
+            case M_DIVE:      return 1.3f;
+            case M_WAVE:      return 1.0f;
+            case M_BANKAIR:   return 0.9f;
             case M_WINGOVER:  return 0.0f;   // removed per user (overbanked roll overload)
             case M_STALL:     return 1.8f;   // the ONE inverting-crest roll kept (RMC signature)
             case M_BANANA:    return 0.0f;   // removed per user (near-duplicate of the stall)
@@ -1068,7 +1107,7 @@ struct Track {
     static float elemSpeedPref(SegMode m, float spd) {
         switch (m) {
             case M_TURN: case M_DIVE: case M_SCURVE: case M_HELIX:
-                return 0.12f + 2.60f * spd;    // hard sustained-g turns: strongly favored when fast (g = v^2/R at their now-fixed radius -> faster entry is the lever for higher held g)
+                return 0.40f + 1.20f * spd;    // hard sustained-g turns: still favored when fast (g = v^2/R -> faster entry is the lever for higher held g), but no longer a 2.7x cruise monopoly -- the old 0.12+2.60 made banked turns ~half of all cruise picks (user: banked too often); the physics (fast entry = high g) is preserved by the bias direction, the magnitude is what's tamed
             // WINGOVER is deliberately NOT in the fast group: it's a half-inversion trick, not a
             // sustained-g turn, and the 2.6x boost at cruise made the rarest-weighted element (0.7)
             // the 6th most common pick (measured 7/ride vs the ~1/ride a real signature gets).
@@ -1311,7 +1350,7 @@ struct Track {
                 // banked, drop a flat brake straight -- the "catch your breath" section every long
                 // real coaster has. Adds realistic idle track and paces the ride.
                 if (!mcbrDone && elems >= elemLimit / 2 && h < 40.0f && !wasBanked) {
-                    mcbrDone = true; mode = M_FLAT; remain = irnd(9, 14); levelHold = remain;   // ~126-196 m, ~2-3 s: real mid-course brake runs transit in ~3-6 s -- toward the WR side
+                    mcbrDone = true; mode = M_FLAT; remain = irnd(7, 10); levelHold = remain;   // ~98-140 m, ~1.5-2 s transit: one real breather per lap, no longer stretched toward the WR side (user: too much flat)
                     break;
                 }
                 // ONE top-hat per lap. wantLaunch (which runs the tall CLIMB top-hat) fires ONLY at
@@ -1333,7 +1372,11 @@ struct Track {
                 // Arrive-slow station approach: once a station stop is pending, stop re-powering
                 // and let the final energy arc bleed naturally into the platform (a real launch
                 // coaster times its last arc to arrive slow rather than braking from cruise).
-                bool wantBoost  = slow && !wantLaunch && !stationPending;
+                // boostCool: a fresh boost holds the next few slots un-powered (the discharge arc);
+                // the genV<58 override is survival -- deep run-downs still re-power (the inversion
+                // hook below gets first claim on those windows either way).
+                bool wantBoost  = slow && !wantLaunch && !stationPending &&
+                                  (boostCool == 0 || genV < 58.0f);
                 // SLOW-WINDOW INVERSIONS: the run-down moments (genV < BOOST_TRIG) are the ONLY
                 // places the entry-gated inversions fit -- their windows sit at ~1.6-2.2x their
                 // real-world entry speeds (invVMax), far below the boosted cruise. Before burning
