@@ -1844,20 +1844,39 @@ int main(int argc, char **argv) {
 
             if (const char *tg2 = getenv("MC_DUMP_ELEM")) {
                 int wantKind = -1;
+                bool dumpAll = TextIsEqual(tg2, "ALL");
                 for (int ti = 0; ti < M_COUNT; ti++) if (TextIsEqual(tg2, NM[ti])) wantKind = ti;
-                if (wantKind >= 0) {
+                if (wantKind >= 0 || dumpAll) {
+                    int dumpSeeds = 3;
+                    if (const char *ds = getenv("MC_DUMP_SEEDS")) dumpSeeds = atoi(ds);
                     bool inRun = false;
                     for (int k = 1; k < n; k++) {
-                        if (t.kind[k] == wantKind) {
+                        if (dumpAll || t.kind[k] == wantKind) {
                             Vector3 p0 = t.cp[k-1], p1 = t.cp[k];
                             float dx = p1.x - p0.x, dz = p1.z - p0.z;
                             float heading = atan2f(dx, dz) * 180.0f / PI;
-                            printf("[dump] seed%d cp%d kind=%s pos=(%.2f,%.2f,%.2f) heading=%.2f\n",
-                                   sd, k, NM[wantKind], p1.x, p1.y, p1.z, heading);
+                            // Signed bank/roll: angle of up[k] away from the "flat" up in the
+                            // plane normal to the track tangent (0 = level, +right lean).
+                            float roll = 0.0f;
+                            if (k < n - 1) {
+                                Vector3 tanv = Vector3Normalize(Vector3Subtract(t.cp[k+1], p0));
+                                Vector3 side = Vector3CrossProduct((Vector3){0,1,0}, tanv);
+                                float sl = Vector3Length(side);
+                                if (sl > 1e-4f) {
+                                    side = Vector3Scale(side, 1.0f/sl);
+                                    Vector3 flatUp = Vector3CrossProduct(tanv, side);
+                                    roll = atan2f(Vector3DotProduct(t.up[k], side),
+                                                  Vector3DotProduct(t.up[k], flatUp)) * 180.0f / PI;
+                                }
+                            }
+                            printf("[dump] seed%d cp%d kind=%s pos=(%.2f,%.2f,%.2f) heading=%.2f dy=%+.2f terr=%.1f roll=%+.1f v=%.1f\n",
+                                   sd, k, NM[t.kind[k]], p1.x, p1.y, p1.z, heading,
+                                   p1.y - p0.y, groundTopAt(p1.x, p1.z), roll,
+                                   k < (int)t.gvlog.size() ? t.gvlog[k] : 0.0f);
                             inRun = true;
                         } else if (inRun) { inRun = false; printf("[dump] --- run end ---\n"); }
                     }
-                    if (sd >= 3) return 0;
+                    if (sd >= dumpSeeds) return 0;
                 }
             }
 
