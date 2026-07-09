@@ -9,6 +9,7 @@ static inline bool submergedGround(float groundTopY) { return groundTopY <= WATE
 struct Track {
     std::deque<Vector3>       cp;
     std::deque<Vector3>       up;
+    std::deque<Vector3>       geomUp;   // ROLL CARRY-THROUGH: the BASELINE (no-carry) per-cp up-vector. up[] carries the rendered lean across banked->banked seams; the post-generation geometry passes (vert-g relax skip, felt-g safety net) read geomUp[] instead so a carried lean never perturbs the generated track -- geometry stays bit-identical to baseline.
     std::deque<unsigned char> kind;
     std::deque<unsigned char> chainf;
     std::deque<float>         arc;
@@ -46,20 +47,28 @@ struct Track {
     int     dropRun = 0;   // how many cps the current M_DROP has run -- capped so a drop can't crawl forever down a descending slope and starve element generation
     float   dropTopY = 1e9f;   // the current DROP run's entry crest, latched on its first step -- the ~300 m max-drop cap (user) measures every drop from here
     float   ddKnuckle = 0.0f;   // (see enterDrop)
+    bool    crownLatched = false;   // once the CLIMB crest-lead fires, the crown-descent target stays asserted every step through the apex. The old genPrevDy>0 gate un-fired at the vertex (applied dy just crossed to <=0), dropping the crown and re-asserting the +36/+18 base climb target for one step -- the ceilY clip then pinned+flipped that spurious re-climb to M_DROP (267-326 m crest bust, a 5-cp apex shelf, a shallow drop face). Cleared at every CLIMB->DROP handoff / mode end.
     float   boostGrade = 0.0f;   // INCLINED LSM boost: constant per-step climb (+4-8 deg) for ~45% of boosts, following the terrain trend -- Falcon's Flight's mid-course LSM lift (powered track that regains altitude while re-energizing); 0 = classic flat boost   // DOUBLE-DOWN: height above ground where this drop briefly shelves then re-drops (the El Toro/Maverick two-stage drop's ejector knuckle -- a roll-free thrill); 0 = plain drop
     float   genV      = LAUNCH_V;
     float   genFloorY = -1e9f;   // curvature-bounded terrain floor (lifts track out of the ground smoothly)
     float   genFloorVy = 0.0f;
     unsigned char lastGenMode = (unsigned char)M_FLAT;
     Vector3 genPrevUp = WUP;
+    Vector3 genGeomUp = WUP;        // ROLL CARRY-THROUGH: the up-vector as it would evolve WITHOUT any carry (the baseline unwind). Feeds ONLY the post-hoc vertical-g cap gate (which exempts steep-banked seats) so a carried lean can't disable that cap on level FLAT/DROP geometry -- keeps the generated track bit-identical to baseline while genPrevUp carries the rendered lean.
     int     upEaseSteps = 0;
     int     upEaseInit  = 0;       // window length upEaseSteps started at, so the unwind can keep the first ~2 seam steps slow then finish fast
     float   upEaseRate  = 0.38f;   // how fast the bank unwinds after an element; lower = gentler (helix needs slow so the bank outlasts the turn)
+    int     bankHold = 0;          // ROLL CARRY-THROUGH: cps left to HOLD a banked element's exit lean across a short FLAT/DROP/DIP gap so a re-banking next element meets it (shortest path via easeUpVec) instead of dipping through dead-level. Capped (bankHoldMax) so a genuine breather gap still returns to level via upEaseSteps.
+    int     bankHoldMax = 2;       // gap length (cps) up to which the exit lean is carried; longer gaps keep the prompt unwind (user: roll return must not pollute the next flat section)
 
     int     seamEaseN = 0;
     int     seamEaseTot = 0;
     int     invSlotUsed = 0;   // slow-window pacing: how many inversions the current run-down window has taken; capped at 2 before the window must go to a re-power BOOST (reset there) so inversions and speed alternate instead of inversion chains starving the boosts
-    int     hardInvCount = 0;   // hard inversions (LOOP/ROLL/IMMEL/DIVELOOP) placed this lap; a hard per-lap budget (eligibleElem) keeps a handful, not the ~10/ride the weights alone produced (user: a bit too many inversions)
+    int     hardInvCount = 0;   // budget inversions (LOOP/ROLL/IMMEL/DIVELOOP/STALL) placed this lap; the per-lap invBudget below caps them (eligibleElem), not the ~7.6/ride the weights alone produced (user: 2-4 inversions/lap)
+    int     invBudget = 4;      // per-lap inversion allowance, drawn irnd(2,4) in startLaunch (spec occurrence rules): once hardInvCount reaches it, the 5 kept inversion types stop being OFFERED for the rest of the lap
+    int     quotaMet = 0;       // bitmask of the >=1/lap quota families already placed this lap (Q_* below); pickFromPool boosts + force-picks the unmet ones toward lap end without ever bypassing eligibleElem
+    int     cliffFizzles = 0;   // signature-dive re-arm counter: a low/too-tall apex clears cliffDone so the dive re-arms same-lap (spec: cliffdive >=1/lap), bounded so a massif that can never hold a sub-300 crest can't loop the lap into all-climbs
+    int     cliffScanCool = 0;  // after a fizzle, suppress the real-RIM scan for a few elements: a rim on a high massif fizzles the apex-over-local-ground check and, unsuppressed, the scan just re-finds the SAME rim and loops (census: 8-tophat laps). While suppressed the guarantee falls to the structural plunge, which fires once the undulating track descends into a valley (gtHere < 138).
     int     bankCool = 0;   // BANKED-ELEMENT CADENCE (user: bank/tilt elements too often + too long vs real): after any banked-up-vector element, the next 2 element slots must be low-tilt (straight hills/dips/drops/inversions), matching how real layouts alternate lateral and vertical force events instead of chaining banked shapes back-to-back across families. Decremented per non-banked pick in rememberElement; feel rule only -- eligibleSafety ignores it.
     int     boostCool = 0;   // RE-POWER CADENCE (user: too many dead-flat sections): a real coaster has 1-3 mid-course boosts, not one every ~14 s -- after a BOOST, skip re-powering for the next few element slots so the ride runs proper discharge arcs (long bleed, then one big recharge) instead of constant flat interruptions. Survival override at genV<58 in nextMode keeps forced climbs alive.
     int     levelHold = 0;
@@ -136,19 +145,21 @@ struct Track {
     bool    stationRamping = false;
     float   stationDeckY = 0;
 
-    void pushCP(Vector3 p, Vector3 upv, unsigned char tag, unsigned char ch = 0) {
+    void pushCP(Vector3 p, Vector3 upv, unsigned char tag, unsigned char ch = 0, Vector3 gup = {0,0,0}) {
         float a = arc.empty() ? 0.0f : arc.back() + Vector3Length(Vector3Subtract(p, cp.back()));
-        cp.push_back(p); up.push_back(upv); kind.push_back(tag); chainf.push_back(ch); arc.push_back(a);
+        bool nogup = (gup.x == 0.0f && gup.y == 0.0f && gup.z == 0.0f);   // sentinel: unbanked callers (reset) get geomUp == up
+        cp.push_back(p); up.push_back(upv); geomUp.push_back(nogup ? upv : gup);
+        kind.push_back(tag); chainf.push_back(ch); arc.push_back(a);
         gvlog.push_back(genV);
     }
     void popFront() {
-        cp.pop_front(); up.pop_front(); kind.pop_front(); chainf.pop_front(); arc.pop_front();
+        cp.pop_front(); up.pop_front(); geomUp.pop_front(); kind.pop_front(); chainf.pop_front(); arc.pop_front();
         if (!gvlog.empty()) gvlog.pop_front();
         base++;
     }
 
     void reset() {
-        cp.clear(); up.clear(); kind.clear(); chainf.clear(); arc.clear(); gvlog.clear(); base = 0;
+        cp.clear(); up.clear(); geomUp.clear(); kind.clear(); chainf.clear(); arc.clear(); gvlog.clear(); base = 0;
         chainMode = false; stationPending = false; stationActive = false; stationRamping = false;
 
         Theme th    = THEMES[irnd(0, THEME_N - 1)];
@@ -169,9 +180,11 @@ struct Track {
         mode = M_FLAT; remain = 3; turnDir = 1; turnMag = 0.4f; mega = false; elems = 0;
         elemLimit = irnd(17, 24); queuedInv = 0; launchElem = M_CLIMB; mcbrDone = false;   // ~28% fewer elements per lap (see startLaunch): the WR-sized elements each run much longer track
         cliffDone = false; signatureDive = false; cliffMode = 0; hardInvCount = 0;
-        bankCool = 0; boostCool = 0;
+        invBudget = irnd(2, 4); quotaMet = 0; cliffFizzles = 0; cliffScanCool = 0;
+        bankCool = 0; boostCool = 0; bankHold = 0;
         lastElem = M_FLAT; prevElem = M_FLAT; helixDrop = -3.4f; genV = LAUNCH_V;
         genPrevDy = 0; genPrevCurv = 0; genPrevDyaw = 0; genFloorY = -1e9f; genFloorVy = 0;
+        crownLatched = false;
         setClearance(10.0f, 24.0f);
 
         pushCP(gpos, WUP, (unsigned char)M_LAUNCH);
@@ -300,36 +313,36 @@ struct Track {
         dlside   = Vector3Normalize(Vector3CrossProduct(WUP, dlf));
         dlLeadStart = gpos;
 
-        // Real dive loops start upright and PLUNGE DOWN before curving into the loop. The lead-in
-        // uses an S-curve (smoothstep) vertical profile that is LEVEL at both ends (zero slope
-        // entering AND leaving), matching whatever came before at the start and the loop's own
-        // flat-bottom tangent at the end, so there's no discontinuity to spike curvature on.
-        dlLeadSteps = 9;   // was 14 (~2 s of straight plunge before the loop even starts -- the 7.4 s mean transit's main fat); a real dive loop's dive is short and immediate
-        float wantDrop = 10.0f;   // total lead-in drop
-        auto smooth = [](float t) { return t * t * (3.0f - 2.0f * t); };
-        float maxTotalDrop = wantDrop;
-        for (int la = 1; la <= dlLeadSteps; la++) {
-            float t  = (float)la / (float)dlLeadSteps;
-            float gt = groundTopAt(gpos.x + dlf.x * SEG_LEN * la, gpos.z + dlf.z * SEG_LEN * la);
-            float budget = gpos.y - gt - 14.0f;
-            maxTotalDrop = fminf(maxTotalDrop, budget / fmaxf(smooth(t), 1e-3f));
-        }
-        dlLeadDrop = Clamp(maxTotalDrop, 0.0f, wantDrop);   // dlLeadDrop now holds the TOTAL drop
+        // A dive loop is the REVERSE Immelmann: climb + half-twist to inverted, then a half-loop
+        // DOWN whose pitch alone reverses heading ~180 deg and dives out low, antiparallel to the
+        // entry. (The old full-360 loop returned to its own heading and netted only the ~67 deg the
+        // yaw twist added -- not a real dive loop's reversal.) The lead-in CLIMBS on a smoothstep
+        // profile (zero slope both ends: level at entry, horizontal at the apex) while a heartline
+        // half-roll takes the car upright->inverted, so the half-loop can start inverted at the top
+        // and flip back upright as it dives -- a continuous C1 handoff at the apex.
+        dlLeadSteps = 9;
+        { dlR = invRFor(M_DIVELOOP); dlR *= frnd(0.92f, 1.0f); }   // record-capped radius, sized from the entry speed like the loop/immel family (user spec: at-and-above record)
 
-        // The physics sim follows this drop like any other track height loss, so the train is
-        // genuinely faster by the time it reaches the loop. Sizing dlR from the PRE-dive genV
-        // would size the loop for a speed the train no longer has. Estimate the post-dive speed
-        // from energy conservation (ignoring drag slightly overestimates the gain, erring toward
-        // a bigger, safer loop) and size the loop from THAT.
-        float vAfterDive = sqrtf(genV * genV + 2.0f * GRAV * dlLeadDrop);
-        { dlR = invRAt(M_DIVELOOP, vAfterDive); dlR *= frnd(0.92f, 1.0f); }   // hold the speed-sized radius near its WR-capped value (user spec: at-and-above record); the trimmed lead-in below keeps transit near ~1x Valravn's ~4-5 s
+        // The half-loop bottom is intrinsically 2R below the apex and is the g-critical point
+        // (fastest). Bound the net dive so bottomV^2 = genV^2 + 2*g*netDrop holds the record-anchored
+        // envelope: hot entries into the capped radius leave little drop budget (the climb nearly
+        // matches the descent -- a near-symmetric loop, exit ~= entry height, like the old full loop's
+        // bottom), while cooler entries in the gate window dive deeper. Cap depth to ~1.2R for shape.
+        const float gBottomCap = 9.5f;
+        float dropByG  = ((gBottomCap - 1.0f) * GRAV * dlR - genV * genV) / (2.0f * GRAV);
+        float netDrop  = Clamp(dropByG, 0.0f, 1.2f * dlR);
+        float rise     = 2.0f * dlR - netDrop;   // apex height above entry (climb before the dive)
+        float speedCap = fmaxf((genV * genV - 30.0f * 30.0f) / (2.0f * GRAV) - 4.0f, 0.0f);   // inverted apex still carries >=30 m/s (no stall)
+        float crestCap = fmaxf(296.0f - gpos.y, 0.0f);                                         // apex crest < 300 m design rule
+        rise = fminf(rise, fminf(speedCap, crestCap));
+        dlLeadDrop = rise;   // field reused: lead-in is now a RISE (dive loops climb, then dive out low)
 
         Vector3 leadEnd = { gpos.x + dlf.x * SEG_LEN * dlLeadSteps,
-                             gpos.y - dlLeadDrop,
+                             gpos.y + rise,
                              gpos.z + dlf.z * SEG_LEN * dlLeadSteps };
-        dlcenter = { leadEnd.x, leadEnd.y + dlR, leadEnd.z };
-        dltheta  = 0; dlsteps = irnd(40, 46);
-        dlturn   = (rnd01() < 0.5f ? 1.0f : -1.0f) * frnd(0.8f, 1.2f);
+        dlcenter = { leadEnd.x, leadEnd.y - dlR, leadEnd.z };            // apex sits R ABOVE the center (half-loop DOWN)
+        dltheta  = 0; dlsteps = Clamp((int)(PI * dlR / 3.0f), 14, 40);   // half loop at the loop family's ~3 m sampling
+        dlturn   = (rnd01() < 0.5f ? 1.0f : -1.0f);                      // roll + lateral-drift direction (the teardrop lean)
         remain   = dlLeadSteps + dlsteps;
     }
 
@@ -478,6 +491,7 @@ struct Track {
     void startLaunch() {
         elems = 0; elemLimit = irnd(17, 24); chainMode = false; launchElem = pickLaunchExit(); mcbrDone = false; helixLap = false; wingLap = false;   // ~28% fewer elements per lap than the old 24-34: the WR-sized elements run 2-3x longer each, so the lap stays ~2-3 min without filler
         cliffDone = false; signatureDive = false; cliffMode = 0; hardInvCount = 0;   // signature dive + inversion budget re-arm each lap
+        invBudget = irnd(2, 4); quotaMet = 0; cliffFizzles = 0; cliffScanCool = 0;   // spec occurrence rules: 2-4 inversions/lap, quota families unmet, cliff re-arm counter fresh
         setClearance(10.0f, 36.0f);
         mode = M_LAUNCH; remain = irnd(9, 12);   // ~126-168 m, ~3-4 s from a rolling start: the LONGEST real launches (Formula Rossa 4.9 s / ~163 m, Red Force 5.0 s) -- durations matched toward the WR side
         // M_LAUNCH rides dead flat (dy is always 0.0f in stepGeneric -- a real LSM launch track
@@ -606,8 +620,15 @@ struct Track {
         // 94 m/s, 8+/ride, starving the loop family of its family-1 slots).
         switch (m) {
             // ROLL/HEARTLINE rotate about (near) the heartline -- no big top to starve/overload.
-            // Their window is 2x their real entry speed directly (corkscrew ~97 km/h -> 27 m/s).
-            case M_ROLL:      return 54.0f;
+            // Their window is ~2.2x their real entry speed directly (corkscrew ~97 km/h -> 27 m/s).
+            // Raised 54 -> 62: at 54 the window sat entirely below the ~78 cruise AND below most of
+            // nextMode's slow-window samples, so ROLL was DEAD (never offered) and its ~40% share of
+            // the real inversion mix renormalized silently onto LOOP/IMMEL/DIVELOOP. 62 opens a
+            // [42.2,62] band that overlaps the run-down speeds the other inversions monopolized (LOOP
+            // 51.6-62, DIVELOOP 55.2-66.5, IMMEL 57.8-69.7), so ROLL's 4.0 rarity weight can actually
+            // win those shared windows. No g bust: initRoll's own GCAP=9.5 loop grows rR until felt g
+            // <= 9.5, so the hotter entry just sizes the corkscrew a touch wider.
+            case M_ROLL:      return 62.0f;
             case M_HEARTLINE: return 56.0f;
             // STALL/STENGEL self-size their SHAPE from entry speed but their ROLL/over-bank rates
             // scale felt lateral with v^2 -- ungated hot entries measured -18 vert / 24 lat.
@@ -702,6 +723,19 @@ struct Track {
         hillBumps = chain ? irnd(2, 3) : 1;
         hillH     = chain ? frnd(18.0f, 30.0f)    // small bunny hops (the chain, ~150-220 m each)
                           : frnd(46.0f, 62.0f);   // single signature camelback (~Formula Rossa 52 m top-hat scale, ~0.8x the old 60-78)
+        // CHAIN DEMOTION: a bunny-hop chain routed up rising ground pays hillH + terrain rise per
+        // hop and its low troughs pin flat against the climbing floor -- real coasters do NOT run a
+        // hop chain up a slope. Scan the near chain corridor at FULL resolution (a narrow terrain
+        // spike between hillRiseAhead's 3-step samples is exactly what strands a trough, e.g. a
+        // 43 m spike mid-chain the coarse scan read as +8) and where it rises more than ~a third of
+        // a hop, demote to a single signature camelback that follows the climb on one arc.
+        if (chain) {
+            float gt0 = groundTopAt(gpos.x, gpos.z), riseF = 0.0f;
+            for (int la = 2; la <= 20; la++)
+                riseF = fmaxf(riseF, groundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
+                                                 gpos.z + cosf(gyaw) * SEG_LEN * la) - gt0);
+            if (riseF > 0.35f * hillH) { chain = false; hillBumps = 1; hillH = frnd(46.0f, 62.0f); }
+        }
         // First crest must stay ballistic AND leave clearance room for the descending baseline drop
         // (~0.30*hillH*(N-1)/N below entry) inside the band.
         float chainRoom = 1.0f / (1.0f + 0.30f * (float)(hillBumps - 1) / (float)hillBumps);
@@ -929,7 +963,8 @@ struct Track {
         prevElem = lastElem;
         lastElem = m;
         lastUsedAt[m] = ++elemSeq;
-        if (isHardInversion(m)) hardInvCount++;   // count toward the per-lap inversion budget (eligibleElem)
+        if (isBudgetInversion(m)) hardInvCount++;   // count toward the per-lap inversion budget invBudget (eligibleElem)
+        quotaMet |= quotaBit(m);                    // mark the >=1/lap family this pick satisfies
         if (m == M_HELIX)    helixLap = true;
         if (m == M_WINGOVER) wingLap  = true;
         // Banked cadence: a banked pick arms the cooldown; each low-tilt pick walks it down.
@@ -941,6 +976,32 @@ struct Track {
     }
     static bool isHardInversion(SegMode m) {
         return m == M_LOOP || m == M_ROLL || m == M_IMMEL || m == M_DIVELOOP || m == M_COBRA || m == M_PRETZEL || m == M_HEARTLINE;
+    }
+    // The 5 inversion types kept in generation, counted against the per-lap invBudget (spec share
+    // table ROLL/LOOP/IMMEL/DIVELOOP/STALL). STALL is NOT an isHardInversion (it's a ballistic
+    // zero-g crest, exempt from the inversion seam/g-cap rules) but it IS a rider inversion, so it
+    // spends budget too -- otherwise a lap could run 4 hard loops PLUS unlimited stalls.
+    static bool isBudgetInversion(SegMode m) {
+        return m == M_LOOP || m == M_ROLL || m == M_IMMEL || m == M_DIVELOOP || m == M_STALL;
+    }
+    // Per-lap MINIMUM-occurrence quota families (spec: >=1/lap). Each maps to one bit set in
+    // quotaMet when the family is picked (rememberElement). pickFromPool multiplies the unmet bits'
+    // weights up as the lap's remaining element slots shrink toward the unmet-quota count, then
+    // force-filters the pool to unmet families when slots <= unmet count. It NEVER bypasses
+    // eligibleElem, so a family that is never physics/terrain-eligible in a lap simply stays unmet
+    // (surfaced by --census). Top hat (launch CLIMB) and CLIFFDIVE are guaranteed by their own
+    // once-per-lap paths, not this mask.
+    enum { Q_HILLS = 1, Q_TURN = 2, Q_HELIX = 4, Q_DIP = 8, Q_BANKAIR = 16 };
+    static constexpr int Q_ALL = Q_HILLS | Q_TURN | Q_HELIX | Q_DIP | Q_BANKAIR;
+    static int quotaBit(SegMode m) {
+        switch (m) {
+            case M_HILLS: return Q_HILLS;
+            case M_TURN:  return Q_TURN;
+            case M_HELIX: return Q_HELIX;
+            case M_DIP:   return Q_DIP;
+            case M_WAVE: case M_BANKAIR: case M_STENGEL: return Q_BANKAIR;   // banked-airtime group counts as one family
+            default:      return 0;
+        }
     }
     // The elements that hold a big banked/tilted up-vector for their whole span (the heartline
     // turns plus the overbanked STENGEL crest). Inversions are NOT in here: they're brief
@@ -1042,10 +1103,10 @@ struct Track {
             if (vMax < 1e8f && (genV > vMax || genV < invVMinFrac(m) * vMax)) return false;
             (void)invGCeil;
         }
-        // PER-LAP INVERSION BUDGET (user: a bit too many inversions). Cap the hard inversions at a
-        // handful per lap; once spent, they stop being OFFERED and the slot goes to a turn/hill/etc.
-        // Deterministic, unlike weight-trimming (which the age^2 freshness bonus kept inflating).
-        if (isHardInversion(m) && hardInvCount >= 4) return false;
+        // PER-LAP INVERSION BUDGET (user: 2-4 inversions/lap). Cap the 5 kept inversion types at the
+        // invBudget drawn in startLaunch; once spent, they stop being OFFERED and the slot goes to a
+        // turn/hill/etc. Deterministic, unlike weight-trimming (which the age^2 bonus kept inflating).
+        if (isBudgetInversion(m) && hardInvCount >= invBudget) return false;
         // Once-per-lap signature cap (see helixLap/wingLap above): a helix is a finale element,
         // a wingover a signature trick -- not every-third-element recurring turns.
         if (m == M_HELIX    && helixLap) return false;
@@ -1053,8 +1114,11 @@ struct Track {
         // Banked cadence (user: banked/tilt elements too often and too long -- few flat/low-tilt
         // sections left): while the cooldown is armed, banked elements aren't OFFERED, so every
         // banked stretch is followed by genuinely low-tilt track. Feel rule, not a physics gate --
-        // eligibleSafety deliberately skips it.
-        if (bankCool > 0 && isBankedElem(m)) return false;
+        // eligibleSafety deliberately skips it. HELIX is EXEMPT: it's a once-per-lap finale (helixLap
+        // caps it at 1) and a >=1/lap quota family, so gating it on the banked cooldown -- which is
+        // armed most of the lap by the frequent turns/waves -- was starving its quota (census: HELIX
+        // the most-missed family). Its single occurrence can't over-saturate the banked cadence.
+        if (bankCool > 0 && isBankedElem(m) && m != M_HELIX) return false;
         float clr = gpos.y - groundTopAt(gpos.x, gpos.z);
         float trickMax = maxTrickHeight(m);
         if (trickMax > 0.0f && clr > trickMax) return false;
@@ -1128,6 +1192,11 @@ struct Track {
             float vMax = invVMax(m);
             if (vMax < 1e8f && (genV > vMax || genV < invVMinFrac(m) * vMax)) return false;
         }
+        // The per-lap inversion BUDGET is a design cap, not just a variety rule -- the fallback must
+        // honour it too, else a slot where every non-inversion is terrain-ineligible falls back onto
+        // an over-budget 5th inversion (measured: hardInvCount ran to 5 against invBudget 2). With
+        // this the degenerate slot lands on M_TURN instead.
+        if (isBudgetInversion(m) && hardInvCount >= invBudget) return false;
         float clr = gpos.y - groundTopAt(gpos.x, gpos.z);
         float trickMax = maxTrickHeight(m);
         if (trickMax > 0.0f && clr > trickMax) return false;
@@ -1162,15 +1231,20 @@ struct Track {
             case M_WAVE:      return 2.5f;   // wave turns are a signature of these coasters (Falcon's Flight has 2-3); now a real 90deg-banked reversal, no longer a BANKAIR duplicate
             case M_BANKAIR:   return 0.9f;
             case M_WINGOVER:  return 0.0f;   // removed per user (overbanked roll overload)
-            case M_STALL:     return 1.5f;   // the ONE inverting-crest roll kept (RMC signature)
+            // Inversion type weights are set PROPORTIONAL to the real-life installed share (spec
+            // occurrence table, renormalized over the KEPT types): ROLL ~40% / LOOP ~30% / IMMEL ~10%
+            // / DIVELOOP ~10% / STALL ~10%. The budget gate caps the COUNT at 2-4/lap; these set the
+            // TYPE MIX within it. ROLL leads (its window was just un-deadened in invVMax), and the
+            // audit's no-type-over-50% gate backstops any age^2 recency spike.
+            case M_STALL:     return 1.0f;   // ~10% share (RMC zero-g stall, x6 real-life multiplier per spec)
             case M_BANANA:    return 0.0f;   // removed per user (near-duplicate of the stall)
-            case M_LOOP:      return 2.0f;   // the most common NAMED inversion, but still just a handful per ride (trimmed: user wanted a bit fewer inversions overall)
+            case M_LOOP:      return 3.0f;   // ~30% share (vertical loop, the most common NAMED inversion)
             case M_HELIX:     return 0.9f;   // usually a single finale element -- at 2.0, being the sole family-5 entry plus the 2.6x fast-group boost made it the 2nd most common pick (measured 8.6/ride vs the ~1 a real ride has)
-            case M_ROLL:      return 1.2f;   // corkscrews: on most real loopers but once or twice, not recurring
-            case M_IMMEL:     return 1.6f;
+            case M_ROLL:      return 4.0f;   // ~40% share (corkscrew/zero-g roll family, the single most common real inversion)
+            case M_IMMEL:     return 1.0f;   // ~10% share (Immelmann)
             case M_HEARTLINE: return 0.0f;   // removed per user (near-duplicate of the stall)
             case M_STENGEL:   return 1.2f;
-            case M_DIVELOOP:  return 1.6f;
+            case M_DIVELOOP:  return 1.0f;   // ~10% share (dive loop)
             case M_COBRA:     return 0.0f;   // removed per user   // real cobra rolls are a one-per-ride signature piece
             case M_PRETZEL:   return 0.0f;   // removed per user (teardrop apex geometry rings a +29 raw-g spline seam I could not tame)
             default:          return 1.0f;
@@ -1205,6 +1279,13 @@ struct Track {
     SegMode pickFromPool(const SegMode *pool, int n) const {
         SegMode valid[32]; float w[32]; int vc = 0; float wsum = 0;
         int wtrDist = -1;   // lazy: only sampled when an eligible M_DIP is actually in the pool
+        // >=1/lap QUOTA (spec occurrence rules): families not yet placed this lap get their weight
+        // boosted the fewer element slots remain, and once the slots left have shrunk to the count of
+        // still-unmet families the pool is FORCE-filtered down to them (when any are eligible here).
+        int unmetQ = Q_ALL & ~quotaMet;
+        int unmetCount = 0; for (int b = unmetQ; b; b &= b - 1) unmetCount++;
+        int slotsLeft = elemLimit - elems; if (slotsLeft < 0) slotsLeft = 0;
+        bool forceMode = (unmetCount > 0 && slotsLeft <= unmetCount);
         for (int i = 0; i < n && vc < 32; i++) {
             if (!eligibleElem(pool[i])) continue;
             float age = (float)(elemSeq - lastUsedAt[pool[i]]) + 1.0f;
@@ -1225,7 +1306,24 @@ struct Track {
                 if (wtrDist < 0) wtrDist = waterAheadDist();
                 if (wtrDist > 0) wgt *= 5.0f;   // water-seeking splashdown (see initDip)
             }
+            // Unmet-quota boost: grows as the slack between remaining slots and unmet families
+            // closes, so a still-missing family (HILLS/TURN/HELIX/DIP/banked-airtime) leads the pick
+            // near lap end. Multiplicative only -- eligibleElem already vetted pool[i] above.
+            if (quotaBit(pool[i]) & unmetQ)
+                wgt *= 1.0f + 10.0f / fmaxf((float)(slotsLeft - unmetCount) + 1.0f, 1.0f);
             valid[vc] = pool[i]; w[vc] = wgt; wsum += w[vc]; vc++;
+        }
+        // FORCE the quota once slots have run out: if any still-unmet family is eligible in this
+        // pool, drop every non-quota candidate so the slot MUST go to a missing family. Skipped when
+        // no unmet family is eligible here (nothing to force to -- the family stays unmet, --census).
+        if (forceMode && vc > 0) {
+            int qc = 0; for (int i = 0; i < vc; i++) if (quotaBit(valid[i]) & unmetQ) qc++;
+            if (qc > 0) {
+                int nv = 0; wsum = 0.0f;
+                for (int i = 0; i < vc; i++)
+                    if (quotaBit(valid[i]) & unmetQ) { valid[nv] = valid[i]; w[nv] = w[i]; wsum += w[i]; nv++; }
+                vc = nv;
+            }
         }
         if (vc == 0) {
             // Full eligibleElem() found nothing (variety constraint exhausted the pool) --
@@ -1341,6 +1439,7 @@ struct Track {
     }
 
     void nextMode() {
+        crownLatched = false;   // an element ended: drop the crest-lead latch so it never leaks into the next element
         float h = gpos.y - groundTopAt(gpos.x, gpos.z);
 
         if (forcedElem >= 0) {
@@ -1484,13 +1583,14 @@ struct Track {
                 // it climbs the back at a uniform full-grade face with NO rounded top-hat crown, then
                 // dives the cliff face. PREFERS a real mesa rim; guarantees the signature with a
                 // structural plunge if none is in range by the time the lap is nearly done.
-                if (!cliffDone && elems >= (elemLimit * 2) / 3 && genV > 40.0f) {
+                if (!cliffDone && elems >= elemLimit / 2 && genV > 40.0f) {   // arm from mid-lap (was 2/3): a wider window means more low-entry chances to find a real rim before the near-lap-end structural fallback (spec: cliffdive >=1/lap guaranteed)
+                    if (cliffScanCool > 0) cliffScanCool--;   // walk down the post-fizzle rim-scan suppression once per element decision
                     float gtHere = gpos.y - h;
                     // Scan for a real cliff RIM ahead, but ONLY when we could enter it cleanly (low and
                     // unbanked): high ground (>200 m) with a sharp >110 m far-side falloff -- exactly the
                     // narrow-band cliff face terrainH now builds.
                     float bestTop = -1e9f, bestYaw = gyaw; bool foundCliff = false;
-                    if (h < 45.0f && !wasBanked) {
+                    if (h < 45.0f && !wasBanked && gtHere < 190.0f && cliffScanCool == 0) {   // gtHere < 190: on a massif TOP the climb can't get 100 m above the (already high) local ground, so the apex-fizzle path just burns re-armed climbs (measured: a 7-tophat lap with no cliffdive) -- defer until the undulating track descends. cliffScanCool suppresses re-finding the SAME rim right after it fizzled.
                         for (int s = -4; s <= 4; s++) {
                             float ay = gyaw + s * 0.10f;                 // +-0.4 rad cone, 9 samples
                             float sn = sinf(ay), cs = cosf(ay);
@@ -1503,16 +1603,44 @@ struct Track {
                             }
                         }
                     }
-                    // Fire on a real cliff the instant one is in range; otherwise, after giving it a few
-                    // elements to find one, GUARANTEE the signature near lap end with a structural plunge.
-                    bool lastChance = (elems >= (elemLimit * 2) / 3 + 4);
-                    if (foundCliff || lastChance) {
+                    // GUARANTEE (spec: cliffdive >=1/lap): prefer a real rim the instant one is in
+                    // range; otherwise fire the structural plunge at the FIRST low-enough moment once
+                    // armed (the post-top-hat valley reliably supplies it), rather than waiting for a
+                    // near-lap-end window that may land on elevated ground. The structural crest caps
+                    // at ceilY 272 and the dive needs both a >100 m crest-over-local-ground and a
+                    // >145 m drop ahead, which only holds when the launch ground sits below ~138 --
+                    // above that it just burns a fizzled climb, so DEFER (fall through, cliffDone stays
+                    // false) and let the undulating track descend into a valley first.
+                    // Structural fallback: AIM at the deepest nearby ground ~85 m ahead (the dive's
+                    // valley sample point in initCliffDive) instead of blindly along the current
+                    // heading -- a plunge fired into RISING terrain has no drop and fizzles the >=150 m
+                    // floor (measured: structural fires from gtHere 61 straight into a hillside, fizz
+                    // runs to 6). The crest climbs to ~268 (ceilY cap); require crestEst - valley >= 150
+                    // so we never climb for a dive the terrain can't hold.
+                    float structBestVal = 1e9f, structYaw = gyaw;
+                    if (gtHere < 138.0f) {
+                        for (int s = -5; s <= 5; s++) {
+                            float ay = gyaw + s * 0.11f, sn2 = sinf(ay), cs2 = cosf(ay);
+                            for (float d = 65.0f; d <= 130.0f; d += 15.0f) {
+                                float gv = groundTopAt(gpos.x + sn2 * d, gpos.z + cs2 * d);
+                                if (gv < structBestVal) { structBestVal = gv; structYaw = ay; }
+                            }
+                        }
+                    }
+                    float structCrestEst = fminf(gtHere + 210.0f, 268.0f);
+                    bool canStructural = (gtHere < 138.0f) && (structCrestEst - structBestVal >= 150.0f);
+                    if (foundCliff || canStructural) {
                         if (foundCliff) {
                             cliffMode = 1; cliffTargetYaw = bestYaw;
                             climbTop = Clamp(bestTop - gtHere + 4.0f, 60.0f, 250.0f);   // crest right at the rim height
                         } else {
-                            cliffMode = 2; cliffTargetYaw = gyaw;
-                            climbTop = frnd(195.0f, 230.0f);   // no cliff in range: tall structural near-vertical plunge
+                            cliffMode = 2; cliffTargetYaw = structYaw;
+                            // ADAPTIVE height: cap the crest near 248 BEFORE the genFloor terrain lift
+                            // (which rides the climb up any rising slope another ~15-30 m) so the dive
+                            // apex stays under the 296 cap even from an already-elevated launch. A
+                            // fixed 195-230 crested at 276-293 on rising ground and fizzled the crest
+                            // cap every time (census: 8-tophat laps). The valley aim keeps the drop.
+                            climbTop = Clamp(fminf(frnd(150.0f, 185.0f), 248.0f - gtHere), 95.0f, 185.0f);
                         }
                         signatureDive = true; cliffDone = true;
                         mode = M_CLIMB; chainMode = false; mega = false;
@@ -1520,7 +1648,12 @@ struct Track {
                         rememberElement(M_CLIMB);
                         break;
                     }
-                    // not fired yet -- fall through to normal generation, retry next element
+                    // No cliff-capable feature in range yet: fall through and retry. If the lap is
+                    // nearly over and the terrain simply has no rim OR valley deep enough for a >=150 m
+                    // signature dive (a genuinely gentle-relief lap), give up CLEANLY -- latch cliffDone
+                    // so the remaining slots run real elements instead of a string of fizzled climbs
+                    // (census logs the miss). This is the one physics/terrain override the spec allows.
+                    if (elems >= (elemLimit * 2) / 3 + 6) cliffDone = true;
                 }
                 // WIND THE LAYOUT: a real coaster turns to stay in its footprint, never running miles
                 // dead straight (user: "2 miles of straight sometimes"). Once the track has run ~900 m
@@ -1577,14 +1710,28 @@ struct Track {
                 // Loose entry guards on purpose: the slow moments mostly happen mid-mountainside
                 // where the terrain-follow is still climbing a few m/step -- a real coaster enters
                 // its loop off a pullout slope too, and the seam-ease pass smooths the handoff.
-                if (wantBoost && invSlotUsed < 2 && rnd01() < 0.5f && h <= 26.0f && fabsf(genPrevDy) <= 0.45f * SEG_LEN) {   // rnd gate: not EVERY slow window becomes an inversion -- roughly halves the hook's injection rate (user: a bit too many inversions), the rest stay plain boosts
+                // rnd gate CHASES the per-lap floor: while under 2 inversions the lap takes nearly
+                // every eligible slow window (the invBudget cap, not this gate, prevents overshoot --
+                // spec: 2-4/lap); once the floor is met the 3rd/4th stay opportunistic so plain boosts
+                // keep their pacing variety.
+                float invUrge = (hardInvCount < 2) ? 0.92f : 0.45f;
+                float invHCap = (hardInvCount < 2) ? 40.0f : 26.0f;   // chase the floor from a wider height band (a loop entering off a pullout slope is still fine -- its own riseF/speed gates stay in force)
+                if (wantBoost && invSlotUsed < 2 && rnd01() < invUrge && h <= invHCap && fabsf(genPrevDy) <= 0.45f * SEG_LEN) {
                     static const SegMode invPool[] = { M_LOOP, M_ROLL, M_IMMEL, M_STALL, M_DIVELOOP,
                                                        M_STENGEL };
+                    // FLOOR CHASE (spec: >=2 inversions/lap): while under the floor, restrict to the 5
+                    // budget inversion types (drop STENGEL, index 5) and gate on eligibleSafety instead
+                    // of eligibleElem, so the family-variety rule can't block a 2nd inversion right
+                    // after the 1st when the lap has only one clean slow window between them. Real
+                    // coasters chain inversions and the seam-ease pass owns the inversion->inversion
+                    // handoff; the invBudget cap still bounds the total at 2-4.
+                    bool floor = (hardInvCount < 2);
+                    int pn = floor ? 5 : (int)(sizeof(invPool)/sizeof(invPool[0]));
                     bool any = false;
-                    for (int ip = 0; ip < (int)(sizeof(invPool)/sizeof(invPool[0])) && !any; ip++)
-                        if (eligibleElem(invPool[ip])) any = true;
+                    for (int ip = 0; ip < pn && !any; ip++)
+                        if (floor ? eligibleSafety(invPool[ip]) : eligibleElem(invPool[ip])) any = true;
                     if (any) {
-                        SegMode pick = pickFromPool(invPool, (int)(sizeof(invPool)/sizeof(invPool[0])));
+                        SegMode pick = pickFromPool(invPool, pn);
                         if (eligibleSafety(pick)) {
                             invSlotUsed++;
                             rememberElement(pick);
@@ -1730,6 +1877,7 @@ struct Track {
 
         float dy = 0;
         float dipFloorGuard = -1e9f;   // M_DIP's own per-step floor, handed to the g-cap block below
+        bool  diveArrestedUp = false;  // set when the dive-arrest clamps dy UP; read by the g-cap block below
         switch (mode) {
             case M_FLAT: {
                 if (stationRamping)      { dy = (stationDeckY - gpos.y) * 0.45f; break; }
@@ -1776,10 +1924,32 @@ struct Track {
                 // within 2 m of target the track holds level; real undulation comes from the shaped
                 // elements, not the connective flats.
                 float ferr = (gtAvg + 4.0f) - gpos.y;
-                dy = (fabsf(ferr) < 2.0f) ? 0.0f : ferr * 0.40f;
+                // CONTINUOUS proportional band (no dead-band step): the old hard <2 m dead-band snapped dy
+                // between 0 and ~0.8 at the edge, a micro-jitter of its own. Ramp the gain 0 at ferr=0 to
+                // the full 0.40 by |ferr|~4 m, so near-level terrain noise makes near-zero dy smoothly.
+                // Cap |dy| <= 10 m (a genuine wall is the CLIMB-conversion guard's job above).
+                float fgain = 0.40f * fminf(fabsf(ferr) / 4.0f, 1.0f);
+                dy = Clamp(ferr * fgain, -10.0f, 10.0f);
                 break;
             }
-            case M_TURN:  dy = ((gt + 5.0f + 2.2f * sinf(rollPh += 0.30f)) - gpos.y) * 0.50f; break;   // hug the ground, with a subtler version of FLAT's swell
+            case M_TURN: {
+                // Hug a SMOOTHED forward ground average (M_FLAT's 7-sample gtAvg pattern) instead of the
+                // raw voxel gt: chasing the bare voxel height with a bare proportional gain rang the pitch,
+                // and through the 3-D g-relax passes that ripple yanked x/z too (M_TURN owned the heading
+                // wobble). Keep the subtler 2.2 m swell.
+                float gtAvg = gt;
+                for (int la = 1; la <= 6; la++)
+                    gtAvg += groundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
+                                         gpos.z + cosf(gyaw) * SEG_LEN * la);
+                gtAvg /= 7.0f;
+                // Floor the smoothed target at the LOCAL ground (+2 m): the forward average dips below
+                // the current terrain where the ground descends ahead, which aimed the banked turn into
+                // a deep tunnel (measured clr -9.8). Keep it >= local gt+2 so it still hugs valleys
+                // without burying below the tunnel clearance.
+                float turnTgt = fmaxf(gtAvg + 5.0f, gt + 2.0f) + 2.2f * sinf(rollPh += 0.30f);
+                dy = (turnTgt - gpos.y) * 0.50f;
+                break;
+            }
             case M_HILLS: {
                 int   i  = hillLen - remain;
                 float t0 = (float)i / hillLen, t1 = (float)(i + 1) / hillLen;
@@ -1814,7 +1984,7 @@ struct Track {
                 // so the jerk/curvature clamps carve the crown while the tag is STILL M_CLIMB --
                 // the lift-assist thrust is tag-gated, and switching to DROP before the apex cut
                 // the assist mid-crest (measured: 682-frame crawl across the crown).
-                if (!signatureDive && genPrevDy > 0.0f) {
+                if (!signatureDive && (genPrevDy > 0.0f || crownLatched)) {
                     float vEffC    = mega ? fminf(genV, 54.0f) : genV;   // tall launch-hat: same bled effective speed as the budget block, so the crown-prediction window matches the sharper crown the low-speed budgets now carve (no early crest-lead ballooning crestY)
                     float v2c      = fmaxf(vEffC * vEffC, 400.0f);
                     // mega uses the EXACT crown budget (1-gNegT = 7, matching the -6 mega crest in the
@@ -1845,8 +2015,16 @@ struct Track {
                     // before turning over -- then dy=-12 snaps the crown HARD (high crest ejector g
                     // accepted). Crest stays under 300: the 270 cp-cap holds ~13 m of overshoot headroom.
                     float lagLead  = mega ? 1.7f * genPrevDy : genPrevDy;
-                    if (gpos.y + lagLead + 0.5f * genPrevDy * genPrevDy / fmaxf(dlimNegC, 0.05f) >= ceilNow)
+                    // LATCH: once the crest-lead fires, hold the crown-descent target every subsequent
+                    // step instead of re-evaluating the genPrevDy>0 gate. At the apex the applied dy has
+                    // just crossed to <=0 -> the old gate went false and the base +36/+18 climb target
+                    // re-asserted for one step, which the ceilY clip pinned+flipped to M_DROP (crest
+                    // bust + a 5-cp apex shelf + a shallow drop face).
+                    if (crownLatched ||
+                        gpos.y + lagLead + 0.5f * genPrevDy * genPrevDy / fmaxf(dlimNegC, 0.05f) >= ceilNow) {
                         dy = mega ? -12.0f : -8.0f;
+                        crownLatched = true;
+                    }
                 }
                 break;
             }
@@ -2069,8 +2247,16 @@ struct Track {
                 // A far-out-enough lookahead means gtLook picks up any rise ahead while the car is
                 // still well above it, so gap shrinks and maxSteep tightens in time to arrest the
                 // dive at a normal pull-out distance instead of diving underground.
+                // HILLS TROUGH ALLOWANCE: a bunny-hop's ballistic trough is a real, wanted descent.
+                // The full 14-step (196 m) forward-MAX froze whole chain middles to dy=0 wherever
+                // ANY ground inside the window sat at/above the hump (measured: seed2 cp398-403
+                // pinned flat over LOCALLY flat terr=30 because terrain rose to 63 nine cps ahead).
+                // For hills scan a short horizon (4 steps) so only the immediate corridor arrests,
+                // and floor the gap so a small trough keeps a slack anticipatory budget instead of a
+                // hard 0. Backstops still own the ground: tunnelFloor=gt-5 + lift>8 termination below.
+                int   arrestLook = (mode == M_HILLS) ? 4 : 14;
                 float gtLook = gt;
-                for (int la = 1; la <= 14; la++)
+                for (int la = 1; la <= arrestLook; la++)
                     gtLook = fmaxf(gtLook, groundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
                                                        gpos.z + cosf(gyaw) * SEG_LEN * la));
                 // Pull out AT the highest ground the descent is flowing into (never below it): a
@@ -2080,13 +2266,17 @@ struct Track {
                 // (gtLook==gt low) is unaffected. tunnelFloor=gt-5 below still allows an INTENTIONAL
                 // tunnel where the NEAR ground itself is the high point being bored through.
                 float gap      = gpos.y - gtLook;
+                // Floor the hills gap so maxSteep never shrinks below the cosine's own ballistic
+                // descent budget -- a hop trough breathes to its natural min dy (~-6/step) rather
+                // than getting pinned to 0 the instant gtLook creeps up to the hump.
+                if (mode == M_HILLS) gap = fmaxf(gap, 12.0f);
                 // MAX-DROP CAP (user: ~300 m ceiling on any single drop): treat the cap altitude
                 // (drop crest - 296) exactly like rising ground -- the same anticipatory sqrt budget
                 // arrests the descent smoothly AT the cap, after all smoothing, with no hard shelf.
                 // A drop that levels out here still elevated hands to the height-tolerant element
                 // families via nextMode's dropRun cap.
                 float maxSteep = sqrtf(2.0f * dlimPos * fmaxf(gap, 0.0f));
-                if (dy < -maxSteep) dy = -maxSteep;
+                if (dy < -maxSteep) { dy = -maxSteep; diveArrestedUp = true; }
             }
 
             // Hand CLIMB to DROP only at the APEX (dy crossing zero after the crest-lead in the
@@ -2099,9 +2289,10 @@ struct Track {
                 // entry speed/pitch (measured: a genFloor lift cascade + a 140 m ballistic tower).
                 if (signatureDive) {
                     if (gpos.y - gt > 100.0f) { initCliffDive(); return WUP; }   // apex high enough: dive from here (pitch ~0, the proper entry)
-                    signatureDive = false;   // apex fizzled low (entry wiggle): skip the dive this lap
+                    signatureDive = false;   // apex fizzled low (entry wiggle): drop out of this climb...
+                    if (++cliffFizzles <= 6) { cliffDone = false; cliffScanCool = 5; }   // ...but RE-ARM the signature this lap (spec: cliffdive >=1/lap) -- suppress the rim scan for a few elements so a later valley (structural plunge) takes it instead of the same fizzling rim. Bounded so a massif that can never hold a sub-300 crest can't loop the lap into all-climbs.
                 }
-                if (mode == M_CLIMB) { mode = M_DROP; remain = irnd(3, 4); dropTopY = gpos.y; }
+                if (mode == M_CLIMB) { mode = M_DROP; remain = irnd(3, 4); dropTopY = gpos.y; crownLatched = false; }
             }
         }
         gpos.y += dy;
@@ -2123,7 +2314,7 @@ struct Track {
         // terrain rises faster than the element can follow without the floor lift kinking it, END the
         // element so a terrain-following mode climbs the wall on a real curvature budget instead.
         if (remain > 2 && (mode == M_HELIX || mode == M_SCURVE || mode == M_TURN ||
-                           mode == M_DIVE  || mode == M_WINGOVER)) {
+                           mode == M_DIVE  || mode == M_WINGOVER || mode == M_STENGEL)) {
             float gtW = gt;
             for (int la = 1; la <= 5; la++)
                 gtW = fmaxf(gtW, groundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
@@ -2154,7 +2345,7 @@ struct Track {
             // the dive's crest arc carries the tangent continuously from the climb's ~57 deg grade
             // down over the edge, so a hard flat clamp here would inject a sharp convex crest kink.
             if (mode == M_CLIMB && signatureDive) { initCliffDive(); }
-            else { gpos.y = ceilY; if (mode == M_CLIMB) { mode = M_DROP; remain = irnd(3, 4); dropTopY = gpos.y; } }
+            else { gpos.y = ceilY; if (mode == M_CLIMB) { mode = M_DROP; remain = irnd(3, 4); dropTopY = gpos.y; crownLatched = false; } }
         }
 
         // M_BOOST is NO LONGER exempt here (LAUNCH still is -- it rides truly dead flat). A boost
@@ -2163,8 +2354,12 @@ struct Track {
         // 2nd-diff cap runs at vEffK=genV, which for a boost IS the thrust cruise (~85, see the genV
         // integrator), so it bounds the boost's trough pull-up to +12 felt at the true ride speed --
         // the backstop the excluded curvature budget never gave it.
+        // genGeomUp.y < 0.55 (steep seat bank) exempts the true banked ELEMENTS (their own budgets own
+        // the g). genGeomUp is the BASELINE (no-carry) up-vector, so a ROLL CARRY-THROUGH hold -- which
+        // leaves genPrevUp banked on level FLAT/DROP/DIP geometry -- does NOT spuriously disable this
+        // vertical-profile cap; the generated track stays bit-identical to baseline.
         if ((int)cp.size() >= 2 && mode != M_STATION && mode != M_LAUNCH &&
-            !isHardInversion((SegMode)kind.back()) && genPrevUp.y >= 0.55f) {
+            !isHardInversion((SegMode)kind.back()) && genGeomUp.y >= 0.55f) {
             Vector3 p0 = cp[cp.size() - 2], p1 = cp.back();
 
             float dxz0 = sqrtf((p1.x-p0.x)*(p1.x-p0.x) + (p1.z-p0.z)*(p1.z-p0.z));
@@ -2193,6 +2388,11 @@ struct Track {
             // the delta here to not cross the floor just stops this cap from re-introducing the exact
             // underground dive the arrest exists to prevent.
             float delta = clamped - sd;
+            // CAP-VS-ARREST: when the dive-arrest clamped dy UP this step (flattening the descent to clear
+            // rising/near terrain), p0/p1 still carry the steep dive's trend, so sd swings hard positive and
+            // a NEGATIVE g-cap delta drags gpos.y back down to re-steepen the exact dive the arrest just
+            // prevented (the fight described just below). Forbid the negative delta (mirror the floor guard).
+            if (diveArrestedUp && delta < 0.0f) delta = 0.0f;
             // M_DIP now supplies its OWN per-step floor (dipFloorGuard = its dy case's floorY,
             // which is WATER_Y+0.9 over a skimming pool -- so a negative g-cap delta can no
             // longer push a splashdown below the water surface). It used to be excluded here on
@@ -2262,7 +2462,11 @@ struct Track {
             upv = Vector3Normalize(Vector3Add(Vector3Scale(WUP, cosf(bank)),
                                               Vector3Scale(side, sinf(bank))));
         }
-        if (--remain <= 0) nextMode();
+        // A latched crown must finish ON the CLIMB label: if remain expires mid-crest, nextMode's
+        // M_CLIMB case hands the still-RISING track to enterDrop, which clears the latch and drops the
+        // crest-lead -- the DROP then free-climbs its residual +dy to a runaway crest. Hold the label
+        // so the crest-lead crown-over (or the ceilY clip) owns the apex instead.
+        if (--remain <= 0) { if (mode == M_CLIMB && crownLatched) remain = 2; else nextMode(); }
         return upv;
     }
 
@@ -2354,13 +2558,19 @@ struct Track {
             float rcEst   = fmaxf(30.0f, genV * genV / (GRAV * 6.3f));
             float apexEst = gpos.y + rcEst * (1.0f - cosf(cdPitch));
             float fx0 = gpos.x + sinf(cdYaw) * 85.0f, fz0 = gpos.z + cosf(cdYaw) * 85.0f;
-            if (apexEst - (groundTopAt(fx0, fz0) + 4.0f) < 145.0f) { enterDrop(irnd(2, 3)); return; }
+            // MIN-DROP FLOOR: 145 m for a natural-rim dive (cliffMode 1, which has the terrain drop);
+            // relaxed to 118 for the structural plunge (cliffMode 2) so a gentle/rising-relief lap
+            // still gets a real -- if slightly shorter -- signature dive rather than none (spec:
+            // cliffdive >=1/lap). Still a >100 m near-vertical plunge; the crest-cap and stall gates
+            // are untouched.
+            float minDrop = (cliffMode == 2) ? 118.0f : 145.0f;
+            if (apexEst - (groundTopAt(fx0, fz0) + 4.0f) < minDrop) { if (++cliffFizzles <= 6) { cliffDone = false; cliffScanCool = 5; } enterDrop(irnd(2, 3)); return; }   // too low for a real plunge: re-arm the signature same-lap (spec: cliffdive >=1/lap), rim scan suppressed so a valley structural plunge takes it
         }
         // CREST < 300 HARD (user): on a tall massif the signature climb terrain-follows the mesa back
         // up past the ceilY crest cap (the genFloor lift overrides it), so the dive would apex > 300.
         // Where the crest is already too high for a sub-300 apex, skip the dive this lap and hand to a
         // normal drop rather than run a CLIFFDIVE-labeled crest over the cap. apexY adds the crest arc.
-        if (gpos.y + fmaxf(30.0f, genV * genV / (GRAV * 6.3f)) * (1.0f - cosf(cdPitch)) > 296.0f) { enterDrop(irnd(2, 3)); return; }
+        if (gpos.y + fmaxf(30.0f, genV * genV / (GRAV * 6.3f)) * (1.0f - cosf(cdPitch)) > 296.0f) { if (++cliffFizzles <= 6) { cliffDone = false; cliffScanCool = 5; } enterDrop(irnd(2, 3)); return; }   // crest too high for a sub-300 apex: re-arm same-lap (rim scan suppressed so a lower valley structural plunge takes it); bounded so an all-too-tall massif can't loop
         mode    = M_CLIFFDIVE;
         // Cap how far the back-slope wedge may reach behind the rim: never far enough to rise over
         // track already built back there. Scan the existing cps in the mesa's lateral band that sit
@@ -2446,32 +2656,37 @@ struct Track {
 
     Vector3 stepDiveLoop() {
         if (remain > dlsteps) {
-            // S-curve (smoothstep) lead-in: level at both ends, all net drop in between -- see
-            // the long comment in initDiveLoop() for why (matches the loop's own level bottom
-            // tangent, so there's no kink at the handoff).
+            // Smoothstep CLIMB to the apex (level slope both ends) plus a heartline half-roll
+            // upright->inverted (sin term zero at both ends, so no lateral lean at the seams). The
+            // apex hands off horizontal AND inverted into the half-loop below -- a clean C1 seam.
             int   i = dlLeadSteps - (remain - dlsteps) + 1;
             float t = (float)i / (float)dlLeadSteps;
             float smooth = t * t * (3.0f - 2.0f * t);
             gpos = { dlLeadStart.x + dlf.x * SEG_LEN * (float)i,
-                      dlLeadStart.y - dlLeadDrop * smooth,
+                      dlLeadStart.y + dlLeadDrop * smooth,
                       dlLeadStart.z + dlf.z * SEG_LEN * (float)i };
+            float roll = PI * smooth;   // 0 -> PI : upright -> inverted, ready for the half-loop top
+            Vector3 upv = Vector3Normalize(Vector3Add(Vector3Scale(WUP, cosf(roll)),
+                                                      Vector3Scale(dlside, sinf(roll) * dlturn)));
             --remain;
-            return WUP;
+            return upv;
         }
-        dltheta += (2.0f * PI) / dlsteps;
-        float prog = dltheta / (2.0f * PI);
-        float e = prog * prog * (3.0f - 2.0f * prog);
-        float yawOff = dlturn * e;
-        Vector3 f    = Vector3RotateByAxisAngle(dlf,    WUP, yawOff);
-        Vector3 side = Vector3RotateByAxisAngle(dlside, WUP, yawOff);
+        // Half-loop DOWN: theta 0->PI. radial.y = +cos so theta=0 is the apex (top) and theta=PI is
+        // the bottom; the tangent runs +dlf at the top and -dlf at the bottom -- a ~180 deg heading
+        // reversal from the PITCH alone. A smootherstep lateral drift offsets the exit track sideways
+        // (teardrop); smootherstep's zero 1st AND 2nd derivative at both ends means the drift adds no
+        // curvature at the apex or the g-critical bottom, and never perturbs the entry/exit headings.
+        dltheta += PI / dlsteps;
+        float prog = dltheta / PI;
+        float e = prog * prog * prog * (prog * (prog * 6.0f - 15.0f) + 10.0f);
         float s = sinf(dltheta), c = cosf(dltheta);
-        Vector3 radial = { f.x * s, -c, f.z * s };
-        float lat = e * dlR * 1.15f;
-        gpos = { dlcenter.x + radial.x * dlR + side.x * lat,
+        Vector3 radial = { dlf.x * s, c, dlf.z * s };
+        float lat = e * dlR * 0.6f * dlturn;
+        gpos = { dlcenter.x + radial.x * dlR + dlside.x * lat,
                  dlcenter.y + radial.y * dlR,
-                 dlcenter.z + radial.z * dlR + side.z * lat };
+                 dlcenter.z + radial.z * dlR + dlside.z * lat };
         Vector3 upv = Vector3Normalize(Vector3Scale(radial, -1.0f));
-        if (--remain <= 0) { gyaw = atan2f(f.x, f.z); enterDrop(irnd(2, 3)); }
+        if (--remain <= 0) { gyaw = atan2f(-dlf.x, -dlf.z); enterDrop(irnd(2, 3)); }
         return upv;
     }
 
@@ -2518,6 +2733,15 @@ struct Track {
                 upEaseSteps = steepBankExit ? 7 : 5;   // shorter unwind window (user: roll return still too long)
                 upEaseInit  = upEaseSteps;
                 upEaseRate  = steepBankExit ? 0.22f : 0.38f;
+
+                // ROLL CARRY-THROUGH: a sustained-bank element (TURN/HELIX/DIVE/SCURVE/BANKAIR/WAVE/
+                // WINGOVER/STENGEL) flowing into a SHORT flat/drop should not unwind through dead-level
+                // if the next element re-banks. The up-vector is orientation only (it never moves gpos,
+                // so physics/stall are unaffected), so hold the exit lean across the gap and let the
+                // next element's easeUpVec slew from it (shortest path, C1). Capped at bankHoldMax cps
+                // so a genuine breather gap still returns to level promptly via upEaseSteps above.
+                if (isBankedElem((SegMode)lastGenMode)) bankHold = bankHoldMax;
+                else bankHold = 0;
 
                 if (lastGenMode == (unsigned char)M_COBRA)      { levelHold = 4; }
                 else if (isHardInversion((SegMode)lastGenMode) || lastGenMode == (unsigned char)M_HELIX) { seamEaseN = 4; seamEaseTot = 4; }
@@ -2567,42 +2791,56 @@ struct Track {
             if (gpos.y < gtN + mc) gpos.y = gtN + mc;
         }
 
-        if (mode == M_TURN || mode == M_HILLS || mode == M_DIVE || mode == M_BANKAIR ||
-            mode == M_WAVE || mode == M_SCURVE || mode == M_WINGOVER || mode == M_DIP ||
-            mode == M_FLAT || mode == M_DROP || mode == M_HELIX || mode == M_CLIMB) {
-            // Bank slew rate. The hard-banked high-g turns (TURN/DIVE/SCURVE/WINGOVER) track their
-            // heartline target faster (0.30) so the plateau spends its length AT full bank -- more of
-            // the lateral load rotates into the seat (raises sustained in-seat vert) instead of the
-            // bank perpetually lagging a still-ramping target. HELIX keeps the gentler 0.18 (its coil
-            // is long and already holds 5.5 g; a faster slew there risks overshoot at the tight top),
-            // and the airtime/transition modes keep 0.18 for smoothness.
-            // A CONTINUOUSLY-TURNING element (helix/turn/dive) has a bank target whose DIRECTION
-            // rotates every step as the heading sweeps. A slow slew can't track that rotation -- the
-            // seat would lag far behind and end up barely banked despite pulling strong lateral g.
-            // These need a FAST slew so the bank keeps up with the coil; only the airtime/transition
-            // modes want the gentle 0.18 smoothing.
-            // FLAT/DROP produce a LEVEL target (upv=WUP); their bank is a post-element UNWIND, not
-            // an in-turn slew, so they must NOT share the slow 0.18 in-turn cap -- that cap was
-            // masking the faster upEaseRate below and stretching the unwind to 7-10 cps (the "roll
-            // return too long, pollutes next section"). Let the upEaseSteps loop own their speed.
-            float upEase = (mode == M_HELIX) ? 0.60f
-                         : (mode == M_TURN || mode == M_DIVE) ? 0.50f
-                         : (mode == M_SCURVE || mode == M_WINGOVER) ? 0.38f
-                         : (mode == M_FLAT || mode == M_DROP) ? 0.60f : 0.18f;
-            upv = easeUpVec(genPrevUp, upv, upEase);
-        }
-
-        if (upEaseSteps > 0 && (mode == M_DROP || mode == M_FLAT)) {
-            // Pay the still-turning lateral-g tax only for the first ~2 cps (where the chord seam
-            // still carries heading rate, absorbed alongside by seamEaseN); after that the car runs
-            // straight, so unwind FAST to reach level promptly instead of bleeding lean into the
-            // next section. This keeps the deliberate slow seam handoff yet returns to horizontal in
-            // ~2-4 cps total rather than the old 7-10.
-            int   consumed = upEaseInit - upEaseSteps;
-            float rate = (consumed < 1) ? upEaseRate : fmaxf(upEaseRate, 0.66f);   // only the FIRST seam cp stays slow, then unwind hard to level -- user: roll-return still too slow / pollutes next section
-            upv = easeUpVec(genPrevUp, upv, rate);
-            upEaseSteps--;
-        }
+        // Up-vector easing. `target` is stepGeneric's raw up (a bank for the banked elements, WUP for
+        // FLAT/DROP). The SAME ease is applied to two tracks: `genGeomUp` (baseline, no carry -- feeds
+        // the g-cap gate so geometry is bit-identical to baseline) and the rendered output.
+        // ROLL CARRY-THROUGH: while a hold is active on a short FLAT/DROP/DIP gap, the OUTPUT keeps the
+        // banked element's exit lean (genPrevUp) instead of unwinding to level, so the next element's
+        // ease slews from the held lean (shortest path, C1) -- no dip through dead-horizontal. The
+        // baseline track still unwinds, so upEaseSteps bookkeeping and the g-cap gate are unchanged.
+        Vector3 target = upv;
+        // Only CARRY the lean where the track is genuinely near-level: holding a steep lean across an
+        // airtime cp (steep slope OR a valley/crest 2nd-difference) rotates the vertical g into the
+        // seat's lateral axis (a real sideways-throw, not just a render change) -- which is exactly why
+        // a drop UNWINDS. So a hold pauses on any airtime cp (the baseline unwind resumes there) and
+        // only spans the flat, low-g connective bits between two banked elements.
+        float dyNow  = gpos.y - yBefore;
+        float curNow = dyNow - genPrevDy;
+        bool  levelCp = (fabsf(dyNow) < 3.0f && fabsf(curNow) < 1.5f);
+        // levelHold marks a DELIBERATE level breather (mid-course brake run) -- never carry a lean into
+        // one; it exists to ride flat. Otherwise carry only genuinely near-level connective cps.
+        bool holdBank = (bankHold > 0 && levelCp && levelHold <= 0 &&
+                         (mode == M_DROP || mode == M_FLAT || mode == M_DIP));
+        auto applyEase = [&](Vector3 src) -> Vector3 {
+            Vector3 u = target;
+            if (mode == M_TURN || mode == M_HILLS || mode == M_DIVE || mode == M_BANKAIR ||
+                mode == M_WAVE || mode == M_SCURVE || mode == M_WINGOVER || mode == M_DIP ||
+                mode == M_FLAT || mode == M_DROP || mode == M_HELIX || mode == M_CLIMB) {
+                // Bank slew rate. Hard-banked turns (TURN/DIVE/SCURVE/WINGOVER) track their heartline
+                // faster so the plateau spends its length AT full bank; HELIX/airtime/transition modes
+                // keep the gentle 0.18. FLAT/DROP produce a LEVEL target -- their bank is a post-element
+                // unwind (below), not an in-turn slew, so they get the fast 0.60 not the slow 0.18.
+                float upEase = (mode == M_HELIX) ? 0.60f
+                             : (mode == M_TURN || mode == M_DIVE) ? 0.50f
+                             : (mode == M_SCURVE || mode == M_WINGOVER) ? 0.38f
+                             : (mode == M_FLAT || mode == M_DROP) ? 0.60f : 0.18f;
+                u = easeUpVec(src, u, upEase);
+            }
+            if (upEaseSteps > 0 && (mode == M_DROP || mode == M_FLAT)) {
+                // First seam cp stays slow (still-turning lateral-g tax, absorbed alongside by seamEaseN),
+                // then unwind hard to level so the roll returns in ~2-4 cps not the old 7-10.
+                int   consumed = upEaseInit - upEaseSteps;
+                float rate = (consumed < 1) ? upEaseRate : fmaxf(upEaseRate, 0.66f);
+                u = easeUpVec(src, u, rate);
+            }
+            return u;
+        };
+        Vector3 baseUp = applyEase(genGeomUp);          // baseline track: gate + upEaseSteps state
+        upv = holdBank ? genPrevUp : applyEase(genPrevUp);   // rendered track: carries the lean across the gap
+        if (upEaseSteps > 0 && (mode == M_DROP || mode == M_FLAT)) upEaseSteps--;   // baseline bookkeeping, once
+        if (holdBank) bankHold--;
+        else if (mode != M_DROP && mode != M_FLAT && mode != M_DIP) bankHold = 0;   // a real element cleared the hold
+        genGeomUp = baseUp;
         float appliedDy = gpos.y - yBefore;
         genPrevCurv = appliedDy - genPrevDy;
         genPrevDy   = appliedDy;
@@ -2621,7 +2859,7 @@ struct Track {
         }
         genPrevUp = upv;
         lastGenMode = tag;
-        pushCP(gpos, upv, tag, ch);
+        pushCP(gpos, upv, tag, ch, baseUp);
 
         if ((int)cp.size() >= 3) {
             int m = (int)cp.size() - 2;
@@ -2646,6 +2884,10 @@ struct Track {
                 cp[m] = Vector3Lerp(cp[m], Vector3Scale(Vector3Add(cp[m - 1], cp[m + 1]), 0.5f), w);
                 up[m] = Vector3Normalize(Vector3Lerp(up[m],
                             Vector3Scale(Vector3Add(up[m - 1], up[m + 1]), 0.5f), w));
+                // Smooth the baseline geomUp identically so the geometry passes below see the SAME
+                // post-smoothing up they would in baseline (ROLL CARRY-THROUGH decoupling).
+                geomUp[m] = Vector3Normalize(Vector3Lerp(geomUp[m],
+                            Vector3Scale(Vector3Add(geomUp[m - 1], geomUp[m + 1]), 0.5f), w));
             }
         }
 
@@ -2667,7 +2909,7 @@ struct Track {
 
                     if (ki == M_STATION) continue;
 
-                    if (up[i].y < 0.55f) continue;
+                    if (geomUp[i].y < 0.55f) continue;   // baseline up (see geomUp): a carried lean must not change which cps this vert-g relax processes
                     float dxa = sqrtf((cp[i].x-cp[i-1].x)*(cp[i].x-cp[i-1].x) + (cp[i].z-cp[i-1].z)*(cp[i].z-cp[i-1].z));
                     float dxb = sqrtf((cp[i+1].x-cp[i].x)*(cp[i+1].x-cp[i].x) + (cp[i+1].z-cp[i].z)*(cp[i+1].z-cp[i].z));
                     float span = fmaxf(0.5f * (dxa + dxb), 1.0f);
@@ -2720,7 +2962,7 @@ struct Track {
                     if (la < 1e-3f || lb < 1e-3f) continue;
                     Vector3 kap = Vector3Scale(Vector3Subtract(Vector3Scale(b, 1.0f / lb),
                                                Vector3Scale(a, 1.0f / la)), 1.0f / (0.5f * (la + lb)));
-                    Vector3 u   = Vector3Normalize(up[i]);
+                    Vector3 u   = Vector3Normalize(geomUp[i]);   // baseline up (see geomUp): the felt-g safety net must decompose against the same up baseline would, so a carried lean can't retrigger it
                     Vector3 tan = Vector3Normalize(Vector3Subtract(cp[i + 1], cp[i - 1]));
                     Vector3 lat = Vector3CrossProduct(u, tan);
                     float ll = Vector3Length(lat); if (ll > 1e-4f) lat = Vector3Scale(lat, 1.0f / ll);
@@ -2769,7 +3011,7 @@ struct Track {
                 if (tf <= genFloorY) {            // terrain at/below the floor: follow it down, reset the climb
                     genFloorY = tf; genFloorVy = 0.0f;
                 } else {                           // terrain above: climb toward it, easing the slope in (bounded g)
-                    genFloorVy = fminf(genFloorVy + 1.8f, 10.0f);   // +accel cap (curvature ~ +6 g at 80 m/s) ... slope cap 10 m/cp (~36 deg)
+                    genFloorVy = fminf(genFloorVy + 0.9f, 10.0f);   // +accel cap 0.9 (was 1.8): EASE the floor up so the ratchet climbs terrain smoothly, not in steps. slope cap 10 m/cp (~36 deg)
                     genFloorY += genFloorVy;
                     if (genFloorY > tf) { genFloorY = tf; genFloorVy = 0.0f; }
                 }
@@ -2777,7 +3019,12 @@ struct Track {
                     float vFloor  = fmaxf(gvlog[i], 20.0f);
                     float dlimF   = Clamp(6.0f * SEG_LEN * SEG_LEN * GRAV / (vFloor * vFloor), 0.6f, 18.0f);
                     float trendDy = (i >= 2) ? (cp[i - 1].y - cp[i - 2].y) : 0.0f;
-                    float maxLiftY = cp[i - 1].y + trendDy + dlimF;   // curvature-safe ceiling for this single step
+                    // Decelerate the lift smoothly INTO genFloorY (sqrt approach, mirrors the dive-arrest)
+                    // instead of ramping at full trend+dlimF until it abruptly catches the floor and stops
+                    // -- that catch-and-stop is the genFloorY ratchet's vertical micro-jitter.
+                    float gapF     = genFloorY - cp[i - 1].y;
+                    float vDecel   = sqrtf(2.0f * dlimF * fmaxf(gapF, 0.0f));
+                    float maxLiftY = cp[i - 1].y + fminf(trendDy + dlimF, vDecel);   // curvature-safe, decel into floor
                     cp[i].y = fminf(genFloorY, maxLiftY);
                     if (cp[i].y < cp[i - 1].y) cp[i].y = cp[i - 1].y;   // never lift backwards past the last frozen cp
                 }
