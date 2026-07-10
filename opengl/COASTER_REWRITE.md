@@ -32,6 +32,16 @@ approach as untrustworthy by default, not as prior art to consult, port, or matc
    especially for elements where no solid real-world anchor exists (turn radius, corkscrew roll
    rate, and other gaps that doc lists explicitly).
 
+## Process rule: no patching (user, 2026-07-09)
+
+V1 became unmaintainable through ten days of local patches layered on local patches. The standing
+rule for V2 — both while building it and for all later fixes: **don't patch a defect in place;
+fully rewrite or redo the affected unit** (the whole primitive, schedule, or check — not a guard
+clause bolted on top), **and when the change overlaps neighbouring code, re-check the surrounding
+system (up to the whole module) rather than trusting the seams.** Then re-run the acceptance
+harness. If a fix feels like a one-line special case, that's the V1 pattern re-entering — step
+back and rebuild the unit it belongs to.
+
 ## Why a rewrite is required
 
 The current generator is a streaming state machine that alternates modes (`FLAT`, `DROP`,

@@ -107,6 +107,17 @@ element (see per-element notes below for what's actually sourced vs. estimated).
 doubling) and not ~3s flat (naive "same size, just faster"). Use the `k_r/k_v` relationship above,
 not this specific example, to compute actual targets per element.
 
+**Refinement (user, 2026-07-09, supersedes a strict reading of the 0.70–0.80 band):** the ratio
+band and the size band can conflict — at `k_v ≤ 1.5`, holding `k_r/k_v ≤ 0.80` caps `k_r` at
+~1.2, which keeps every element away from the top of its 1.0–1.5x WR size band. When that
+happens (i.e., when `k_r/k_v` "seems low" for the size the element wants), **slide the ratio
+toward ~1.0 — transit time ≈ the real element's time — so built size can reach the ~1.5x WR
+scale.** Treat `k_r/k_v ∈ [0.70, 1.0]` as the working range: toward 0.70–0.80 for modest-size
+instances, toward 1.0 when pushing an element to the grand end of its size band. **All of these
+user-given numbers are soft targets, not precise constants: within ±5% is good, within ±10% is
+acceptable, closer is better.** That tolerance philosophy applies to the user's other numeric
+targets in this doc too, unless one is explicitly marked as a hard cap.
+
 ### The real physics of curve shape vs. g-force (peer-reviewed, use this for within-element curve design)
 
 The `k_r/k_v` ratio above governs how an element's *overall* size scales with entry speed — a
