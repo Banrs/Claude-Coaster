@@ -1,5 +1,5 @@
 // V1 baseline generator. V2 must use the modular route builder specified in
-// ../../COASTER_REWRITE.md rather than extending this state machine.
+// ../COASTER_REWRITE.md rather than extending this state machine.
 // Shared water predicate for V1 consumers.
 static inline bool submergedGround(float groundTopY) { return groundTopY <= WATER_Y + 0.01f; }
 

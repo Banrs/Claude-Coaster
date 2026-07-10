@@ -3,6 +3,20 @@
 Status: authoritative implementation brief. Do **not** add corrective passes to the V1
 generator. Preserve it only as a comparison baseline while V2 is built alongside it.
 
+## Start here
+
+1. Read this file in full, then [`docs/SHAPES.md`](../docs/SHAPES.md) and
+   [`docs/TERRAIN_CONTRACT.md`](../docs/TERRAIN_CONTRACT.md).
+2. Do not open `coaster_track.cpp` planning to patch it. Any fix for a symptom described below
+   goes into the new `opengl/src/track/` modules, not into the V1 state machine.
+3. First concrete step is Migration sequence item 1: create the `opengl/src/track/` module
+   skeleton and a `TrackV2` adapter that matches the existing `Track` interface, with no V1
+   behavior changes. Do not begin with turns/inversions/terrain — line, connector, top-hat,
+   camelback, and drop come first, per item 2.
+4. If you find yourself writing a smoothing pass, a terrain-floor ratchet, or a per-sample pitch
+   edit, stop — that is exactly the pattern this rewrite exists to remove (see "What to remove
+   or quarantine" below).
+
 ## Why a rewrite is required
 
 The current generator is a streaming state machine that alternates modes (`FLAT`, `DROP`,
