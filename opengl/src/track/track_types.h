@@ -185,11 +185,11 @@ Pose emitConnector(Route& r, const Pose& target, Tag tag, bool chain);
 // crest->exit heights, meters) — never terrain-relative. Face lengths are
 // solved from them; too-small heights for the given transitions are a
 // planner error (asserted).
-// All numeric defaults here and below are provisional harness values, NOT
-// locked design targets (REALISM_SCALE.md "ask before locking in").
+// Defaults marked LOCKED come from REALISM_SCALE.md "Locked element targets"
+// (user decisions 2026-07-10); the rest remain provisional harness values.
 struct TopHatSpec {
-    float riseH = 180.0f;
-    float dropH = 175.0f;
+    float riseH = 230.0f;   // LOCKED 2026-07-10: 1.4x Falcon's Flight 163 m
+    float dropH = 225.0f;
     float thetaFace = 1.13446401f; // 65 deg
     float rampIn = 100.0f;         // entry transition arc length
     float crestLen = 60.0f;        // crest transition arc length
@@ -300,8 +300,8 @@ Pose emitCliffDive(Route& r, const CliffDiveSpec& spec);
 // (opened 2026-07-09) -> game band 55-82 m; the default below is PROVISIONAL
 // pending the ask-before-locking-in pass.
 struct LoopSpec {
-    float height = 70.0f;   // raw vertical diameter, entry rail to top rail (m)
-    float vEntry = 40.0f;   // design entry speed (m/s) — shapes the teardrop
+    float height = 78.0f;   // LOCKED 2026-07-10: 1.43x Tormenta 54.6 m
+    float vEntry = 44.0f;   // design entry speed (m/s) — shapes the teardrop
     float rampLen = 25.0f;  // entry/exit clothoid length
 };
 Pose emitLoop(Route& r, const LoopSpec& spec);
@@ -313,8 +313,8 @@ Pose emitLoop(Route& r, const LoopSpec& spec);
 // (pi-theta, psi+pi, phi+pi) — identical tangent and frame) so downstream
 // primitives see a standard level pose.
 struct ImmelmannSpec {
-    float height = 75.0f;   // raw rise, entry to the inverted exit rail (m), PROVISIONAL
-    float vEntry = 42.0f;
+    float height = 95.0f;   // LOCKED 2026-07-10: 1.43x Tormenta 66.4 m
+    float vEntry = 47.0f;
     float rampLen = 25.0f;
     float twistLen = 70.0f; // half-roll run-out length
 };

@@ -216,8 +216,8 @@ static void testStep2Route() {
     int runs;
     elemHeights(r, Tag::TopHat, rise, drop, runs);
     CHECK(runs == 1, "one top hat, got %d", runs);
-    CHECK(fabsf(rise - 180.0f) < 1.0f, "top hat rise %g (want 180)", rise);
-    CHECK(fabsf(drop - 175.0f) < 1.0f, "top hat drop %g (want 175)", drop);
+    CHECK(fabsf(rise - 230.0f) < 1.0f, "top hat rise %g (want 230)", rise);
+    CHECK(fabsf(drop - 225.0f) < 1.0f, "top hat drop %g (want 225)", drop);
 
     elemHeights(r, Tag::Camelback, rise, drop, runs);
     CHECK(runs == 2, "two camelbacks, got %d", runs);
@@ -530,12 +530,12 @@ static void testStep5Route() {
     int runs;
     elemHeights(r, Tag::Loop, rise, drop, runs);
     CHECK(runs == 1, "one loop, got %d", runs);
-    CHECK(fabsf(rise - 70.0f) < 1.0f, "loop height %g (want 70)", rise);
-    CHECK(fabsf(drop - 70.0f) < 2.0f, "loop closes, drop %g", drop);
+    CHECK(fabsf(rise - 78.0f) < 1.0f, "loop height %g (want 78)", rise);
+    CHECK(fabsf(drop - 78.0f) < 2.0f, "loop closes, drop %g", drop);
 
     elemHeights(r, Tag::Immelmann, rise, drop, runs);
     CHECK(runs == 1, "one immelmann, got %d", runs);
-    CHECK(fabsf(rise - 75.0f) < 1.0f, "immelmann rise %g (want 75)", rise);
+    CHECK(fabsf(rise - 95.0f) < 1.0f, "immelmann rise %g (want 95)", rise);
     CHECK(drop < 2.0f, "immelmann exits at its top, drop %g", drop);
 
     // Exit heading reversed relative to the entry line.
@@ -548,7 +548,7 @@ static void testStep5Route() {
     // Report felt g at loop top/bottom (diagnostic, not the authoring input).
     for (const SegmentRec& s : r.segs)
         if (s.tag == Tag::Loop) {
-            float v0 = 40.0f;
+            float v0 = 44.0f;
             int iTop = 0;
             float yTop = -1e9f, y0 = s.entry.pos.y;
             for (size_t i = 0; i < r.samples.size(); i++)

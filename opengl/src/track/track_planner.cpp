@@ -51,7 +51,7 @@ Route buildStep2RouteDs(uint32_t seed, float ds) {
     emitLine(r, 30.0f, Tag::Station, false);
     emitLine(r, 120.0f, Tag::Launch, true);
 
-    TopHatSpec hat; // defaults: 180 up / 175 down, 65 deg faces
+    TopHatSpec hat; // locked defaults: 230 up / 225 down, 65 deg faces
     emitTopHat(r, hat);
 
     emitLine(r, 40.0f, Tag::Line, false);
@@ -113,9 +113,8 @@ Route buildStep3RouteDs(uint32_t seed, float ds) {
 }
 
 // Step-5 proof route: the first two inversions — vertical loop and
-// Immelmann. Same provisional-size caveat; loop 70 m and Immelmann 75 m sit
-// inside the 1.0-1.5x band of their Tormenta Rampaging Run anchors
-// (54.6 m / 66.4 m, REALISM_SCALE.md) pending the ask-before-locking-in pass.
+// Immelmann, at the LOCKED grand sizes (78 m / 95 m = 1.43x their Tormenta
+// anchors; REALISM_SCALE.md "Locked element targets", user 2026-07-10).
 Route buildStep5Route(uint32_t seed) { return buildStep5RouteDs(seed, 1.0f); }
 Route buildStep5RouteDs(uint32_t seed, float ds) {
     (void)seed;
@@ -126,15 +125,15 @@ Route buildStep5RouteDs(uint32_t seed, float ds) {
 
     emitLine(r, 50.0f, Tag::Line, false);
 
-    LoopSpec loop; // 70 m teardrop @ 40 m/s entry
+    LoopSpec loop; // locked: 78 m teardrop @ 44 m/s entry
     emitLoop(r, loop);
 
     emitLine(r, 50.0f, Tag::Line, false);
 
-    ImmelmannSpec imm; // 75 m half-loop + half-roll @ 42 m/s
+    ImmelmannSpec imm; // locked: 95 m half-loop + half-roll @ 47 m/s
     emitImmelmann(r, imm);
 
-    // Exits reversed, 75 m above the entry line — run back over the route.
+    // Exits reversed, 95 m above the entry line — run back over the route.
     emitLine(r, 80.0f, Tag::Line, false);
 
     buildFrames(r);

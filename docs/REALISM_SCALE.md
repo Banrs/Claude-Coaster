@@ -112,8 +112,7 @@ band and the size band can conflict — at `k_v ≤ 1.5`, holding `k_r/k_v ≤ 0
 ~1.2, which keeps every element away from the top of its 1.0–1.5x WR size band. When that
 happens (i.e., when `k_r/k_v` "seems low" for the size the element wants), **slide the ratio
 toward ~1.0 — transit time ≈ the real element's time — so built size can reach the ~1.5x WR
-scale.** Treat `k_r/k_v ∈ [0.70, 1.0]` as the working range: toward 0.70–0.80 for modest-size
-instances, toward 1.0 when pushing an element to the grand end of its size band. **All of these
+scale.** Treat `k_r/k_v ∈ [0.9, 1.1]` as the working range. **All of these
 user-given numbers are soft targets, not precise constants: within ±5% is good, within ±10% is
 acceptable, closer is better.** That tolerance philosophy applies to the user's other numeric
 targets in this doc too, unless one is explicitly marked as a hard cap.
@@ -178,6 +177,29 @@ before hardcoding it — don't unilaterally pick a number within the 1.0–1.5x 
 especially for elements where the research below found no solid real-world anchor (turn radius,
 corkscrew roll rate — see gaps below). The user may want specific elements pushed toward the top
 or bottom of the range for pacing/variety reasons that aren't derivable from research alone.
+
+## Locked element targets (user decisions, 2026-07-10 — supersede "provisional" markers)
+
+Confirmed via the ask-before-locking-in process; the ±5%/±10% soft-tolerance rule applies:
+
+| Decision | Value | Basis |
+|---|---|---|
+| Signature element size | **~1.4–1.5x WR** ("grand"), `k_r/k_v ≈ 0.95–1.0` (transit ≈ real time) | User pick; anchors per element below |
+| Top hat (signature) | **~230 m** rise | 1.4x Falcon's Flight 163 m structure |
+| Camelback (flagship) | **~240 m** | 1.45x Falcon's 165 m airtime hill; smaller instances scale down with entry speed (see note below) |
+| Vertical loop | **~78 m** | 1.43x Tormenta 54.6 m |
+| Immelmann | **~95 m** | 1.43x Tormenta 66.4 m |
+| Main drop | **~280 m** | 1.44x Falcon's 195 m elevation drop |
+| Corkscrew roll rate | **90–100°/s** (S5-eased ends) | User pick over a GENUINE data gap — **flagged: re-research if real data ever surfaces**; radius from the loop family scaled down (~10–14 m, design estimate) |
+| Zero-g stall hold | **2–2.5 s** inverted weightless hold | User pick; real anchor is a weak ~2 s estimate (Pantheon) |
+| Inversions per lap | **1–3** | User pick (was 2–4 in V1-era rules) |
+| Inversion roster | loop, Immelmann, dive loop, corkscrew, zero-g stall — **banana roll, heartline roll, wingover/overbank-inversion, pretzel stay excluded** | User re-confirmed the old exclusions |
+
+**Instance-size note (this project's interpretation, flag if wrong):** the 1.0x floor binds each
+element family's *flagship* instance (the grandest camelback ≥ its WR anchor); smaller instances
+of repeatable elements (hills, loops in multi-inversion stretches) scale down with live entry
+speed per the sizing rule, bounded below by the small end of that family's real examples (e.g.
+El Toro-class 25–34 m hills), not by the flagship anchor.
 
 ## g-force scaling
 
@@ -297,6 +319,18 @@ teardrop shape claim; the specific "Werner Stengel 1976" attribution is widely r
 independently re-verified against a primary source in this pass — flag if a hard citation for that
 specific claim is needed. No sourced numeric transit-time-vs-height relationship was found for any
 loop — derive one from the `k_r/k_v` relationship above, or measure empirically once implemented.
+
+**V2 implementation note (2026-07-10, this project's own construction, derived from the cited
+toolkit):** `emitLoop` builds the teardrop as S5 clothoid entry/exit ramps around a
+**constant-centripetal arc** — `κ(y) = a_C / v²(y)` with energy-conserving `v²(y)` — which is
+automatically tightest at the top (the teardrop property); `a_C` is bisected so the loop's raw
+height matches the spec. Felt g (Müller's formula) is `a_C/g + cosθ`: measured at a 70 m loop with
+40 m/s entry, top ≈ **1.05 g at 54 km/h** — physically in line with real loops. This is a
+project-derived construction consistent with (not lifted from) Pendrill 2005's constant-g-segment
+recipe; the alternative (their exact `1/r` θ-formula) can be swapped in later if a closer match to
+a specific real loop profile is ever wanted. A planar loop's entry/exit tracks cross in the loop
+plane — real Stengel loops incline slightly; that tilt/offset is a **planner placement concern**
+(step 6), noted in `track_primitives.cpp`.
 
 ### Immelmann / dive loop / pretzel loop
 
