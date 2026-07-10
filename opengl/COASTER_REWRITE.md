@@ -1,7 +1,12 @@
 # Procedural Track V2
 
 Status: authoritative implementation brief. Do **not** add corrective passes to the V1
-generator. Preserve it only as a comparison baseline while V2 is built alongside it.
+generator. V2 is a **full, ground-up rewrite** — not a refactor, not a cleanup, not a port. V1
+stays in the tree only so the game keeps building/running while V2 is developed alongside it, and
+as a *conceptual* pointer to which element names/behaviors need to exist (a loop, a top hat, a
+helix) — it is **not** a proper reference for *how* to build any of them. V1 is the ten days of
+overlapping, conflicting patches that caused this rewrite; treat its actual code, formulas, and
+approach as untrustworthy by default, not as prior art to consult, port, or match output against.
 
 ## Start here
 
@@ -10,8 +15,11 @@ generator. Preserve it only as a comparison baseline while V2 is built alongside
    [`docs/REALISM_SCALE.md`](../docs/REALISM_SCALE.md) (element sizing/speed/pacing rules and the
    real-world research behind every number — read this before assigning any size, speed, or
    duration target to an element).
-2. Do not open `coaster_track.cpp` planning to patch it. Any fix for a symptom described below
-   goes into the new `opengl/src/track/` modules, not into the V1 state machine.
+2. Do not open `coaster_track.cpp` planning to patch it — and do not open it planning to *learn
+   from* it either. It's not a working reference to consult for "how does V1 do X" before writing
+   the V2 version; it's the untrusted output of ten days of overlapping patches, which is why V2
+   exists. Any fix for a symptom described below goes into the new `opengl/src/track/` modules,
+   built from this doc's primitives and real-world research, not from reading V1's code.
 3. First concrete step is Migration sequence item 1: create the `opengl/src/track/` module
    skeleton and a `TrackV2` adapter that matches the existing `Track` interface, with no V1
    behavior changes. Do not begin with turns/inversions/terrain — line, connector, top-hat,
@@ -167,9 +175,16 @@ face with zero curvature at both ends, and cannot create a horizontal shelf.
 - Generated wave turns. Until a dedicated primitive is implemented, map them to the single
   camelback primitive.
 
-The V1 code and its diagnostics are intentionally quarantined as baseline code. Do not copy its
-state-machine fields, target-slope rules, or comments into V2. Git history is the archive for
-historical tuning notes; no previous handoff or TODO file is normative.
+The V1 code and its diagnostics are intentionally quarantined as baseline code, not as a reference
+implementation. **Do not copy or port any of it into V2** — not its state-machine fields, not its
+target-slope rules, not its comments, not its formulas, not its overall approach or control flow.
+Treating V1 as something to consult "just for how it handles X" is exactly how the old spaghetti
+pattern re-enters V2 — every V1 fix was itself a patch on top of prior patches; there is no clean
+layer in it worth extracting. If a V1 function's *name* or a comment nearby happens to describe a
+real requirement (e.g., "cliff dive must aim at a scanned ridge"), treat that as a hint to verify
+against `SHAPES.md`/`TERRAIN_CONTRACT.md`/`REALISM_SCALE.md` or fresh research — never as something
+to read the implementing code for. Git history is the archive for historical tuning notes; no
+previous handoff or TODO file, and no V1 source file, is normative for V2's design.
 
 ## Acceptance harness for V2
 
