@@ -395,7 +395,12 @@ void buildFrames(Route& r) {
         Sample& B = r.samples[i];
         Vector3 v = transportStep(A.up, A.tan, B.tan);
         float dRoll = B.roll - A.roll;
-        if (fabsf(B.pitch - A.pitch) > 2.0f) dRoll = 0.0f; // normalization joint
+        // Bookkeeping joints carry no physical twist: inversion-exit
+        // normalization flips pitch by ~pi, and full-rotation wraps step the
+        // stored roll by 2*pi (stall) or 2*pi*cos(alpha) (corkscrew, whose
+        // transport holonomy supplies the rest). Real designed roll never
+        // steps more than ~0.1 rad per sample, so |dRoll| > 1 is a joint.
+        if (fabsf(B.pitch - A.pitch) > 2.0f || fabsf(dRoll) > 1.0f) dRoll = 0.0f;
         B.up = rotateAbout(v, B.tan, dRoll);
     }
 

@@ -123,6 +123,9 @@ static void sweepSamples(const Route& r, ValidationReport& rep) {
 
         // Roll rate must be continuous everywhere outside deliberate joints
         // (the railway-transition constraint: no step in droll/ds).
+        // Bookkeeping wraps (|dRoll| > 1: full-rotation unwind at a stall/
+        // corkscrew exit) are joints like the pitch flips.
+        if (fabsf(B.roll - A.roll) > 1.0f) flipPair = true;
         float rollRate = (B.roll - A.roll) / ds;
         if (havePrevRollRate && !flipPair && !prevFlipPair) {
             float jump = fabsf(rollRate - prevRollRate);
@@ -479,6 +482,92 @@ void checkImmelmann(const Route& r, const ElemRun& run, ValidationReport& rep) {
     (void)dTop; // exit height == rise by definition; kept for clarity
 }
 
+void checkDiveLoop(const Route& r, const ElemRun& run, ValidationReport& rep) {
+    // Half-roll to inverted, then a descending half-teardrop: pitch falls
+    // monotonically to ~-pi, exits upright, reversed, and much lower.
+    float minPitch = 10.0f, minUpY = 1.0f, rollLo = 100.0f, rollHi = -100.0f;
+    for (int i = run.i0; i <= run.i1; i++) {
+        minPitch = fminf(minPitch, r.samples[i].pitch);
+        minUpY = fminf(minUpY, r.samples[i].up.y);
+        rollLo = fminf(rollLo, r.samples[i].roll);
+        rollHi = fmaxf(rollHi, r.samples[i].roll);
+    }
+    if (fabsf(minPitch + kPi) > degToRad(2.0f))
+        fail(rep, run, r, "descending half-loop does not reach -pi");
+    if (minUpY > -0.9f) fail(rep, run, r, "never inverted");
+    if (fabsf((rollHi - rollLo) - kPi) > degToRad(2.0f))
+        fail(rep, run, r, "twist is not a half-roll");
+    if (r.samples[run.i0].up.y < 0.98f || r.samples[run.i1].up.y < 0.98f)
+        fail(rep, run, r, "entry/exit not upright");
+    float fall = r.segs[run.firstSeg].entry.pos.y - r.segs[run.lastSeg].exit.pos.y;
+    if (fall < 10.0f) fail(rep, run, r, "does not exit low");
+}
+
+void checkZeroGStall(const Route& r, const ElemRun& run, ValidationReport& rep) {
+    // Fully-inverted hold between the two half-rolls, with felt g == 0 over
+    // the hold — verified from the geometry alone: derive v^2 at the first
+    // hold sample from kappa = -g*cos(th)/v^2, then energy-track it and
+    // demand the stored curvature stays on the ballistic law.
+    // Hold core: the inverted region (roll pinned at pi) minus 20 m at each
+    // end — V2's own construction places ~12 m C2 blends plus the S5 twist
+    // tails there, which are NOT on the ballistic arc. The hold DIVES as it
+    // falls — up tilts with pitch, so the inversion criterion is
+    // up.y < -0.5, with the felt-g law as the real property being enforced.
+    int r0 = -1, r1 = -1;
+    for (int i = run.i0; i <= run.i1; i++) {
+        if (fabsf(r.samples[i].roll - kPi) < 0.05f) {
+            if (r0 < 0) r0 = i;
+            r1 = i;
+        }
+    }
+    int trim = (int)(20.0f / r.ds);
+    int h0 = r0 + trim, h1 = r1 - trim;
+    if (r0 < 0 || (h1 - h0) * r.ds < 30.0f) {
+        fail(rep, run, r, "no inverted ballistic hold section");
+        return;
+    }
+    for (int i = h0; i <= h1; i++)
+        if (r.samples[i].up.y > -0.5f) {
+            fail(rep, run, r, "hold not inverted");
+            break;
+        }
+    const Sample& s0 = r.samples[h0];
+    float v20 = -9.81f * cosf(s0.pitch) / s0.kPitch;
+    if (v20 < 25.0f) {
+        fail(rep, run, r, "implausible hold speed");
+        return;
+    }
+    for (int i = h0; i <= h1; i++) {
+        const Sample& s = r.samples[i];
+        float vv = v20 - 2.0f * 9.81f * (s.pos.y - s0.pos.y);
+        float felt = (vv * s.kPitch) / 9.81f + cosf(s.pitch);
+        if (fabsf(felt) > 0.06f) {
+            fail(rep, run, r, "hold is not weightless (felt g off the ballistic arc)");
+            break;
+        }
+    }
+}
+
+void checkCorkscrew(const Route& r, const ElemRun& run, ValidationReport& rep) {
+    // One full rider rotation along a cone-precession path: upright in and
+    // out, inverted mid-element, symmetric pitch oscillation, heading kept.
+    float minUpY = 1.0f, maxPitch = -10.0f, minPitch = 10.0f;
+    for (int i = run.i0; i <= run.i1; i++) {
+        minUpY = fminf(minUpY, r.samples[i].up.y);
+        maxPitch = fmaxf(maxPitch, r.samples[i].pitch);
+        minPitch = fminf(minPitch, r.samples[i].pitch);
+    }
+    // Full inversion occurs while the tangent is pitched at the cone angle,
+    // so up.y bottoms out at -cos(alpha), not -1.
+    if (minUpY > -cosf(maxPitch) + 0.06f) fail(rep, run, r, "never inverted");
+    if (r.samples[run.i0].up.y < 0.98f || r.samples[run.i1].up.y < 0.98f)
+        fail(rep, run, r, "entry/exit not upright");
+    if (fabsf(maxPitch + minPitch) > degToRad(3.0f))
+        fail(rep, run, r, "pitch oscillation asymmetric");
+    float dYaw = angDiff(r.segs[run.lastSeg].exit.yaw, r.segs[run.firstSeg].entry.yaw);
+    if (dYaw > degToRad(2.0f)) fail(rep, run, r, "heading not preserved");
+}
+
 void checkDrop(const Route& r, const ElemRun& run, ValidationReport& rep) {
     // The drop must hold a sustained face and finish its planned pull-out
     // (exit pitch equals the segment record's plan — no early hand-off).
@@ -522,6 +611,9 @@ ValidationReport validateRoute(const Route& r, const TerrainQuery* terrain) {
             case Tag::CliffDive: checkCliffDive(r, run, rep); break;
             case Tag::Loop:      checkLoop(r, run, rep); break;
             case Tag::Immelmann: checkImmelmann(r, run, rep); break;
+            case Tag::DiveLoop:  checkDiveLoop(r, run, rep); break;
+            case Tag::ZeroGStall: checkZeroGStall(r, run, rep); break;
+            case Tag::Corkscrew: checkCorkscrew(r, run, rep); break;
             default: break;
         }
     }

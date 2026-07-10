@@ -318,39 +318,41 @@ struct PitchTable {
 constexpr float kGrav = 9.81f;
 
 // Integrate the teardrop for a given ramp peak curvature. sweep = total pitch
-// to traverse (2*pi for a loop, pi for an Immelmann half-loop). Returns the
-// table and reports max height + final speed^2; maxY > requested height means
-// kappa0 is too small (loop too big).
+// to traverse, SIGNED: +2*pi for a loop, +pi for an Immelmann half-loop,
+// -pi for a dive loop's descending half. `reach` is the vertical extent in
+// the direction of travel (max rise for climbing sweeps, max descent for
+// diving ones); reach > requested height means kappa0 is too small.
 PitchTable integrateTeardrop(float kappa0, float sweep, float rampLen, float v0,
-                             float theta0, float* maxYOut, float* aCOut) {
+                             float theta0, float* reachOut, float* aCOut) {
     PitchTable t;
     t.th = std::make_shared<std::vector<float>>();
     t.k = std::make_shared<std::vector<float>>();
     const float h = t.h;
-    float th = theta0, y = 0.0f, s = 0.0f, maxY = 0.0f;
+    const float dir = sweep >= 0.0f ? 1.0f : -1.0f;
+    float th = theta0, y = 0.0f, s = 0.0f, reach = 0.0f;
     float aC = 0.0f; // fixed once the entry ramp hands over
     bool inArc = false;
     auto v2 = [&](float yy) { return v0 * v0 - 2.0f * kGrav * yy; };
     t.th->push_back(th);
     t.k->push_back(0.0f);
-    const float sMax = 40.0f * sweep / fmaxf(kappa0, 1e-4f) + 4.0f * rampLen;
+    const float sMax = 40.0f * fabsf(sweep) / fmaxf(kappa0, 1e-4f) + 4.0f * rampLen;
     while (s < sMax) {
         float kap;
         if (s < rampLen) {
-            kap = kappa0 * s5(s / rampLen);
+            kap = dir * kappa0 * s5(s / rampLen);
         } else {
             if (!inArc) { aC = kappa0 * v2(y); inArc = true; }
             float vv = v2(y);
-            if (vv < 25.0f) { *maxYOut = 1e9f; *aCOut = aC; return t; } // stall: too slow
-            kap = aC / vv;
+            if (vv < 25.0f) { *reachOut = 1e9f; *aCOut = aC; return t; } // stall: too slow
+            kap = dir * aC / vv;
         }
         // Exit ramp: when the remaining sweep equals what a mirrored S5 ramp
-        // at the CURRENT curvature would consume (kap*rampLen/2), hand over.
-        // The ramp runs its FULL length so curvature lands exactly at zero;
-        // the sweep it delivers matches the handoff criterion to within one
-        // integration step (~0.2 deg), absorbed by the join tolerances.
-        float remain = (theta0 + sweep) - th;
-        if (inArc && remain <= kap * rampLen * 0.5f) {
+        // at the CURRENT curvature would consume (|kap|*rampLen/2), hand
+        // over. The ramp runs its FULL length so curvature lands exactly at
+        // zero; the sweep it delivers matches the handoff criterion to
+        // within one integration step (~0.2 deg).
+        float remain = dir * ((theta0 + sweep) - th);
+        if (inArc && remain <= fabsf(kap) * rampLen * 0.5f) {
             float kExit = kap;
             float sExitStart = s;
             while (s < sMax) {
@@ -359,7 +361,7 @@ PitchTable integrateTeardrop(float kappa0, float sweep, float rampLen, float v0,
                 kap = kExit * (1.0f - s5(u));
                 th += kap * h;
                 y += sinf(th) * h;
-                maxY = fmaxf(maxY, y);
+                reach = fmaxf(reach, dir * y);
                 s += h;
                 t.th->push_back(th);
                 t.k->push_back(kap);
@@ -368,32 +370,32 @@ PitchTable integrateTeardrop(float kappa0, float sweep, float rampLen, float v0,
         }
         th += kap * h;
         y += sinf(th) * h;
-        maxY = fmaxf(maxY, y);
+        reach = fmaxf(reach, dir * y);
         s += h;
         t.th->push_back(th);
         t.k->push_back(kap);
     }
     t.len = ((float)t.th->size() - 1.0f) * h;
-    *maxYOut = maxY;
+    *reachOut = reach;
     *aCOut = aC;
     return t;
 }
 
 PitchTable solveTeardrop(float height, float sweep, float rampLen, float v0,
                          float theta0, float* aCOut) {
-    // Bisect kappa0: larger kappa0 -> tighter loop -> lower max height.
+    // Bisect kappa0: larger kappa0 -> tighter loop -> smaller vertical reach.
     float lo = 0.2f / height, hi = 24.0f / height;
     PitchTable best;
     float aC = 0.0f;
     for (int i = 0; i < 40; i++) {
         float mid = 0.5f * (lo + hi);
-        float maxY;
-        best = integrateTeardrop(mid, sweep, rampLen, v0, theta0, &maxY, &aC);
-        if (maxY > height) lo = mid; else hi = mid;
+        float reach;
+        best = integrateTeardrop(mid, sweep, rampLen, v0, theta0, &reach, &aC);
+        if (reach > height) lo = mid; else hi = mid;
     }
-    float maxY;
-    best = integrateTeardrop(0.5f * (lo + hi), sweep, rampLen, v0, theta0, &maxY, &aC);
-    assert(fabsf(maxY - height) < 0.75f && "teardrop failed to converge: vEntry too low for height?");
+    float reach;
+    best = integrateTeardrop(0.5f * (lo + hi), sweep, rampLen, v0, theta0, &reach, &aC);
+    assert(fabsf(reach - height) < 0.75f && "teardrop failed to converge: entry speed vs height?");
     *aCOut = aC;
     return best;
 }
@@ -436,6 +438,197 @@ Pose emitImmelmann(Route& r, const ImmelmannSpec& sp) {
     n.kPitch = -n.kPitch;
     r.endPose = n;
     return n;
+}
+
+Pose emitDiveLoop(Route& r, const DiveLoopSpec& sp) {
+    const Pose e = r.endPose;
+    assert(fabsf(e.kPitch) < 1e-4f && fabsf(e.kYaw) < 1e-4f && "dive loop needs a straight entry");
+    assert(fabsf(e.roll) < 1e-4f && fabsf(e.pitch) < 0.02f && "dive loop needs a level unbanked entry");
+    // Half-roll to inverted level flight...
+    emitSchedule(r, sp.twistLen, constantProfile(e.pitch), constantProfile(e.yaw),
+                 rampProfile(0.0f, kPi, sp.twistLen), Tag::DiveLoop, false);
+    // ...then dive through the descending half-teardrop (sweep -pi).
+    float aC;
+    PitchTable t = solveTeardrop(sp.height, -kPi, sp.rampLen, sp.vTop, e.pitch, &aC);
+    Profile1D pf = t.profile();
+    emitSchedule(r, t.len, pf, constantProfile(e.yaw), constantProfile(kPi),
+                 Tag::DiveLoop, false);
+    // Exit is (~-pi, psi, pi): normalize to the equivalent level upright pose
+    // (pi-(-pi)=2pi==0, psi+pi, pi+pi==0) — identical tangent and frame.
+    Pose n = r.endPose;
+    n.pitch = kPi - n.pitch - 2.0f * kPi;
+    n.yaw = n.yaw + kPi;
+    n.roll = n.roll - kPi;
+    n.kPitch = -n.kPitch;
+    r.endPose = n;
+    return n;
+}
+
+Pose emitZeroGStall(Route& r, const ZeroGStallSpec& sp) {
+    const Pose e = r.endPose;
+    assert(fabsf(e.kPitch) < 1e-4f && fabsf(e.kYaw) < 1e-4f && "stall needs a straight entry");
+    assert(fabsf(e.roll) < 1e-4f && fabsf(e.pitch) < 0.02f && "stall needs a level unbanked entry");
+    Profile1D yawC = constantProfile(e.yaw);
+    const float v2Apex = sp.vApex * sp.vApex;
+    const float kHoldIn = -kGrav / v2Apex; // ballistic curvature at level pitch
+    const float blendLen = 12.0f;
+
+    // 1. Half-roll in, level straight flight.
+    emitSchedule(r, sp.twistLen, constantProfile(e.pitch), yawC,
+                 rampProfile(0.0f, kPi, sp.twistLen), Tag::ZeroGStall, false);
+
+    // 2. C2 blend from straight flight into the free-fall arc's curvature.
+    float thBlend = e.pitch + kHoldIn * blendLen * 0.5f;
+    emitSchedule(r, blendLen,
+                 quinticProfile(e.pitch, 0.0f, 0.0f, thBlend, kHoldIn, 0.0f, blendLen),
+                 yawC, constantProfile(kPi), Tag::ZeroGStall, false);
+
+    // 3. The hold: the exact free-fall arc, kappa = -g*cos(th)/v^2(y) — felt
+    // g is zero by construction (Mueller: v^2*kappa + g*cos(th) = 0; the
+    // zero-g limit of the Nordmark & Essen constant-force family).
+    // Pre-integrated from the blend's exit; length = vApex * holdTime.
+    const float holdLen = sp.vApex * sp.holdTime;
+    PitchTable t;
+    t.th = std::make_shared<std::vector<float>>();
+    t.k = std::make_shared<std::vector<float>>();
+    {
+        const float h = t.h;
+        float th = r.endPose.pitch, y = 0.0f;
+        t.th->push_back(th);
+        t.k->push_back(-kGrav * cosf(th) / v2Apex);
+        for (float s = 0.0f; s < holdLen; s += h) {
+            float vv = v2Apex - 2.0f * kGrav * y;
+            float kap = -kGrav * cosf(th) / vv;
+            th += kap * h;
+            y += sinf(th) * h;
+            t.th->push_back(th);
+            t.k->push_back(kap);
+        }
+        t.len = ((float)t.th->size() - 1.0f) * h;
+    }
+    float thHold1 = t.th->back();
+    float kHold1 = t.k->back();
+    emitSchedule(r, t.len, t.profile(), yawC, constantProfile(kPi), Tag::ZeroGStall, false);
+
+    // 4. C2 blend out of the arc to a straight diving grade.
+    float thExit = thHold1 + kHold1 * blendLen * 0.5f;
+    emitSchedule(r, blendLen,
+                 quinticProfile(thHold1, kHold1, 0.0f, thExit, 0.0f, 0.0f, blendLen),
+                 yawC, constantProfile(kPi), Tag::ZeroGStall, false);
+
+    // 5. Half-roll out — same rotation direction (RMC stall: 180 in, hold,
+    // the remaining 180 back upright; 360 total) on the straight grade.
+    emitSchedule(r, sp.twistLen, constantProfile(thExit), yawC,
+                 rampProfile(kPi, 2.0f * kPi, sp.twistLen), Tag::ZeroGStall, false);
+
+    // 6. Pull up to level; wrap the full-rotation roll bookkeeping (identity).
+    emitSchedule(r, sp.pullOutLen, rampProfile(thExit, 0.0f, sp.pullOutLen), yawC,
+                 constantProfile(2.0f * kPi), Tag::ZeroGStall, false);
+    r.endPose.roll -= 2.0f * kPi;
+    return r.endPose;
+}
+
+Pose emitCorkscrew(Route& r, const CorkscrewSpec& sp) {
+    const Pose e = r.endPose;
+    assert(fabsf(e.kPitch) < 1e-4f && fabsf(e.kYaw) < 1e-4f && "corkscrew needs a straight entry");
+    assert(fabsf(e.roll) < 1e-4f && fabsf(e.pitch) < 0.02f && "corkscrew needs a level unbanked entry");
+    // Geometry from the locked roll rate: element length = v * (360/rate);
+    // cone angle from the path radius.
+    float length = sp.vElement * (360.0f / sp.rollRateDegS);
+    float sinA = 2.0f * kPi * sp.radius / length;
+    assert(sinA < 0.85f && "corkscrew too tight: radius vs roll rate/speed");
+    float alpha = asinf(sinA);
+
+    // Entry pitch ramp 0 -> alpha (the cone tangent starts climbing at
+    // alpha); C2 because the cone path is curvature-free at phi=0 (phi'=0).
+    Profile1D yawC = constantProfile(e.yaw);
+    emitSchedule(r, sp.pitchRamp, rampProfile(e.pitch, e.pitch + alpha, sp.pitchRamp), yawC,
+                 constantProfile(0.0f), Tag::Corkscrew, false);
+
+    // Tabulate the cone-precession schedule: phi runs 0 -> 2*pi as
+    // phi(u) = 2*pi*S5(u), so phi' = 2*pi*S5'(u)/L is ZERO at both ends
+    // (curvature-free entry/exit) and peaks at 1.875x the average mid-element
+    // — the locked 90-100 deg/s roll rate is the AVERAGE; the S5 peak runs
+    // proportionally higher, as any eased profile must.
+    PitchTable pt;
+    pt.th = std::make_shared<std::vector<float>>();
+    pt.k = std::make_shared<std::vector<float>>();
+    std::shared_ptr<std::vector<float>> psiT = std::make_shared<std::vector<float>>();
+    std::shared_ptr<std::vector<float>> psiK = std::make_shared<std::vector<float>>();
+    const float h = pt.h;
+    const float yaw0 = r.endPose.yaw;
+    int n = (int)(length / h) + 1;
+    float prevPsi = yaw0;
+    for (int i = 0; i <= n; i++) {
+        float s = fminf((float)i * h, length);
+        float u = s / length;
+        float phi = 2.0f * kPi * s5(u);
+        float phid = 2.0f * kPi * s5d(u) / length;
+        float ca = cosf(alpha), sa = sinf(alpha);
+        // T in the frame A=heading(yaw0), U=up, W=A x U (right of heading).
+        float tA = ca, tU = sa * cosf(phi), tW = sa * sinf(phi);
+        float th = asinf(tU);
+        // Horizontal components: A and W are both horizontal.
+        float hx = tA * sinf(yaw0) + tW * cosf(yaw0); // W = right of +Z-ish heading
+        float hz = tA * cosf(yaw0) - tW * sinf(yaw0);
+        float psi = atan2f(hx, hz);
+        while (psi - prevPsi > kPi) psi -= 2.0f * kPi;
+        while (psi - prevPsi < -kPi) psi += 2.0f * kPi;
+        prevPsi = psi;
+        // Derivatives: dT/ds = sa*phid*(-sin(phi)*U + cos(phi)*W).
+        float dtU = -sa * sinf(phi) * phid;
+        float dtW = sa * cosf(phi) * phid;
+        float cth = cosf(th);
+        float kP = (cth > 1e-4f) ? dtU / cth : 0.0f;
+        float horiz2 = tA * tA + tW * tW;
+        float kY = (horiz2 > 1e-6f) ? (tA * dtW) / horiz2 : 0.0f; // d(atan2(tW,tA))/ds
+        pt.th->push_back(th);
+        pt.k->push_back(kP);
+        psiT->push_back(psi);
+        psiK->push_back(kY);
+    }
+    pt.len = length;
+    Profile1D pitchP = pt.profile();
+    float lenC = length;
+    Profile1D yawP{
+        [psiT, h, lenC](float s) {
+            if (s <= 0.0f) return (*psiT)[0];
+            if (s >= lenC) return psiT->back();
+            float fi = s / h; int i = (int)fi; float f = fi - (float)i;
+            if (i + 1 >= (int)psiT->size()) return psiT->back();
+            return (*psiT)[i] * (1.0f - f) + (*psiT)[i + 1] * f;
+        },
+        [psiK, h, lenC](float s) {
+            if (s <= 0.0f) return (*psiK)[0];
+            if (s >= lenC) return psiK->back();
+            float fi = s / h; int i = (int)fi; float f = fi - (float)i;
+            if (i + 1 >= (int)psiK->size()) return psiK->back();
+            return (*psiK)[i] * (1.0f - f) + (*psiK)[i + 1] * f;
+        }};
+    // Designed roll: 2*pi*cos(alpha) total, synchronized with phi — the cone
+    // holonomy 2*pi*(1-cos(alpha)) supplies the remainder of the full rider
+    // rotation, so the frame exits upright (verified by the harness).
+    // SIGN: the cone precesses clockwise viewed along travel (U -> W), while
+    // positive roll is counterclockwise in this module's convention — both
+    // designed roll and holonomy are therefore negative, summing to -2*pi.
+    float rollTotal = -2.0f * kPi * cosf(alpha);
+    Profile1D rollP{
+        [rollTotal, lenC](float s) { return rollTotal * s5(fminf(s / lenC, 1.0f)); },
+        [rollTotal, lenC](float s) { return rollTotal * s5d(fminf(s / lenC, 1.0f)) / lenC; }};
+    emitSchedule(r, length, pitchP, yawP, rollP, Tag::Corkscrew, false);
+    // Full rider rotation == identity frame: normalize the roll bookkeeping
+    // in BOTH the end pose and the segment record (rollTotal is not a 2*pi
+    // multiple — the missing holonomy share lives in the transported frame,
+    // which the join check cannot see; the record must say "upright", which
+    // physically it is).
+    r.endPose.roll -= rollTotal;
+    r.segs.back().exit.roll -= rollTotal;
+
+    // Exit pitch ramp alpha -> level.
+    Pose x = r.endPose;
+    Pose out = emitSchedule(r, sp.pitchRamp, rampProfile(x.pitch, e.pitch, sp.pitchRamp), yawC,
+                            constantProfile(x.roll), Tag::Corkscrew, false);
+    return out;
 }
 
 // ---------------------------------------------------------------------------

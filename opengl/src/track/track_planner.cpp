@@ -120,7 +120,7 @@ Route buildStep5RouteDs(uint32_t seed, float ds) {
     (void)seed;
     Route r;
     Pose p0;
-    p0.pos = Vector3{0.0f, 30.0f, 0.0f};
+    p0.pos = Vector3{0.0f, 50.0f, 0.0f};
     startRoute(r, p0, ds);
 
     emitLine(r, 50.0f, Tag::Line, false);
@@ -134,7 +134,23 @@ Route buildStep5RouteDs(uint32_t seed, float ds) {
     emitImmelmann(r, imm);
 
     // Exits reversed, 95 m above the entry line — run back over the route.
-    emitLine(r, 80.0f, Tag::Line, false);
+    emitLine(r, 40.0f, Tag::Line, false);
+
+    DiveLoopSpec dl; // the Immelmann's mirror: dives the 95 m back down
+    emitDiveLoop(r, dl);
+
+    // Reversed again: original heading, back near the entry altitude.
+    emitLine(r, 40.0f, Tag::Line, false);
+
+    ZeroGStallSpec st; // locked: 2.25 s weightless inverted hold
+    emitZeroGStall(r, st);
+
+    emitLine(r, 30.0f, Tag::Line, false);
+
+    CorkscrewSpec cs; // locked band: 95 deg/s full rotation
+    emitCorkscrew(r, cs);
+
+    emitLine(r, 60.0f, Tag::Line, false);
 
     buildFrames(r);
     return r;

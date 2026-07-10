@@ -538,12 +538,49 @@ static void testStep5Route() {
     CHECK(fabsf(rise - 95.0f) < 1.0f, "immelmann rise %g (want 95)", rise);
     CHECK(drop < 2.0f, "immelmann exits at its top, drop %g", drop);
 
-    // Exit heading reversed relative to the entry line.
+    elemHeights(r, Tag::DiveLoop, rise, drop, runs);
+    CHECK(runs == 1, "one dive loop, got %d", runs);
+    CHECK(rise < 2.0f, "dive loop enters at its top, rise %g", rise);
+    CHECK(fabsf(drop - 95.0f) < 1.0f, "dive loop descent %g (want 95)", drop);
+
+    elemHeights(r, Tag::ZeroGStall, rise, drop, runs);
+    CHECK(runs == 1, "one stall, got %d", runs);
+    CHECK(drop > 30.0f && drop < 110.0f, "stall ballistic drop %g", drop);
+
+    elemHeights(r, Tag::Corkscrew, rise, drop, runs);
+    CHECK(runs == 1, "one corkscrew, got %d", runs);
+
+    // Immelmann reverses; the dive loop reverses back; the corkscrew keeps
+    // heading — the route ends on its original heading.
     float entryYaw = r.segs.front().entry.yaw;
     float exitYaw = r.segs.back().exit.yaw;
-    float d = fmodf(fabsf(exitYaw - (entryYaw + kPi)), 2.0f * kPi);
+    float d = fmodf(fabsf(exitYaw - entryYaw), 2.0f * kPi);
     if (d > kPi) d = 2.0f * kPi - d;
-    CHECK(d < 1e-3f, "immelmann reversed heading off by %g deg", radToDeg(d));
+    CHECK(d < 2e-2f, "final heading off by %g deg", radToDeg(d));
+
+    // Stall hold: ~2.25 s at 25 m/s == ~56 m of inverted, weightless track
+    // (the ballistic-curvature core between the C2 blends).
+    {
+        int held = 0;
+        for (const Sample& s : r.samples)
+            if (s.tag == Tag::ZeroGStall && fabsf(s.roll - kPi) < 0.05f &&
+                fabsf(s.kPitch) > 0.006f)
+                held++;
+        float heldLen = (float)held * r.ds;
+        printf("  stall: inverted weightless hold %.0f m (~%.2f s at 25 m/s)\n", heldLen,
+               heldLen / 25.0f);
+        CHECK(heldLen > 45.0f && heldLen < 80.0f, "stall hold length %g m", heldLen);
+    }
+
+    // Corkscrew: full rotation with upright exit; report the cone angle.
+    {
+        float maxPitch = 0.0f;
+        for (const Sample& s : r.samples)
+            if (s.tag == Tag::Corkscrew) maxPitch = fmaxf(maxPitch, s.pitch);
+        printf("  corkscrew: cone angle %.1f deg\n", radToDeg(maxPitch));
+        CHECK(maxPitch > degToRad(20.0f) && maxPitch < degToRad(50.0f),
+              "corkscrew cone angle %g deg", radToDeg(maxPitch));
+    }
 
     // Report felt g at loop top/bottom (diagnostic, not the authoring input).
     for (const SegmentRec& s : r.segs)

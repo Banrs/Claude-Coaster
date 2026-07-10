@@ -320,6 +320,51 @@ struct ImmelmannSpec {
 };
 Pose emitImmelmann(Route& r, const ImmelmannSpec& spec);
 
+// Dive loop — the Immelmann's mirror (REALISM_SCALE.md: no dedicated anchor;
+// targets derived from the loop family): half-roll to inverted level flight,
+// then a DESCENDING half-teardrop (curvature tightest at the slow top),
+// exiting fast, level, upright, heading reversed, `height` lower.
+struct DiveLoopSpec {
+    float height = 95.0f;   // raw descent (m), mirrors the Immelmann target
+    float vTop = 14.0f;     // speed entering the dive at the top (m/s)
+    float rampLen = 25.0f;
+    float twistLen = 70.0f;
+};
+Pose emitDiveLoop(Route& r, const DiveLoopSpec& spec);
+
+// Zero-g stall (REALISM_SCALE.md: an INVERSION — RMC signature): half-roll to
+// inverted, then a ballistic hold — the exact free-fall arc
+// kappa = -g*cos(theta)/v^2(y), felt g == 0 by construction (the zero-g
+// limiting case of the Nordmark & Essen constant-force family) — then the
+// remaining half-roll (same direction, 360 total) and a pull-up to level.
+// Hold time LOCKED 2026-07-10: 2-2.5 s.
+struct ZeroGStallSpec {
+    float vApex = 25.0f;    // speed over the stall (m/s)
+    float holdTime = 2.25f; // seconds of weightless hold (LOCKED band 2-2.5)
+    float twistLen = 55.0f;
+    float pullOutLen = 45.0f;
+};
+Pose emitZeroGStall(Route& r, const ZeroGStallSpec& spec);
+
+// Corkscrew (REALISM_SCALE.md: GENUINE data gap — roll rate LOCKED at
+// 90-100 deg/s by user decision 2026-07-10, FLAGGED for re-research; radius
+// a design estimate from the loop family scaled down). The path tangent
+// precesses around a horizontal axis at cone angle alpha:
+//   T(s) = cos(a)*A + sin(a)*(cos(phi)*U + sin(phi)*W),  phi' S5-eased,
+// which is curvature-free at both ends by construction (phi'=0 there), so
+// straight track joins C2 after simple pitch ramps 0->alpha. Designed roll
+// totals 2*pi*cos(alpha): the cone's parallel-transport holonomy
+// 2*pi*(1-cos(alpha)) supplies the rest of the rider's full 360 rotation, so
+// the exit lands exactly upright. alpha = asin(2*pi*radius/length) with
+// length = v * 360deg/rollRate.
+struct CorkscrewSpec {
+    float radius = 9.0f;       // path radius around the corkscrew axis (m)
+    float rollRateDegS = 95.0f; // LOCKED band 90-100 deg/s (flagged)
+    float vElement = 30.0f;    // design speed through the element (m/s)
+    float pitchRamp = 20.0f;   // entry/exit ramps 0 <-> alpha
+};
+Pose emitCorkscrew(Route& r, const CorkscrewSpec& spec);
+
 // track_planner.cpp — whole-ride beat planning (built out in steps 2+).
 // buildSmokeRoute: minimal deterministic route used by the step-1/2 harness.
 Route buildSmokeRoute(uint32_t seed);
