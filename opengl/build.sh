@@ -1,7 +1,5 @@
 #!/bin/zsh
 cd "$(dirname "$0")"
-# Vendored raylib lives at the REPO root (../src/vendor/raylib from here); the old
-# fallback looked in ./src/vendor and never fired, so Macs without CMake couldn't build.
 RLDIR=""
 for d in ../src/vendor/raylib/src src/vendor/raylib/src; do
   [[ -d "$d" ]] && RLDIR="$d" && break

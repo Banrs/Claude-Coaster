@@ -1,5 +1,8 @@
 # MINECOASTER — Vulkan renderer
 
+> Track note: this renderer still consumes the V1 generator as a temporary compatibility path.
+> Do not add track behavior here; migrate it to the renderer-neutral V2 route adapter when V2 lands.
+
 A from-scratch **Vulkan** rewrite of the MINECOASTER renderer, replacing the
 raylib/OpenGL immediate-mode path. Cross-platform by design (Windows + Linux
 natively, macOS via **MoltenVK**), and structured so the DXR/RTX path tracer from
@@ -12,7 +15,7 @@ Two motivations:
 2. **Performance** — one indexed draw for the world instead of ~hundreds of
    thousands of per-cube `rlBegin/rlEnd` calls.
 
-## Status (see `WORK_HANDOFF.md` for the full state of work)
+## Status
 
 Builds and renders **headlessly** (verified on Mesa **lavapipe** software Vulkan —
 no GPU required) and interactively via SDL2:
@@ -28,7 +31,7 @@ no GPU required) and interactively via SDL2:
   `../opengl/src/coaster_track.cpp` compiled via `GameCompat.h` (not a port); ride
   physics mirrored in `Physics.h` (constants + thrust synced 2026-07-06); exact
   base-game HUD (`Hud.h`) with the shared geometry-aware element names.
-- ⏳ Next (priority order in `WORK_HANDOFF.md`): CSM shadows, split-sum IBL, DLSS
+- ⏳ Planned renderer work: CSM shadows, split-sum IBL, DLSS
   backend seam, async streaming, station stops.
 - ⏳ `IRenderer` seam so `../win-rtx` (D3D12/DXR + DLSS) is the Windows RTX backend.
 

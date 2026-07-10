@@ -1,10 +1,9 @@
-// CoasterTrack.h — drives the *real* physics-driven generator from
-// ../../opengl/src/coaster_track.cpp (compiled via GameCompat.h) and turns its
-// control points into rail/spine/tie/support/train box meshes for the renderer.
+// V1 track adapter for the Vulkan renderer. It is retained only until Vulkan consumes the
+// renderer-neutral V2 route interface described in ../../opengl/COASTER_REWRITE.md.
 #pragma once
 #include "GameCompat.h"
 #include "Track.h"                       // world::addBox / addQuad / Mesh / Vec3
-#include "../../opengl/src/coaster_track.cpp"   // struct Track (+ coaster_elements_ext.cpp)
+#include "../../opengl/src/coaster_track.cpp"   // V1 baseline only
 #include <cstdio>
 
 namespace world {

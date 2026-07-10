@@ -1,5 +1,8 @@
 # MINECOASTER Vulkan port — master plan
 
+> Track integration in this document describes the current V1 compatibility path only. New track
+> work follows `../opengl/COASTER_REWRITE.md` and must target a shared V2 route interface.
+
 Goal: port the **entire** raylib game (`../opengl/src/*.cpp`) to the Vulkan renderer in
 `vk/`, and implement the full modern-renderer feature list. Work continues until
 everything below is checked. Each item: build + lavapipe screenshot verify + commit

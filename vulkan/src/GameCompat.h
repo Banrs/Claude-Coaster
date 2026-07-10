@@ -1,8 +1,5 @@
-// GameCompat.h — minimal raylib/game shim so the *actual* coaster generator
-// (../../opengl/src/coaster_track.cpp) compiles unchanged inside the Vulkan build.
-// Provides the symbols that file references: Vector3 + the raymath subset, the
-// physics constants, the RNG, the SegMode enum, Color/Theme, and
-// groundTopAt() (backed by the ported terrainH in Terrain.h).
+// V1 compatibility shim for the shared OpenGL track generator. V2 should depend on a
+// renderer-neutral route interface instead of compiling another backend's implementation.
 #pragma once
 #include "Terrain.h"     // world::terrainH, world::WATER_Y
 #include <cmath>
@@ -41,7 +38,7 @@ static inline float Clamp(float v, float lo, float hi){ return v<lo?lo:(v>hi?hi:
 static inline Vector3 vlerp(Vector3 a, Vector3 b, float s){
     return { a.x+(b.x-a.x)*s, a.y+(b.y-a.y)*s, a.z+(b.z-a.z)*s };
 }
-// up-vector slerp clamp + Catmull-Rom (centripetal), ported from ../../src/main.cpp
+// V1 spline helpers.
 static inline Vector3 easeUpVec(Vector3 from, Vector3 to, float maxRad){
     from=Vector3Normalize(from); to=Vector3Normalize(to);
     float d=Clamp(Vector3DotProduct(from,to),-1.0f,1.0f); float ang=acosf(d);
@@ -65,11 +62,7 @@ static inline Vector3 catmull(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, fl
     return vlerp(B1,B2,(tt-t1)/(t2-t1));
 }
 
-// ---- physics / sizing constants ----
-// These FEED the shared coaster_track.cpp generator (it reads LAUNCH_V/CLIMB_V/BOOST_TRIG/...),
-// so a stale hand-kept mirror here built a DIFFERENT ride than the OpenGL game. They now live in
-// ONE header included by both hosts. WATER_Y (world-dependent, see below) and WUP (needs this
-// host's Vector3) deliberately stay per-host.
+// V1 physics constants. Water level and up-vector remain host-specific.
 #include "../../opengl/src/ride_constants.h"
 static const Vector3 WUP = { 0, 1, 0 };
 
@@ -80,7 +73,7 @@ static inline float rnd01(){ return (xr32() & 0xffffff) / 16777216.0f; }
 static inline float frnd(float a, float b){ return a + (b-a)*rnd01(); }
 static inline int   irnd(int a, int b){ return a + (int)(xr32() % (uint32_t)(b-a+1)); }
 
-// ---- element tags (mirror ../../src/main.cpp enum SegMode) ----
+// V1 element tags.
 enum SegMode { M_FLAT, M_CLIMB, M_DROP, M_HILLS, M_TURN, M_LOOP, M_ROLL,
                M_STATION, M_DIP, M_LAUNCH, M_HELIX, M_BOOST, M_IMMEL,
                M_SCURVE, M_DIVE, M_BANKAIR, M_WAVE,
@@ -89,10 +82,7 @@ enum SegMode { M_FLAT, M_CLIMB, M_DROP, M_HILLS, M_TURN, M_LOOP, M_ROLL,
                M_PRETZEL, M_STENGEL, M_BANANA,
                M_COUNT };
 
-// WORLD-DEPENDENT sea level: must equal the sea level of the world the generator builds over
-// (opengl world sea=30, vulkan=64). groundTopAt() floors at world::WATER_Y=64, so the old 30
-// here made every `groundTopAt(...) <= WATER_Y + 0.01f` skim test in the shared generator DEAD
-// in the Vulkan build. That is why WATER_Y does NOT live in the shared ride_constants.h header.
+// World-dependent sea level.
 static const float WATER_Y = world::WATER_Y;
 static const Color RAIL = {190,198,212,255};
 static int   gForceElem  = -1;                       // generator debug knobs (unused here)

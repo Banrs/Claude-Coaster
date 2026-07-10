@@ -1,5 +1,8 @@
 # MINECOASTER Vulkan port — work handoff
 
+> The direct V1 track inclusion described below is compatibility-only. It is not a track-design
+> requirement and must be replaced by the V2 route adapter.
+
 Continuation brief for a new agent (originally written on the
 `claude/vulkan-port-alpha-pkif4h` branch — since merged; develop on whatever branch
 your session assigns). The goal is a **Vulkan renderer in `vulkan/` that has
@@ -102,7 +105,7 @@ after the shared generator's entry pre-braking was removed upstream).
   ride loop — before that sync the Vulkan build was generating a slower,
   inversion-starved ride from stale constants. Re-run `--ride` telemetry after any
   upstream physics/pacing change; the base game's own gates are
-  `opengl/minecoaster --audit / --census / --pacing`.
+  the V1 OpenGL diagnostic modes.
 - Known cosmetic nit: the HUD SCORE digits slightly overlap the "SCORE" label
   (pre-existing `Hud.h::buildGameHud` layout, was just hidden when score was always 0).
 

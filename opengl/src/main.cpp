@@ -24,15 +24,13 @@
 #include <atomic>
 #include <climits>
 
-// Shared physics/sizing constants (SEG_LEN, BUILD_MAX, GRAV, DRAG, FRICTION, CHAIN_V, MIN_V,
-// MAX_V, LAUNCH_V, CLIMB_V, V_GUARD, BOOST_V, BOOST_TRIG) live in one header the Vulkan host
-// includes too -- they FEED the shared generator, so a stale mirror built a different ride.
+// V1 shared physics constants. V2 will own a renderer-neutral configuration.
 #include "ride_constants.h"
 static const float CELL      = 1.0f;
 static const int   TERRA_R   = 320;   // 20 chunks * 16 m/chunk (TERRAIN_BUCKET) render distance
 
-static const float WATER_Y   = 30.0f;   // opengl world sea level -- WORLD-DEPENDENT, stays per-host (vulkan=64); see ride_constants.h
-static const float TERRA_MAX  = 340.0f;
+static const float WATER_Y   = 18.0f;   // low basin water, not the default height of the entire world
+static const float TERRA_MAX  = 280.0f;
 
 static const Vector3 WUP = { 0, 1, 0 };
 
@@ -184,18 +182,6 @@ static float smooth01(float a, float b, float x) {
     return t * t * (3.0f - 2.0f * t);
 }
 
-// SIGNATURE CLIFF DIVE rim: a single track-registered synthetic mesa the once-per-lap dive plunges
-// off. The track generator (coaster_track.cpp, #included below) calls registerMesa() at the climb
-// crest so terrainH() presents a real rim EXACTLY where the scripted dive goes over the edge -- the
-// forward-marching dy generator could never carve a true near-vertical FACE, so instead the terrain
-// supplies one. Lifts-only (never lowers natural ground). One live site; re-registering moves it.
-static bool  gMesaOn   = false;
-static float gMesaX    = 0.0f, gMesaZ = 0.0f, gMesaYaw = 0.0f, gMesaTopY = 0.0f;
-static float gMesaBackMax = 1e9f;   // how far the back-slope wedge may extend behind the rim before it drops to natural -- capped by the caller so the mesa can never rise over track already built behind the crest
-static void registerMesa(float x, float z, float yaw, float topY, float backMax) {
-    gMesaX = x; gMesaZ = z; gMesaYaw = yaw; gMesaTopY = topY; gMesaBackMax = backMax; gMesaOn = true;
-}
-
 static float hashf(int x, int z) {
     uint32_t h = (uint32_t)x * 374761393u + (uint32_t)z * 668265263u;
     h = (h ^ (h >> 13)) * 1274126177u;
@@ -236,56 +222,37 @@ static int terrainH(float x, float z) {
     float e   = fbm(wx * 0.0040f + 31.7f, wz * 0.0040f + 12.3f, 2);
     float pv  = ridgef(wx * 0.0048f + 5.0f, wz * 0.0048f + 9.0f, 3);
     float det = fbm(wx * 0.020f, wz * 0.020f, 2);
-    float mesaMask = smooth01(0.58f, 0.82f, fbm(wx * 0.0010f + 101.0f, wz * 0.0010f + 44.0f, 2));
     float basin    = smooth01(0.72f, 0.94f, 1.0f - ridgef(wx * 0.0022f + 3.7f, wz * 0.0022f + 8.1f, 2));
-    float mountainRegion = smooth01(0.50f, 0.84f, fbm(wx * 0.00085f + 9.0f, wz * 0.00085f + 73.0f, 2));
+    float mountainRegion = smooth01(0.58f, 0.86f, fbm(wx * 0.00085f + 9.0f, wz * 0.00085f + 73.0f, 2));
     float valleyMask = smooth01(0.62f, 0.90f, ridgef(wx * 0.0017f + 61.0f, wz * 0.0017f + 19.0f, 2));
 
     float midHill = fbm(wx * 0.008f + 32.0f, wz * 0.008f + 77.0f, 3) - 0.5f;
-    float base = 24.0f + powf(c, 1.30f) * 150.0f;
-    float mAmp = powf(1.0f - e, 1.62f);
-    float mtn  = powf(pv, 2.36f) * mAmp * (92.0f + 142.0f * mountainRegion);
-    float h = base + mtn + (det - 0.5f) * 14.0f + midHill * 22.0f;
-    h += powf(pv, 5.0f) * smooth01(0.48f, 0.92f, mountainRegion) * (42.0f + 46.0f * (1.0f - e));
+    // Minecraft-like rolling terrain: a dry, high plain interrupted by varied ridges and
+    // valleys, rather than low ocean everywhere or a field of cylindrical mesas.  The coaster
+    // is permitted to cut through this relief; terrain does not dictate each track tangent.
+    float base = 31.0f + powf(c, 1.34f) * 94.0f;
+    float mAmp = powf(1.0f - e, 1.52f);
+    float mtn  = powf(pv, 2.22f) * mAmp * (52.0f + 104.0f * mountainRegion);
+    float h = base + mtn + (det - 0.5f) * 13.0f + midHill * 21.0f;
+    h += powf(pv, 4.5f) * mountainRegion * 36.0f;
 
-    h -= basin * (22.0f + 48.0f * (1.0f - c));
-    h -= valleyMask * (1.0f - mesaMask) * (8.0f + 18.0f * (1.0f - c));
-    float terraceStep = 5.0f + 8.0f * vnoise(wx * 0.0018f + 211.0f, wz * 0.0018f + 37.0f);
-    float terraced = floorf(h / terraceStep) * terraceStep + (det - 0.5f) * 3.0f;
-    h = h + (terraced - h) * mesaMask * 0.58f;
-    h += mesaMask * smooth01(0.35f, 0.70f, c) * 18.0f;
-    // SIGNATURE CLIFFS: rare tablelands with a SHARP, near-vertical rim. The NARROW smooth01 band
-    // collapses the full ~150 m rise into ~15 m horizontally (~10:1, an ~84 deg cliff FACE once
-    // voxelised) instead of the old 0.14-wide band's 45 deg mountain flank -- a real cliff, not a
-    // hill. Modelled on Falcon's Flight's Tuwaiq cliff; lifts-only so the rim sits cleanly over
-    // existing terrain. The once-per-lap signature dive (coaster_track.cpp) seeks these rims out.
-    float cliffN    = fbm(wx * 0.00060f + 300.0f, wz * 0.00060f + 150.0f, 2);
-    float cliffMask = smooth01(0.655f, 0.672f, cliffN);   // lower threshold -> more mesas so the signature dive lands on a real rim most laps; band still narrow -> sharp face
-    float cliffTop  = 250.0f + (det - 0.5f) * 14.0f;
-    if (cliffTop > h) h = h + (cliffTop - h) * cliffMask;
+    // Natural, world-seeded escarpments for cliff dives.  This is deliberately independent of
+    // the coaster: warped low-frequency noise makes long irregular ridges, while finer erosion
+    // varies the crest and face.  It is never positioned, raised, or reshaped by the track.
+    float escarpField = fbm(wx * 0.00075f + 141.0f, wz * 0.00075f + 67.0f, 3);
+    float escarpEdge  = smooth01(0.710f, 0.735f, escarpField);
+    float escarpH     = 58.0f + 48.0f * fbm(wx * 0.0035f + 9.0f, wz * 0.0035f + 54.0f, 2);
+    float faceRough   = (fbm(wx * 0.018f + 72.0f, wz * 0.018f + 18.0f, 2) - 0.5f) *
+                        12.0f * (1.0f - fabsf(2.0f * escarpEdge - 1.0f));
+    h += escarpEdge * escarpH + faceRough;
 
-    // SIGNATURE CLIFF DIVE rim (track-registered): a mesa whose rim line passes through (gMesaX,gMesaZ)
-    // perpendicular to gMesaYaw (the dive heading). BEHIND the rim (fwd<0, where the climb came up) the
-    // mesa top is gMesaTopY sloping down a ~60 deg back-slope wedge -- STEEPER than the climb's ~57 deg
-    // grade, so the mesa top sits just UNDER the climb track: it buries the support columns without
-    // burying the track. The wedge is cut off at gMesaBackMax (set by the caller from the existing cps)
-    // so it can never rise over track already built further behind. IN FRONT of the rim (fwd>0) the top
-    // falls to natural ground within ~9 m -> a near-vertical voxel FACE the dive plunges. ~80 m lateral
-    // half-width with a smooth falloff. Lifts-only, so it drops cleanly onto existing terrain. terrainH
-    // is a pure function of (x,z), so both the generator and the mesh see the same rim.
-    if (gMesaOn) {
-        float dx = x - gMesaX, dz = z - gMesaZ;
-        float fwd = dx * sinf(gMesaYaw) + dz * cosf(gMesaYaw);   // + = in front of the rim (dive direction)
-        float lat = dx * cosf(gMesaYaw) - dz * sinf(gMesaYaw);   // lateral offset from the rim centreline
-        float latK = 1.0f - smooth01(78.0f, 118.0f, fabsf(lat)); // 1 across the mesa core, 0 past the flanks
-        if (latK > 0.0f && -fwd <= gMesaBackMax) {               // no lift past the back cutoff (protects prior track behind the rim)
-            float mesaTop = (fwd <= 0.0f)
-                          ? gMesaTopY + fwd * 1.75f              // back-slope wedge: ~60 deg, steeper than the climb's ~57 deg so the top stays under the track
-                          : gMesaTopY - fwd * 30.0f;             // front face: ~88 deg (steeper than the dive's -88 deg track so the track hugs just OUTSIDE the wall), to natural within ~6 m
-            float raise = (mesaTop - h) * latK;                  // lateral falloff on the lift only
-            if (raise > 0.0f) h += raise;                        // lifts-only
-        }
-    }
+    h -= basin * (18.0f + 42.0f * (1.0f - c));
+    h -= valleyMask * (10.0f + 24.0f * (1.0f - c));
+    // Gentle 4-7 m voxel terraces retain the block-world character without turning every high
+    // region into a cylindrical mesa.  Natural escarpments are a rare, modest 70-120 m ridge;
+    // the coaster supplies the rest of the signature dive's elevation with its powered climb.
+    float terraceStep = 4.0f + 3.0f * vnoise(wx * 0.0018f + 211.0f, wz * 0.0018f + 37.0f);
+    h = h * 0.72f + floorf(h / terraceStep) * terraceStep * 0.28f;
 
     if (h < 1) h = 1; if (h > TERRA_MAX) h = TERRA_MAX;
     return (int)h;
@@ -1015,6 +982,79 @@ static Vector3 catmull(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t) 
     return vlerp(B1, B2, (tt - t1) / (t2 - t1));
 }
 
+// Centripetal Catmull-Rom is a good plan-view spline, but it may overshoot a vertical
+// extremum when the surrounding control-point spacing changes.  That is particularly
+// visible on a fast coaster as a tiny extra hump/valley between two otherwise deliberate
+// elements.  Use a monotone cubic only for the elevation channel: it remains C1 at every
+// control point, preserves the authored height at crests and valleys, and cannot invent an
+// extra vertical reversal between p1 and p2.
+static float monotoneHermiteY(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t) {
+    float h0 = fmaxf(Vector3Distance(p1, p0), 1e-3f);
+    float h1 = fmaxf(Vector3Distance(p2, p1), 1e-3f);
+    float h2 = fmaxf(Vector3Distance(p3, p2), 1e-3f);
+    float d0 = (p1.y - p0.y) / h0;
+    float d1 = (p2.y - p1.y) / h1;
+    float d2 = (p3.y - p2.y) / h2;
+
+    // Weighted harmonic means are the Fritsch-Carlson monotonicity-preserving tangents.
+    // A sign change is a real crest/trough, so its tangent must be zero rather than letting
+    // Catmull-Rom carry slope through the extremum and create a micro-element.
+    auto tangent = [](float left, float right, float hl, float hr) {
+        if (left * right <= 0.0f) return 0.0f;
+        float w1 = 2.0f * hr + hl;
+        float w2 = hr + 2.0f * hl;
+        return (w1 + w2) / (w1 / left + w2 / right);
+    };
+    float m1 = tangent(d0, d1, h0, h1);
+    float m2 = tangent(d1, d2, h1, h2);
+    float u  = Clamp(t, 0.0f, 1.0f);
+    float u2 = u * u, u3 = u2 * u;
+    return (2.0f*u3 - 3.0f*u2 + 1.0f) * p1.y +
+           (u3 - 2.0f*u2 + u) * h1 * m1 +
+           (-2.0f*u3 + 3.0f*u2) * p2.y +
+           (u3 - u2) * h1 * m2;
+}
+
+static float quinticC2(float p0, float p1, float p2, float p3, float t) {
+    // A quintic Hermite span carries both the tangent and curvature at every control point.
+    // Adjacent spans therefore agree through the second derivative (C2), removing the camera's
+    // per-control-point pitch snap that a C1 Catmull-Rom curve still exposes at coaster speed.
+    float m1 = 0.5f * (p2 - p0), m2 = 0.5f * (p3 - p1);
+    float a1 = p2 - 2.0f * p1 + p0, a2 = p3 - 2.0f * p2 + p1;
+    float u = Clamp(t, 0.0f, 1.0f), u2 = u*u, u3 = u2*u, u4 = u3*u, u5 = u4*u;
+    return (1.0f - 10.0f*u3 + 15.0f*u4 - 6.0f*u5) * p1 +
+           (u - 6.0f*u3 + 8.0f*u4 - 3.0f*u5) * m1 +
+           (0.5f*u2 - 1.5f*u3 + 1.5f*u4 - 0.5f*u5) * a1 +
+           (10.0f*u3 - 15.0f*u4 + 6.0f*u5) * p2 +
+           (-4.0f*u3 + 7.0f*u4 - 3.0f*u5) * m2 +
+           (0.5f*u3 - u4 + 0.5f*u5) * a2;
+}
+
+static Vector3 trackSpline(Vector3 p0, Vector3 p1, Vector3 p2, Vector3 p3, float t,
+                           bool useC2 = true) {
+    Vector3 p = catmull(p0, p1, p2, p3, t);
+    if (useC2) {
+        // Preserve some centripetal character in plan view while taking most of the C2 curve;
+        // this avoids widening tight, deliberately authored elements but removes segmented
+        // heading/pitch changes from ordinary connectors, turns, hills, and booster entries.
+        float cx = quinticC2(p0.x, p1.x, p2.x, p3.x, t);
+        float cz = quinticC2(p0.z, p1.z, p2.z, p3.z, t);
+        p.x = p.x * 0.28f + cx * 0.72f;
+        p.z = p.z * 0.28f + cz * 0.72f;
+
+        float d0 = p1.y - p0.y, d1 = p2.y - p1.y, d2 = p3.y - p2.y;
+        // C2 is safe across a monotonic alignment.  At a deliberate crest/trough retain the
+        // monotonic limiter so smoothing never invents an extra airtime bump or valley.
+        if (d0 * d1 > 0.0f && d1 * d2 > 0.0f)
+            p.y = quinticC2(p0.y, p1.y, p2.y, p3.y, t);
+        else
+            p.y = monotoneHermiteY(p0, p1, p2, p3, t);
+    } else {
+        p.y = monotoneHermiteY(p0, p1, p2, p3, t);
+    }
+    return p;
+}
+
 enum SegMode { M_FLAT, M_CLIMB, M_DROP, M_HILLS, M_TURN, M_LOOP, M_ROLL,
                M_STATION, M_DIP, M_LAUNCH, M_HELIX, M_BOOST, M_IMMEL,
                M_SCURVE, M_DIVE, M_BANKAIR, M_WAVE,
@@ -1443,9 +1483,6 @@ static void census(int seed, long fam[3][7], long invLap[3], long invType[M_COUN
     // The audit's own manual startLaunch()-per-lap + cliffDone-commit variant disagreed with the
     // streaming reference (gate I false fires on seed1-tophat-lap2 / seed3-lap1); this is the fix.
     g_rng = (uint32_t)seed * 2654435761u | 1u;
-    gMesaOn = false;   // this seed's own generation (static window + rollingSim) already ran and may have
-                       // left a stale registered mesa behind; the streaming --census reference never runs
-                       // multiple generation passes per seed, so start this pass with no mesa registered.
     Track c; c.reset();
     const int keep = 64;
     int cnt[M_COUNT]; for (int i = 0; i < M_COUNT; i++) cnt[i] = 0;
@@ -1488,7 +1525,7 @@ static SeedRes auditSeed(int seed) {
 
     // MC_DUMP_ELEM/MC_DUMP_SEEDS test instrument, REHOMED from the legacy --gaudit's identical
     // static 470-cp window (same env-var interface, same [dump] line format). Invocation:
-    // `MC_DUMP_ELEM=<NAME|ALL> MC_DUMP_SEEDS=<N> ./minecoaster --audit <seeds>` (see COASTER_HANDOFF.md).
+    // `MC_DUMP_ELEM=<NAME|ALL> MC_DUMP_SEEDS=<N> ./minecoaster --audit <seeds>`.
     if (const char *tg2 = getenv("MC_DUMP_ELEM")) {
         int wantKind = -1;
         bool dumpAll = TextIsEqual(tg2, "ALL");
@@ -1721,7 +1758,7 @@ static SeedRes auditSeed(int seed) {
     for (int l=0;l<3;l++) if (fam[l][5] < 1){ R.hard[7]=false; printf("  H FAIL  no cliff dive in census lap %d\n", l+1); }
     (void)sawCliff; (void)cliffInSim;
 
-    // ===== Gate G: multiplier conformance (WARN) -- measured vs REALISM.md bands =====
+    // ===== Gate G: V1 diagnostic multiplier report =====
     // helix rotation this seed (max run's accumulated horizontal heading / 360)
     {
         int q=0;
@@ -1983,7 +2020,7 @@ int main(int argc, char **argv) {
     // GENERATION-ONLY occurrence census (battery: NO physics sim, no felt-g pipeline). Rolls the
     // same streaming generator the live ride uses (genPoint + popFront window) for 3 laps x N seeds
     // and counts element-family OCCURRENCES (maximal same-kind runs) per lap: the >=1/lap quota
-    // families, the 2-4/lap inversion budget by type, and the guaranteed cliffdive. This is the
+    // families and V1 diagnostic counters. This is the
     // acceptance harness for the element-occurrence rework. Kept immediately before --audit.
     if (argc > 1 && TextIsEqual(argv[1], "--census")) {
         int seeds = (argc > 2) ? atoi(argv[2]) : 8;

@@ -1,13 +1,8 @@
 #!/bin/zsh
-# MINECOASTER launcher: update ONLY when GitHub is strictly newer, rebuild, then play.
+# Build and launch the current checkout.
 cd "$(dirname "$0")"
 
-# Step 1: SAFE update. The old launcher did `git reset --hard origin/BR` on every run,
-# which silently DESTROYED any local work the moment the remote lagged behind (it wiped
-# a full local rewrite once). Now we only ever FAST-FORWARD, and only when ALL of:
-#   - the working tree is clean (no uncommitted local edits), and
-#   - the remote tip is strictly AHEAD of us (we are behind, not diverged/ahead).
-# In every other case we keep the local version and say why.
+# Update only when the local working tree is clean and the remote can fast-forward it.
 if [[ -z "$MC_LAUNCHER_UPDATED" ]]; then
     echo "==> Checking GitHub for a newer version..."
     if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then

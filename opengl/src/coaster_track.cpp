@@ -1,15 +1,12 @@
-// THE water test. groundTopAt() floors at WATER_Y, so a sample AT water level means the
-// tile is submerged (or sits exactly at the waterline). Every consumer -- the generator's
-// water-seeking scans, the M_DIP skim floor, the SPLASHDOWN label, the wheel-spray system,
-// and the --pacing splash metric -- must share this ONE predicate: the previous strict
-// `terrainH+1 < WATER_Y` spray test disagreed with the label on exact-waterline tiles
-// (terrainH+1 == WATER_Y), producing a SPLASHDOWN banner with zero spray.
+// V1 baseline generator. V2 must use the modular route builder specified in
+// ../../COASTER_REWRITE.md rather than extending this state machine.
+// Shared water predicate for V1 consumers.
 static inline bool submergedGround(float groundTopY) { return groundTopY <= WATER_Y + 0.01f; }
 
 struct Track {
     std::deque<Vector3>       cp;
     std::deque<Vector3>       up;
-    std::deque<Vector3>       geomUp;   // ROLL CARRY-THROUGH: the BASELINE (no-carry) per-cp up-vector. up[] carries the rendered lean across banked->banked seams; the post-generation geometry passes (vert-g relax skip, felt-g safety net) read geomUp[] instead so a carried lean never perturbs the generated track -- geometry stays bit-identical to baseline.
+    std::deque<Vector3>       geomUp;
     std::deque<unsigned char> kind;
     std::deque<unsigned char> chainf;
     std::deque<float>         arc;
@@ -30,13 +27,11 @@ struct Track {
     bool    chainMode = false;
     int     elems = 0;
     int     elemLimit = 3;
-    bool    mcbrDone = false;   // mid-course brake run fired this lap yet? (a real coaster's ~halfway flat brake section -- adds realistic "catch your breath" idle track)
-    float   straightRun = 0.0f; // metres of near-straight track since the last real turn (user: sometimes 2 mi of straight -- force a turn to keep it winding like a real layout)
-    // SIGNATURE CLIFF DIVE (once per lap): a full-grade climb up to a rim, then a scripted near-vertical
-    // plunge off it (stepCliffDive). signatureDive flags the CLIMB approach; at the crest the handoff
-    // (initCliffDive) registers a synthetic mesa rim in terrainH and enters the closed-form M_CLIFFDIVE.
-    // Prefers steering the climb onto a real scanned cliff (cliffMode 1); else climbs a structural tower
-    // (cliffMode 2). Either way the synthetic rim guarantees a genuine near-90 deg face at the crest.
+    bool    mcbrDone = false;
+    float   straightRun = 0.0f;
+    // SIGNATURE CLIFF DIVE (once per lap): a powered climb to a naturally scanned escarpment,
+    // followed by a scripted near-vertical track path. If no real ridge offers enough room, it
+    // must be skipped; terrain is never modified.
     bool    cliffDone = false, signatureDive = false;
     int     cliffMode = 0;
     float   cliffTargetYaw = 0.0f;
@@ -44,23 +39,23 @@ struct Track {
     float   genPrevCurv = 0;
     float   genPrevDyaw = 0;
     int     dropRun = 0;   // how many cps the current M_DROP has run -- capped so a drop can't crawl forever down a descending slope and starve element generation
-    float   dropTopY = 1e9f;   // the current DROP run's entry crest, latched on its first step -- the ~300 m max-drop cap (user) measures every drop from here
-    float   ddKnuckle = 0.0f;   // (see enterDrop)
-    bool    crownLatched = false;   // once the CLIMB crest-lead fires, the crown-descent target stays asserted every step through the apex. The old genPrevDy>0 gate un-fired at the vertex (applied dy just crossed to <=0), dropping the crown and re-asserting the +36/+18 base climb target for one step -- the ceilY clip then pinned+flipped that spurious re-climb to M_DROP (267-326 m crest bust, a 5-cp apex shelf, a shallow drop face). Cleared at every CLIMB->DROP handoff / mode end.
-    float   crownY = 1e9f;       // the crest height latched the instant crownDrop arms -- the post-crest DROP's hard ceiling (crownY + margin) so the residual +dy can't re-climb above the crest it fell off, regardless of how nextMode re-cycles dropTopY on the way down.
-    bool    crownDrop = false;   // set at the mega-CLIMB -> DROP crest handoff (both the apex handoff and the ceilY clip): the FIRST few DROP steps keep the mega climb's bled effective speed (fminf(genV,54)) so the post-crest crown TURNS OVER instead of re-climbing. Without it the ceilY clip hands off with residual +dy and the M_DROP crest-cap (6) at optimistic genV~85 lifts the descent +65 m over ~9 cps (a DROP re-climb to y~314). Cleared once the drop is genuinely diving (dy <= -25) or the mode leaves M_DROP.
-    float   boostGrade = 0.0f;   // INCLINED LSM boost: constant per-step climb (+4-8 deg) for ~45% of boosts, following the terrain trend -- Falcon's Flight's mid-course LSM lift (powered track that regains altitude while re-energizing); 0 = classic flat boost   // DOUBLE-DOWN: height above ground where this drop briefly shelves then re-drops (the El Toro/Maverick two-stage drop's ejector knuckle -- a roll-free thrill); 0 = plain drop
+    float   dropTopY = 1e9f;
+    float   ddKnuckle = 0.0f;
+    bool    crownLatched = false;
+    float   crownY = 1e9f;
+    bool    crownDrop = false;
+    float   boostGrade = 0.0f;
     float   genV      = LAUNCH_V;
-    float   genFloorY = -1e9f;   // curvature-bounded terrain floor (lifts track out of the ground smoothly)
+    float   genFloorY = -1e9f;
     float   genFloorVy = 0.0f;
     unsigned char lastGenMode = (unsigned char)M_FLAT;
     Vector3 genPrevUp = WUP;
-    Vector3 genGeomUp = WUP;        // ROLL CARRY-THROUGH: the up-vector as it would evolve WITHOUT any carry (the baseline unwind). Feeds ONLY the post-hoc vertical-g cap gate (which exempts steep-banked seats) so a carried lean can't disable that cap on level FLAT/DROP geometry -- keeps the generated track bit-identical to baseline while genPrevUp carries the rendered lean.
+    Vector3 genGeomUp = WUP;
     int     upEaseSteps = 0;
     int     upEaseInit  = 0;       // window length upEaseSteps started at, so the unwind can keep the first ~2 seam steps slow then finish fast
     float   upEaseRate  = 0.38f;   // how fast the bank unwinds after an element; lower = gentler (helix needs slow so the bank outlasts the turn)
-    int     bankHold = 0;          // ROLL CARRY-THROUGH: cps left to HOLD a banked element's exit lean across a short FLAT/DROP/DIP gap so a re-banking next element meets it (shortest path via easeUpVec) instead of dipping through dead-level. Capped (bankHoldMax) so a genuine breather gap still returns to level via upEaseSteps.
-    int     bankHoldMax = 2;       // gap length (cps) up to which the exit lean is carried; longer gaps keep the prompt unwind (user: roll return must not pollute the next flat section)
+    int     bankHold = 0;
+    int     bankHoldMax = 10;
 
     int     seamEaseN = 0;
     int     seamEaseTot = 0;
@@ -68,8 +63,8 @@ struct Track {
     int     hardInvCount = 0;   // budget inversions (LOOP/ROLL/IMMEL/DIVELOOP/STALL) placed this lap; the per-lap invBudget below caps them (eligibleElem), not the ~7.6/ride the weights alone produced (user: 2-4 inversions/lap)
     int     invBudget = 4;      // per-lap inversion allowance, drawn irnd(2,4) in startLaunch (spec occurrence rules): once hardInvCount reaches it, the 5 kept inversion types stop being OFFERED for the rest of the lap
     int     quotaMet = 0;       // bitmask of the >=1/lap quota families already placed this lap (Q_* below); pickFromPool boosts + force-picks the unmet ones toward lap end without ever bypassing eligibleElem
-    int     cliffFizzles = 0;   // signature-dive re-arm counter: a low/too-tall apex clears cliffDone so the dive re-arms same-lap (spec: cliffdive >=1/lap), bounded so a massif that can never hold a sub-300 crest can't loop the lap into all-climbs
-    int     cliffScanCool = 0;  // after a fizzle, suppress the real-RIM scan for a few elements: a rim on a high massif fizzles the apex-over-local-ground check and, unsuppressed, the scan just re-finds the SAME rim and loops (census: 8-tophat laps). While suppressed the guarantee falls to the structural plunge, which fires once the undulating track descends into a valley (gtHere < 138).
+    int     cliffFizzles = 0;
+    int     cliffScanCool = 0;
     int     bankCool = 0;   // BANKED-ELEMENT CADENCE (user: bank/tilt elements too often + too long vs real): after any banked-up-vector element, the next 2 element slots must be low-tilt (straight hills/dips/drops/inversions), matching how real layouts alternate lateral and vertical force events instead of chaining banked shapes back-to-back across families. Decremented per non-banked pick in rememberElement; feel rule only -- eligibleSafety ignores it.
     int     boostCool = 0;   // RE-POWER CADENCE (user: too many dead-flat sections): a real coaster has 1-3 mid-course boosts, not one every ~14 s -- after a BOOST, skip re-powering for the next few element slots so the ride runs proper discharge arcs (long bleed, then one big recharge) instead of constant flat interruptions. Survival override at genV<58 in nextMode keeps forced climbs alive.
     int     levelHold = 0;
@@ -143,11 +138,11 @@ struct Track {
     float   hlBaseY = 0, hlH = 8;
     int     hlSteps = 7, hlTurns = 1;
 
-    // SIGNATURE CLIFF DIVE (scripted closed-form path off the synthetic rim -- stepCliffDive)
+    // V1 closed-form cliff-dive state.
     int     cdPhase = 0;                 // 0 crest arc, 1 near-vertical face, 2 pullout arc
     int     cdPulloutN = 0;             // steps taken in the pullout arc -- ramps the curvature in (clothoid) so the straight-face->arc junction is not an instant 1/Rp step
-    static constexpr float CD_FACE_P = -88.0f * DEG2RAD;   // near-vertical dive-face pitch (~88 deg, sustained >=60 m). Wall-hug pins the registered rim to where THIS face begins, so every face cp stays within a few m of the rim wall (user: hug the cliff, don't drift 30-60 m out)
-    static constexpr float CD_HANDOFF_P = -35.0f * DEG2RAD; // pullout hands to the terrain-following DROP here: the dive advances cos(pitch)*SEG horizontally while a DROP takes a FULL SEG step, so handing off while still steep jumps the horizontal advance in one cp (the -83->-52 pitch KINK). At -35 (cos 0.82) the step lengths match -- a continuous seam.
+    static constexpr float CD_FACE_P = -88.0f * DEG2RAD;
+    static constexpr float CD_HANDOFF_P = -35.0f * DEG2RAD;
     float   cdYaw = 0.0f, cdPitch = 0.0f;
     float   cdPulloutStartY = 0.0f, cdValleyY = 0.0f;
     float   cdRc = 30.0f, cdRp = 48.0f;  // crest/pullout arc radii, sized from the ACTUAL entry/bottom speed at init (felt-g bounded) -- a fixed radius rang -47 g when a lap's dive happened to crest fast
@@ -218,7 +213,7 @@ struct Track {
             pushCP(gpos, WUP, (unsigned char)M_LAUNCH);
         }
 
-        mode = M_CLIMB; mega = true; chainMode = false; remain = irnd(14, 18);
+        mode = M_CLIMB; mega = true; chainMode = false; remain = irnd(24, 28);
         climbTop = frnd(240.0f, 275.0f);   // FIRST top-hat out of the platform is ALWAYS a mega (user); crest hard-capped <300 by ceilNow/ceilY, so this sizes the crest-to-valley drop into the ~225-270 m band. The LAUNCH_V=108 entry easily reaches it ballistically.
         ensureAhead(24);
     }
@@ -1411,13 +1406,13 @@ struct Track {
             // gates remain for --gtest/--elementshot (gForceElem).
             M_LOOP, M_ROLL, M_IMMEL, M_STALL, M_DIVELOOP,
             M_HILLS, M_BANKAIR, M_DIP, M_STENGEL,
-            M_HELIX, M_TURN, M_SCURVE, M_DIVE, M_WAVE
+            M_HELIX, M_TURN, M_SCURVE, M_DIVE
         };
         return pickFromPool(pool, (int)(sizeof(pool) / sizeof(pool[0])));
     }
     SegMode pickLaunchExit() const {
         static const SegMode pool[] = {
-            M_CLIMB, M_CLIMB, M_CLIMB, M_HILLS, M_WAVE, M_BANKAIR
+            M_CLIMB, M_CLIMB, M_CLIMB, M_HILLS, M_HILLS, M_BANKAIR
         };
         return pickFromPool(pool, (int)(sizeof(pool) / sizeof(pool[0])));
     }
@@ -1477,7 +1472,7 @@ struct Track {
             case M_TURN:    initTurn(true);break;
             case M_WINGOVER:initWingover();break;
             case M_DIP:     initDip();     break;
-            case M_WAVE:    initWave();    break;
+            case M_WAVE:    initHills();   break;
             default:        initHills();   break;
         }
     }
@@ -1594,7 +1589,10 @@ struct Track {
                                             : frnd(90.0f, 165.0f);
                         climbTop = Clamp(fminf(want, reach), 40.0f, 285.0f);
                     }
-                    remain = mega ? irnd(14, 18) : irnd(6, 9);   // enough steps to actually reach the sized crest
+                    // A 65° top-hat face needs longitudinal room for an entry transition, a
+                    // sustained face, and a mirrored crest transition.  Short runs forced the
+                    // scheduler to flatten the crown before the face ever reached its grade.
+                    remain = mega ? irnd(24, 28) : irnd(13, 17);
                 }
                 launchElem = M_CLIMB;
                 break;
@@ -1668,51 +1666,33 @@ struct Track {
                     mcbrDone = true; mode = M_FLAT; remain = irnd(7, 10); levelHold = remain;   // ~98-140 m, ~1.5-2 s transit: one real breather per lap, no longer stretched toward the WR side (user: too much flat)
                     break;
                 }
-                // SIGNATURE CLIFF DIVE: once per lap, fire a scripted climb-to-the-rim + near-vertical
-                // dive off a REAL cliff. Fan-scan the corridor ahead for a genuine cliff RIM: high
-                // ground (>200 m) with a sharp far-side falloff (>110 m dropping away just beyond it --
-                // exactly the narrow-band cliff face terrainH now builds). Only fires when it finds one
-                // it climbs the back at a uniform full-grade face with NO rounded top-hat crown, then
-                // dives the cliff face. PREFERS a real mesa rim; guarantees the signature with a
-                // structural plunge if none is in range by the time the lap is nearly done.
-                if (!cliffDone && elems >= elemLimit / 2 && genV > 40.0f) {   // arm from mid-lap (was 2/3): a wider window means more low-entry chances to find a real rim before the near-lap-end structural fallback (spec: cliffdive >=1/lap guaranteed)
+                // V1 natural-ridge scan. V2 replaces this with a planner-level escarpment query.
+                if (!cliffDone && elems >= elemLimit / 2 && genV > 40.0f) {
                     if (cliffScanCool > 0) cliffScanCool--;   // walk down the post-fizzle rim-scan suppression once per element decision
                     float gtHere = gpos.y - h;
-                    // Scan for a real cliff RIM ahead, but ONLY when we could enter it cleanly (low and
-                    // unbanked): high ground (>200 m) with a sharp >110 m far-side falloff -- exactly the
-                    // narrow-band cliff face terrainH now builds.
+                    // Scan for a natural ridge edge.  The world intentionally avoids 200 m mesas;
+                    // a Falcon-style dive earns most of its height with the preceding LSM climb,
+                    // then uses a believable 60 m+ falloff in the landscape as its visual edge.
                     float bestTop = -1e9f, bestYaw = gyaw; bool foundCliff = false;
-                    if (h < 45.0f && !wasBanked && gtHere < 190.0f && cliffScanCool == 0) {   // gtHere < 190: on a massif TOP the climb can't get 100 m above the (already high) local ground, so the apex-fizzle path just burns re-armed climbs (measured: a 7-tophat lap with no cliffdive) -- defer until the undulating track descends. cliffScanCool suppresses re-finding the SAME rim right after it fizzled.
+                    if (h < 45.0f && !wasBanked && gtHere < 150.0f && cliffScanCool == 0) {
                         for (int s = -4; s <= 4; s++) {
                             float ay = gyaw + s * 0.10f;                 // +-0.4 rad cone, 9 samples
                             float sn = sinf(ay), cs = cosf(ay);
                             for (float d = 50.0f; d <= 360.0f; d += 35.0f) {
                                 float gtRim = groundTopAt(gpos.x + sn * d, gpos.z + cs * d);
-                                if (gtRim < 200.0f || gtRim > 270.0f) continue;   // genuinely high ground (a mesa top), but rim < ~270: the dive's crest ARC sweeps ~20-27 m ABOVE the rim as the +57 deg entry pitch rounds over, so a 270 m rim apexes ~295 m, keeping the crest under 300 m (user: cliff crest < 300 hard). Taller mesas are skipped.
+                                if (gtRim < 85.0f || gtRim > 165.0f) continue;
                                 float gtFar = groundTopAt(gpos.x + sn * (d + 45.0f), gpos.z + cs * (d + 45.0f));
-                                if (gtRim - gtFar < 110.0f) continue;    // sharp rim: terrain falls >110 m away just beyond
+                                if (gtRim - gtFar < 55.0f) continue;
                                 if (gtRim > bestTop) { bestTop = gtRim; bestYaw = ay; foundCliff = true; }
                             }
                         }
                     }
-                    // GUARANTEE (spec: cliffdive >=1/lap): prefer a real rim the instant one is in
-                    // range; otherwise fire the structural plunge at the FIRST low-enough moment once
-                    // armed (the post-top-hat valley reliably supplies it), rather than waiting for a
-                    // near-lap-end window that may land on elevated ground. The structural crest caps
-                    // at ceilY 272 and the dive needs both a >100 m crest-over-local-ground and a
-                    // >145 m drop ahead, which only holds when the launch ground sits below ~138 --
-                    // above that it just burns a fizzled climb, so DEFER (fall through, cliffDone stays
-                    // false) and let the undulating track descend into a valley first.
-                    // Structural fallback: AIM at the deepest nearby ground ~85 m ahead (the dive's
-                    // valley sample point in initCliffDive) instead of blindly along the current
-                    // heading -- a plunge fired into RISING terrain has no drop and fizzles the >=150 m
-                    // floor (measured: structural fires from gtHere 61 straight into a hillside, fizz
-                    // runs to 6). The crest climbs to ~268 (ceilY cap); require crestEst - valley >= 150
-                    // so we never climb for a dive the terrain can't hold.
+                    // A V1 dive may only proceed from a terrain scan; V2 validates the full
+                    // planned approach and pull-out before emitting samples.
                     // PLATEAU-EDGE DIVE (Falcon's Flight clifftop idiom): the route can spend the
                     // whole arm window ON a high massif (measured cliffMiss laps: gtHere 249-250,
                     // fizzles=0 -- never armed), where neither other branch applies: the rim scan
-                    // wants a RISING wall (gtHere < 190) and the structural plunge needs low ground
+                    // wants a rising wall (gtHere < 190) and the low-ground branch needs terrain
                     // (< 138). From up here the massif's own EDGE is the cliff: scan the forward
                     // cone for a NEAR falloff (ground >=150 m below the plateau within ~120 m) and
                     // fire a SHORT crest hop aimed at it -- the ride crests a small lip and plunges
@@ -1750,39 +1730,22 @@ struct Track {
                             // measured cliffMiss class -- the route camped at gtHere ~250 all lap and a
                             // cliff dive is structurally impossible up there). Steer DOWNHILL toward the
                             // lowest far ground instead, so the proven low-ground machinery (real-rim
-                            // scan at gtHere<190, structural plunge at <138) can arm before lap end.
+                            // scan at gtHere<190 can arm before lap end.
                             if (bestD > 1e8f && lowVal < gtHere - 25.0f) cliffSteerYaw = lowYaw;
                         }
                     }
-                    float structBestVal = 1e9f, structYaw = gyaw;
-                    if (gtHere < 138.0f) {
-                        for (int s = -5; s <= 5; s++) {
-                            float ay = gyaw + s * 0.11f, sn2 = sinf(ay), cs2 = cosf(ay);
-                            for (float d = 65.0f; d <= 130.0f; d += 15.0f) {
-                                float gv = groundTopAt(gpos.x + sn2 * d, gpos.z + cs2 * d);
-                                if (gv < structBestVal) { structBestVal = gv; structYaw = ay; }
-                            }
-                        }
-                    }
-                    float structCrestEst = fminf(gtHere + 210.0f, 268.0f);
-                    bool canStructural = (gtHere < 138.0f) && (structCrestEst - structBestVal >= 150.0f);
-                    if (foundCliff || foundEdge || canStructural) {
+                    // Do not manufacture a structural tower in a valley.  The signature only
+                    // fires at a naturally generated escarpment/plateau edge; otherwise it waits
+                    // for one and eventually gives up rather than faking scenery under the dive.
+                    if (foundCliff || foundEdge) {
                         if (foundCliff) {
                             cliffMode = 1; cliffTargetYaw = bestYaw;
-                            climbTop = Clamp(bestTop - gtHere + 4.0f, 60.0f, 250.0f);   // crest right at the rim height
+                            // The LSM climb rises above the irregular natural ridge enough to
+                            // make a record-scale dive, but the terrain itself remains untouched.
+                            climbTop = Clamp(bestTop + 95.0f - gtHere, 120.0f, 235.0f);
                         } else if (foundEdge) {
                             cliffMode = 1; cliffTargetYaw = edgeYaw;
-                            // Already AT rim height: the "climb" is just the crest lip forming at the
-                            // edge (10-20 m), sized so apex + the dive's ~20-27 m entry arc stays <300.
-                            climbTop = fmaxf(fminf(edgeDist * 0.30f, 270.0f - gtHere), 10.0f);
-                        } else {
-                            cliffMode = 2; cliffTargetYaw = structYaw;
-                            // ADAPTIVE height: cap the crest near 248 BEFORE the genFloor terrain lift
-                            // (which rides the climb up any rising slope another ~15-30 m) so the dive
-                            // apex stays under the 296 cap even from an already-elevated launch. A
-                            // fixed 195-230 crested at 276-293 on rising ground and fizzled the crest
-                            // cap every time (census: 8-tophat laps). The valley aim keeps the drop.
-                            climbTop = Clamp(fminf(frnd(150.0f, 185.0f), 248.0f - gtHere), 95.0f, 185.0f);
+                            climbTop = Clamp(fminf(fmaxf(edgeDist * 0.48f, 125.0f), 270.0f - gtHere), 90.0f, 210.0f);
                         }
                         signatureDive = true; cliffDone = true;
                         mode = M_CLIMB; chainMode = false; mega = false;
@@ -2109,7 +2072,12 @@ struct Track {
                 // smoothed ground, and DEAD-BAND small errors so terrain noise doesn't tilt the deck:
                 // within 2 m of target the track holds level; real undulation comes from the shaped
                 // elements, not the connective flats.
-                float ferr = (gtAvg + 4.0f) - gpos.y;
+                // Design the transition as a free, tangent-continuous vertical curve first.
+                // Terrain may push it UP before it becomes deeply buried, but valleys do not pull
+                // the track down into a sequence of tiny terrain-matching hinges.  This matches
+                // long launch-coaster connectors: the civil earthwork follows the alignment, not
+                // the other way around.
+                float ferr = fmaxf((gtAvg + 10.0f) - gpos.y, 0.0f);
                 // CONTINUOUS proportional band (no dead-band step): the old hard <2 m dead-band snapped dy
                 // between 0 and ~0.8 at the edge, a micro-jitter of its own. Ramp the gain 0 at ferr=0 to
                 // the full 0.40 by |ferr|~4 m, so near-level terrain noise makes near-zero dy smoothly.
@@ -2155,7 +2123,10 @@ struct Track {
                 // the current terrain where the ground descends ahead, which aimed the banked turn into
                 // a deep tunnel (measured clr -9.8). Keep it >= local gt+2 so it still hugs valleys
                 // without burying below the tunnel clearance.
-                float turnTgt = fmaxf(gtAvg + 5.0f, gt + 2.0f) + 2.2f * sinf(rollPh += 0.30f);
+                // A high-speed turn holds its designed elevation through undulating terrain.
+                // Only a rising hillside is allowed to influence the profile, giving the track
+                // permission to carve shallow cuts across valleys instead of wobbling at voxel scale.
+                float turnTgt = fmaxf(gpos.y, fmaxf(gtAvg + 8.0f, gt + 6.0f));
                 dy = (turnTgt - gpos.y) * 0.50f;
                 // FLOW (F2): same critically-damped arrival bound as M_FLAT — the 0.50 gain could
                 // lurch on a big ground-target step and ring through the 3-D relax passes.
@@ -2190,7 +2161,10 @@ struct Track {
                 break;
             }
             case M_CLIMB: {
-                dy = mega ? 40.0f : 18.0f;   // top-hat incline (atan(40/14)=71 deg / atan(18/14)=52 deg). mega raised 33->40 for CLIMB/DROP SYMMETRY (user: both faces 65-68 deg sustained): at 33 the crest-lead's anticipatory lag turned the upper face over early and the sustained climb only reached ~58 deg -- below the drop's 65-68. A 40 target + the trimmed lagLead below holds the full-grade face to ~65-68 deg then snaps the crown over sharply at the capped crest (high crest ejector g accepted).
+                // Top-hat face target: tan(65°) * one longitudinal sample.  The old +40
+                // target competed with a short run and the crest limiter, producing a 45–50°
+                // ramp plus a visible shelf instead of a sustained, near-symmetric 65° face.
+                dy = mega ? 30.0f : 18.0f;
                 if (signatureDive) dy = 22.0f;   // uniform steep climb up the cliff back; the crest-lead below is SKIPPED so the rim stays a sharp edge, not a rounded top-hat crown
                 // CREST-LEAD inside the climb: as the rounded crown approaches (height still to
                 // gain while dy ramps to 0 at the crest budget = dy^2/(2*dlimNeg)), target descent
@@ -2227,7 +2201,10 @@ struct Track {
                     // the drop) no matter the jerk/target budget. 1.7 lets the ramp reach its steep grade
                     // before turning over -- then dy=-12 snaps the crown HARD (high crest ejector g
                     // accepted). Crest stays under 300: the 270 cp-cap holds ~13 m of overshoot headroom.
-                    float lagLead  = mega ? 1.7f * genPrevDy : genPrevDy;
+                    // Do not start the crest transition while a large portion of the face is
+                    // still left.  A modest look-ahead leaves a real +65° plateau, then uses
+                    // the same curvature budget to turn continuously through one apex.
+                    float lagLead  = mega ? 0.40f * genPrevDy : genPrevDy;
                     // LATCH: once the crest-lead fires, hold the crown-descent target every subsequent
                     // step instead of re-evaluating the genPrevDy>0 gate. At the apex the applied dy has
                     // just crossed to <=0 -> the old gate went false and the base +36/+18 climb target
@@ -2235,7 +2212,11 @@ struct Track {
                     // bust + a 5-cp apex shelf + a shallow drop face).
                     if (crownLatched ||
                         gpos.y + lagLead + 0.5f * genPrevDy * genPrevDy / fmaxf(dlimNegC, 0.05f) >= ceilNow) {
-                        dy = mega ? -12.0f : -8.0f;
+                        // Cross directly into the mirrored descent target.  The curvature/jerk
+                        // limiter owns the smooth turn-over; a weak negative target lingered
+                        // around zero for multiple control points and made the flat top shown in
+                        // the screenshot.
+                        dy = mega ? -22.0f : -8.0f;
                         crownLatched = true;
                     }
                 }
@@ -2604,9 +2585,9 @@ struct Track {
                     for (float dd = 40.0f; dd <= 120.0f; dd += 40.0f)
                         gtDive = fminf(gtDive, groundTopAt(gpos.x + sinf(cliffTargetYaw) * dd,
                                                            gpos.z + cosf(cliffTargetYaw) * dd));
-                    if (gpos.y - gtDive > 100.0f) { initCliffDive(); return WUP; }   // apex high enough over the drop: dive from here (pitch ~0, the proper entry)
+                    if (gpos.y - gtDive > 170.0f) { initCliffDive(); return WUP; }   // commit only when the powered climb has created a real 180 m-class dive
                     signatureDive = false;   // apex fizzled low (entry wiggle): drop out of this climb...
-                    if (++cliffFizzles <= 6) { cliffDone = false; cliffScanCool = 5; }   // ...but RE-ARM the signature this lap (spec: cliffdive >=1/lap) -- suppress the rim scan for a few elements so a later valley (structural plunge) takes it instead of the same fizzling rim. Bounded so a massif that can never hold a sub-300 crest can't loop the lap into all-climbs.
+                    if (++cliffFizzles <= 6) { cliffDone = false; cliffScanCool = 5; }
                     else if (getenv("MC_CLIFFDBG")) printf("[cliffdbg] FIZZLE-EXHAUST\n");
                 }
                 if (mode == M_CLIMB) { bool wasMega = mega; mode = M_DROP; remain = irnd(3, 4); dropTopY = gpos.y; crownLatched = false; if (wasMega) { crownDrop = true; crownY = gpos.y; } }
@@ -2657,7 +2638,7 @@ struct Track {
             // DEPTH -- the terrain-follow targets keep the track mostly above ground, so a tunnel
             // happens naturally where terrain rises into a diving/flat section (a real terrain
             // coaster carving through a hill after a top-hat).
-            float tunnelFloor = gt - 5.0f;
+            float tunnelFloor = gt - 18.0f;
             if (gpos.y < tunnelFloor) {
                 float lift = tunnelFloor - gpos.y;
                 gpos.y = tunnelFloor;
@@ -2670,10 +2651,7 @@ struct Track {
             }
         }
         if (gpos.y > ceilY) {
-            // The signature climb crests right at the synthetic-rim height: hand straight to the
-            // scripted cliff dive (which registers the rim here). Do NOT clamp gpos.y flat first --
-            // the dive's crest arc carries the tangent continuously from the climb's ~57 deg grade
-            // down over the edge, so a hard flat clamp here would inject a sharp convex crest kink.
+            // Hand a V1 signature climb directly to its closed-form dive.
             if (mode == M_CLIMB && signatureDive) { initCliffDive(); }
             else { gpos.y = ceilY; if (mode == M_CLIMB) { bool wasMega = mega; mode = M_DROP; remain = irnd(3, 4); dropTopY = gpos.y; crownLatched = false; if (wasMega) { crownDrop = true; crownY = gpos.y; } } }
         }
@@ -2889,11 +2867,9 @@ struct Track {
         return upv;
     }
 
-    // SIGNATURE CLIFF DIVE. The forward-marching dy generator can never carve a true near-vertical
-    // FACE (its jerk/curvature budget rate-limits how fast dy may steepen), so the dive is a scripted
-    // closed-form path in a fixed vertical plane, like stepStall/stepLoop -- and the terrain is made
-    // to present a real rim at the crest (registerMesa) so the track goes OVER an actual edge. Called
-    // from the M_CLIMB crest handoff (stepGeneric) when signatureDive is set.
+    // SIGNATURE CLIFF DIVE. This is a closed-form track path in a fixed vertical plane, called only
+    // after the layout scanner has found a naturally generated escarpment and enough real drop.
+    // It never mutates terrain: if the natural setting is unsuitable, the element is skipped.
     void initCliffDive() {
         signatureDive = false;             // the scripted path owns the shape now; clear the generator-side dive flag
         cdYaw   = gyaw;
@@ -2908,68 +2884,19 @@ struct Track {
             float rcEst   = fmaxf(30.0f, genV * genV / (GRAV * 6.3f));
             float apexEst = gpos.y + rcEst * (1.0f - cosf(cdPitch));
             float fx0 = gpos.x + sinf(cdYaw) * 85.0f, fz0 = gpos.z + cosf(cdYaw) * 85.0f;
-            // MIN-DROP FLOOR: 145 m for a natural-rim dive (cliffMode 1, which has the terrain drop);
-            // relaxed to 118 for the structural plunge (cliffMode 2) so a gentle/rising-relief lap
-            // still gets a real -- if slightly shorter -- signature dive rather than none (spec:
-            // cliffdive >=1/lap). Still a >100 m near-vertical plunge; the crest-cap and stall gates
-            // are untouched.
-            float minDrop = (cliffMode == 2) ? 118.0f : 145.0f;
-            if (apexEst - (groundTopAt(fx0, fz0) + 4.0f) < minDrop) { if (++cliffFizzles <= 6) { cliffDone = false; cliffScanCool = 5; } enterDrop(irnd(2, 3)); return; }   // too low for a real plunge: re-arm the signature same-lap (spec: cliffdive >=1/lap), rim scan suppressed so a valley structural plunge takes it
+            // The landmark dive is a genuine Falcon-scale event.  If there is not enough room for
+            // a 180 m descent, skip it and let a later powered approach find a better valley rather
+            // than label a short pointy hop as a cliff dive.
+            float minDrop = 180.0f;
+            if (apexEst - (groundTopAt(fx0, fz0) + 4.0f) < minDrop) { if (++cliffFizzles <= 6) { cliffDone = false; cliffScanCool = 5; } enterDrop(irnd(2, 3)); return; }
         }
         // CREST < 300 HARD (user): on a tall massif the signature climb terrain-follows the mesa back
         // up past the ceilY crest cap (the genFloor lift overrides it), so the dive would apex > 300.
         // Where the crest is already too high for a sub-300 apex, skip the dive this lap and hand to a
         // normal drop rather than run a CLIFFDIVE-labeled crest over the cap. apexY adds the crest arc.
-        if (gpos.y + fmaxf(30.0f, genV * genV / (GRAV * 6.3f)) * (1.0f - cosf(cdPitch)) > 296.0f) { if (++cliffFizzles <= 6) { cliffDone = false; cliffScanCool = 5; } enterDrop(irnd(2, 3)); return; }   // crest too high for a sub-300 apex: re-arm same-lap (rim scan suppressed so a lower valley structural plunge takes it); bounded so an all-too-tall massif can't loop
+        if (gpos.y + fmaxf(30.0f, genV * genV / (GRAV * 6.3f)) * (1.0f - cosf(cdPitch)) > 296.0f) { if (++cliffFizzles <= 6) { cliffDone = false; cliffScanCool = 5; } enterDrop(irnd(2, 3)); return; }
         mode    = M_CLIFFDIVE;
-        cdRc    = fmaxf(30.0f, genV * genV / (GRAV * 6.3f));   // crest-arc radius (speed-sized, needed here to place the rim at the face-top)
-        // WALL-HUG (user: hug the cliff, don't drift 30-60 m out): register the rim where the near-
-        // vertical FACE begins -- the crest-arc EXIT -- not at the climb crest. The crest arc rounds
-        // ~Rc forward over the top before the face drops; pinning the rim at the crest would leave the
-        // whole descent 40-55 m OUT from the registered wall (the old complaint). Advancing the rim to
-        // the face-top makes every face cp sit within a few m of the registered face plane (the ~88 deg
-        // face drifts <10 m over a 250 m drop). Closed-form from the crest arc (pitch cdPitch -> CD_FACE_P
-        // at radius cdRc): forward advance Rc*(sin cdPitch - sin faceP), vertical Rc*(cos faceP - cos cdPitch).
-        // rimBack seats the wall a few m BEHIND the dive line so the near-vertical face dives just IN
-        // FRONT of the rim block (hugging it) rather than plunging INTO the mesa top behind the edge --
-        // without this the last crest-arc cps land behind the rim and the min-clearance floor fights the
-        // scripted descent (a rim-edge jerk). The descent then stays ~4-13 m out from the wall the whole way.
-        const float rimBack = 8.0f;
-        float dxArc   = cdRc * (sinf(cdPitch) - sinf(CD_FACE_P)) - rimBack;
-        float dyArc   = cdRc * (cosf(CD_FACE_P) - cosf(cdPitch));
-        float rimX    = gpos.x + sinf(cdYaw) * dxArc;
-        float rimZ    = gpos.z + cosf(cdYaw) * dxArc;
-        float rimTopY = gpos.y + dyArc - 2.0f;                 // face-top, 2 m under the track
-        // Cap how far the back-slope wedge may reach behind the rim: never far enough to rise over
-        // track already built back there. Scan the existing cps in the mesa's lateral band that sit
-        // behind the rim and BELOW where the wedge (slope 1.75, matching terrainH) would be -- the
-        // wedge must stop short of the nearest such cp. The crest-arc/climb track sits ABOVE the wedge.
-        float topY = rimTopY, backMax = 200.0f;
-        bool  mesaOk = true;
-        for (int i = 0; i < (int)cp.size(); i++) {
-            float ddx = cp[i].x - rimX, ddz = cp[i].z - rimZ;
-            float ff  = ddx * sinf(cdYaw) + ddz * cosf(cdYaw);
-            float ll  = ddx * cosf(cdYaw) - ddz * sinf(cdYaw);
-            if (fabsf(ll) >= 120.0f) continue;                 // scan the FULL lateral falloff band (lift extends to |lat|~118)
-            // Burying ANY existing track under the mesa triggers the genFloor catch-up cascade
-            // (measured: a runaway +40 m/step lifted tower + -150 m clearance busts), so protect both
-            // sides of the rim. BEHIND: shrink the back wedge short of any low cp (a rim with no back
-            // wedge is still a rim). IN FRONT: the near-vertical face IS the rim -- it can't be
-            // shortened, so if track already runs under it, skip registering the mesa entirely this
-            // lap (the scripted dive path is closed-form and safe with or without the visual face).
-            if (ff < 0.0f) {
-                float wedgeY = topY + ff * 1.75f;              // wedge height at this cp (its full, latK=1 lift)
-                if (cp[i].y < wedgeY + 4.0f)                   // this cp would be buried (or nearly)
-                    backMax = fminf(backMax, -ff - 8.0f);      // stop the wedge ~8 m short of it
-            } else if (ff < 18.0f) {
-                float faceY = topY - ff * 30.0f;               // front face height at this cp (~88 deg, matching terrainH)
-                if (cp[i].y < faceY + 4.0f) mesaOk = false;
-            }
-        }
-        backMax = fmaxf(backMax, 0.0f);
-        // Register the synthetic rim at the face-top: mesa top 2 m below the face-start point, rim
-        // perpendicular to the dive heading, near-vertical (~88 deg) face ahead, back-slope wedge behind.
-        if (mesaOk) registerMesa(rimX, rimZ, cdYaw, topY, backMax);
+        cdRc    = fmaxf(30.0f, genV * genV / (GRAV * 6.3f));
         // Valley target: natural ground ~85 m ahead (clear of the near-vertical face + the pullout footprint).
         float fx = gpos.x + sinf(cdYaw) * 85.0f, fz = gpos.z + cosf(cdYaw) * 85.0f;
         cdValleyY = groundTopAt(fx, fz) + 4.0f;
@@ -3016,11 +2943,9 @@ struct Track {
         // degenerates on the vertical face (forward is nearly straight down there).
         float hx = sinf(cdYaw), hz = cosf(cdYaw);
         Vector3 upv = Vector3Normalize(Vector3{ -hx * sinf(cdPitch), cosf(cdPitch), -hz * sinf(cdPitch) });
-        // Hand to the terrain-following DROP once the pullout has arced up to the shallow, DROP-
-        // compatible handoff pitch (continuous horizontal-step seam). The old truncation used the stale
-        // cdValleyY -- sampled 85 m ahead, often a false-high near-ridge -- which cut the pullout off at
-        // ~-88 (the KINK). Use the REAL ground clearance below the pullout instead: the front of the rim
-        // is natural terrain (registerMesa only lifts), so a false-high valleyY no longer starves the arc.
+        // Hand to the terrain-following DROP once the pullout has arced up to the shallow,
+        // DROP-compatible handoff pitch. Use real local terrain clearance rather than a stale
+        // forward valley sample so an intervening ridge cannot truncate the pullout at -88°.
         float floorHere = groundTopAt(gpos.x, gpos.z) - 5.0f;   // matches the shared min-clearance floor below
         bool  arced   = (cdPhase == 2 && cdPitch >= CD_HANDOFF_P);
         bool  nearGnd = (cdPhase >= 1 && gpos.y <= floorHere + 6.0f);   // out of vertical room (also guards the face against a room-less dive): the DROP terrain-follows the rest
@@ -3168,7 +3093,7 @@ struct Track {
             // TUNNEL -- only depth-cap them so terrain can rise into them for the tunnel look.
             bool inv = (mode==M_LOOP||mode==M_IMMEL||mode==M_ROLL||mode==M_COBRA||mode==M_DIVELOOP||
                         mode==M_PRETZEL||mode==M_HEARTLINE||mode==M_BANANA||mode==M_STENGEL||mode==M_WINGOVER);
-            float mc  = inv ? 3.0f : -5.0f;
+            float mc  = inv ? 3.0f : -18.0f;
             if (gpos.y < gtN + mc) gpos.y = gtN + mc;
         }
 
@@ -3321,7 +3246,7 @@ struct Track {
                     // active again this pass pulls valley floors down hard enough to punch
                     // through the per-cp terrain clamp (measured -17 m). Deep cps it inherited
                     // stay (the terrain-floor pass below owns lifting those smoothly).
-                    float fl = groundTopAt(cp[i].x, cp[i].z) - 5.0f;
+                    float fl = groundTopAt(cp[i].x, cp[i].z) - 18.0f;
                     if (newY < fl && cp[i].y >= fl) newY = fl;
                     cp[i].y = newY;
                 }
@@ -3389,7 +3314,7 @@ struct Track {
             if (ki != M_STATION) {
                 bool invI = (ki==M_LOOP||ki==M_IMMEL||ki==M_ROLL||ki==M_COBRA||ki==M_DIVELOOP||
                              ki==M_PRETZEL||ki==M_HEARTLINE||ki==M_BANANA||ki==M_STENGEL||ki==M_WINGOVER);
-                float clr = invI ? 4.0f : -5.0f;   // carving modes may tunnel to ~5 m deep; inversions stay above ground
+                float clr = invI ? 4.0f : -18.0f;  // ordinary track may make a purposeful shallow cut; inversions stay above ground
                 float tf  = groundTopAt(cp[i].x, cp[i].z) + clr;
                 if (tf <= genFloorY) {            // terrain at/below the floor: follow it down, reset the climb
                     genFloorY = tf; genFloorVy = 0.0f;
@@ -3416,7 +3341,7 @@ struct Track {
                 // shallow tunnels are wanted (a real tunnel-through-the-hill moment), so allow the
                 // track to run a bounded amount under a fast-rising hill while still capping any
                 // pathological deep underground dive.
-                float hardFloor = groundTopAt(cp[i].x, cp[i].z) - 7.0f;
+                float hardFloor = groundTopAt(cp[i].x, cp[i].z) - 20.0f;
                 if (cp[i].y < hardFloor) cp[i].y = hardFloor;
 
                 // ROUND JUST THE TUNNEL-ENTRY LIP. Where a carving mode dives under terrain and the
@@ -3532,7 +3457,17 @@ struct Track {
         int k = (int)u;
         if (k > (int)cp.size() - 4) k = (int)cp.size() - 4;
         if (k < 0) k = 0;
-        return catmull(cp[k], cp[k+1], cp[k+2], cp[k+3], u - k);
+        auto fixedShape = [](unsigned char m) {
+            return m == M_LOOP || m == M_ROLL || m == M_IMMEL || m == M_STALL ||
+                   m == M_DIVELOOP || m == M_COBRA || m == M_HEARTLINE ||
+                   m == M_PRETZEL || m == M_BANANA || m == M_STENGEL ||
+                   m == M_CLIFFDIVE;
+        };
+        // Closed-form inversions and the signature dive already own exact geometry.  Every
+        // ordinary connector, climb, drop, hill, turn and booster receives the C2 ride curve.
+        bool useC2 = !fixedShape(kind[k]) && !fixedShape(kind[k + 1]) &&
+                     !fixedShape(kind[k + 2]) && !fixedShape(kind[k + 3]);
+        return trackSpline(cp[k], cp[k+1], cp[k+2], cp[k+3], u - k, useC2);
     }
     Vector3 upAt(float u) const {
         if (u < 0) u = 0;
@@ -3540,6 +3475,28 @@ struct Track {
         if (k > (int)up.size() - 4) k = (int)up.size() - 4;
         if (k < 0) k = 0;
         Vector3 a = catmull(up[k], up[k+1], up[k+2], up[k+3], u - k);
+        // Match the C2 path interpolation for the camera frame on ordinary upright/banked
+        // track.  Inversions retain their authored Catmull frame so a component-wise spline
+        // can never pass through a zero-length up vector during a roll.
+        auto fixedShape = [](unsigned char m) {
+            return m == M_LOOP || m == M_ROLL || m == M_IMMEL || m == M_STALL ||
+                   m == M_DIVELOOP || m == M_COBRA || m == M_HEARTLINE ||
+                   m == M_PRETZEL || m == M_BANANA || m == M_STENGEL ||
+                   m == M_CLIFFDIVE;
+        };
+        bool useC2 = !fixedShape(kind[k]) && !fixedShape(kind[k + 1]) &&
+                     !fixedShape(kind[k + 2]) && !fixedShape(kind[k + 3]) &&
+                     up[k].y > 0.20f && up[k + 1].y > 0.20f &&
+                     up[k + 2].y > 0.20f && up[k + 3].y > 0.20f;
+        if (useC2) {
+            float t = u - k;
+            Vector3 q = {
+                quinticC2(up[k].x, up[k+1].x, up[k+2].x, up[k+3].x, t),
+                quinticC2(up[k].y, up[k+1].y, up[k+2].y, up[k+3].y, t),
+                quinticC2(up[k].z, up[k+1].z, up[k+2].z, up[k+3].z, t)
+            };
+            a = Vector3Lerp(a, q, 0.72f);
+        }
         if (Vector3Length(a) < 1e-4f) return WUP;
         return Vector3Normalize(a);
     }
