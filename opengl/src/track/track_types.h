@@ -177,9 +177,58 @@ Pose emitLine(Route& r, float lengthM, Tag tag, bool chain);
 // tangent and curvature at both ends (C2), roll blended through S5.
 Pose emitConnector(Route& r, const Pose& target, Tag tag, bool chain);
 
+// Launched top hat (SHAPES.md "Top hat", COASTER_REWRITE.md crest law):
+// S5 pull-up to +thetaFace, sustained face, ONE crest transition
+// theta(u) = thetaFace*(1 - 2*S5(u)), sustained -thetaFace face, pull-out.
+// riseH/dropH are the element's own raw dimensions (entry->crest and
+// crest->exit heights, meters) — never terrain-relative. Face lengths are
+// solved from them; too-small heights for the given transitions are a
+// planner error (asserted).
+// All numeric defaults here and below are provisional harness values, NOT
+// locked design targets (REALISM_SCALE.md "ask before locking in").
+struct TopHatSpec {
+    float riseH = 180.0f;
+    float dropH = 175.0f;
+    float thetaFace = 1.13446401f; // 65 deg
+    float rampIn = 100.0f;         // entry transition arc length
+    float crestLen = 60.0f;        // crest transition arc length
+    float rampOut = 100.0f;        // pull-out arc length
+    float exitPitch = 0.0f;
+};
+Pose emitTopHat(Route& r, const TopHatSpec& spec);
+
+// Camelback (SHAPES.md "Camelback / airtime hill"): exact parabolic core
+// y = Hp - c*x^2 with C3 pitch-profile blends that meet the parabola at its
+// own curvature AND curvature rate. The blend join is root-found so the raw
+// crest height above the entry grade equals `height` exactly. Symmetric:
+// exits at -entryPitch. Airtime physics: crest curvature is -2c; free-fall
+// match for crest speed v is c = g/(2 v^2) (Mueller 2010, REALISM_SCALE.md) —
+// the planner chooses c relative to that to set floater/ejector feel.
+struct CamelbackSpec {
+    float height = 50.0f;   // raw rise, entry grade to crest (m)
+    float c = 0.012f;       // parabola coefficient (1/m)
+    float blendLen = 40.0f; // arc length of each blend (m)
+};
+Pose emitCamelback(Route& r, const CamelbackSpec& spec);
+
+// Drop (SHAPES.md "Drop and valley"): S5 push-over to -thetaDrop, sustained
+// face, planned pull-out to exitPitch. The face length is solved from the raw
+// descent `height`; the pull-out is part of the primitive, so a drop can
+// never end early — an unbuildable drop is rejected upstream, not truncated.
+struct DropSpec {
+    float height = 60.0f;        // raw vertical descent, entry->exit (m)
+    float thetaDrop = 1.22173048f; // 70 deg
+    float rampIn = 30.0f;
+    float rampOut = 40.0f;
+    float exitPitch = 0.0f;
+};
+Pose emitDrop(Route& r, const DropSpec& spec);
+
 // track_planner.cpp — whole-ride beat planning (built out in steps 2+).
 // buildSmokeRoute: minimal deterministic route used by the step-1/2 harness.
 Route buildSmokeRoute(uint32_t seed);
+// buildStep2Route: all step-2 vertical primitives in sequence (harness only).
+Route buildStep2Route(uint32_t seed);
 
 // track_math / framing — one pass over a finished route: parallel-transport
 // the frame along the samples, then apply designed roll about the tangent.

@@ -34,4 +34,49 @@ Route buildSmokeRoute(uint32_t seed) {
     return r;
 }
 
+// Step-2 proof route: every vertical-profile primitive at realistic-ish scale
+// on one straight heading. Sizes are PROVISIONAL harness values (see
+// REALISM_SCALE.md "ask before locking in" — final planner targets are a user
+// decision); what this route proves is continuity and element acceptance,
+// which are size-independent.
+Route buildStep2Route(uint32_t seed) {
+    (void)seed;
+    Route r;
+    Pose p0;
+    p0.pos = Vector3{0.0f, 80.0f, 0.0f};
+    startRoute(r, p0, 1.0f);
+
+    emitLine(r, 30.0f, Tag::Station, false);
+    emitLine(r, 120.0f, Tag::Launch, true);
+
+    TopHatSpec hat; // defaults: 180 up / 175 down, 65 deg faces
+    emitTopHat(r, hat);
+
+    emitLine(r, 40.0f, Tag::Line, false);
+
+    CamelbackSpec cbBig;
+    cbBig.height = 50.0f;
+    cbBig.c = 0.012f;
+    cbBig.blendLen = 40.0f;
+    emitCamelback(r, cbBig);
+
+    emitLine(r, 30.0f, Tag::Line, false);
+
+    CamelbackSpec cbSmall;
+    cbSmall.height = 32.0f;
+    cbSmall.c = 0.02f;
+    cbSmall.blendLen = 30.0f;
+    emitCamelback(r, cbSmall);
+
+    emitLine(r, 40.0f, Tag::Line, false);
+
+    DropSpec drop; // defaults: 60 m descent @ 70 deg
+    emitDrop(r, drop);
+
+    emitLine(r, 60.0f, Tag::Line, false);
+
+    buildFrames(r);
+    return r;
+}
+
 } // namespace v2

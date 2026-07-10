@@ -140,6 +140,147 @@ static void sweepClearance(const Route& r, const TerrainQuery& t, ValidationRepo
     }
 }
 
+// ---------------------------------------------------------------------------
+// Per-element acceptance checks (COASTER_REWRITE.md acceptance harness 2–4).
+// An "element run" is a maximal group of consecutive segments with the same
+// element tag; checks operate on the dense samples inside the run.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct ElemRun {
+    Tag tag;
+    int i0, i1;      // inclusive sample index range
+    int firstSeg, lastSeg;
+};
+
+std::vector<ElemRun> elementRuns(const Route& r) {
+    std::vector<ElemRun> runs;
+    for (size_t k = 0; k < r.segs.size(); k++) {
+        Tag t = r.segs[k].tag;
+        if (!runs.empty() && runs.back().tag == t && runs.back().lastSeg == (int)k - 1) {
+            runs.back().lastSeg = (int)k;
+            runs.back().i1 = (int)floorf(r.segs[k].s1 / r.ds + 1e-4f);
+        } else {
+            ElemRun run;
+            run.tag = t;
+            run.firstSeg = run.lastSeg = (int)k;
+            run.i0 = (int)ceilf(r.segs[k].s0 / r.ds - 1e-4f);
+            run.i1 = (int)floorf(r.segs[k].s1 / r.ds + 1e-4f);
+            runs.push_back(run);
+        }
+    }
+    for (ElemRun& run : runs) {
+        if (run.i1 >= (int)r.samples.size()) run.i1 = (int)r.samples.size() - 1;
+        if (run.i0 < 0) run.i0 = 0;
+    }
+    return runs;
+}
+
+int countHeightApexes(const Route& r, const ElemRun& run) {
+    int apexes = 0;
+    for (int i = run.i0 + 1; i < run.i1; i++) {
+        float y0 = r.samples[i - 1].pos.y, y1 = r.samples[i].pos.y, y2 = r.samples[i + 1].pos.y;
+        if (y1 > y0 && y1 >= y2 && r.samples[i + 1].pos.y < y1) apexes++;
+    }
+    return apexes;
+}
+
+// "Zero consecutive flat samples at the crest": inside the near-level region
+// containing the apex, pitch must fall STRICTLY monotonically — a shelf sits
+// at constant ~0 pitch, while any honest crest (even a gentle floater) keeps
+// moving through zero. Element bases legitimately dwell near zero pitch, so
+// this deliberately checks only the apex neighbourhood.
+bool crestHasShelf(const Route& r, const ElemRun& run) {
+    int apex = run.i0;
+    for (int i = run.i0; i <= run.i1; i++)
+        if (r.samples[i].pos.y > r.samples[apex].pos.y) apex = i;
+    const float flat = degToRad(0.75f);
+    int lo = apex, hi = apex;
+    while (lo > run.i0 && fabsf(r.samples[lo - 1].pitch) < flat) lo--;
+    while (hi < run.i1 && fabsf(r.samples[hi + 1].pitch) < flat) hi++;
+    const float minStep = degToRad(0.02f);
+    for (int i = lo + 1; i <= hi; i++)
+        if (r.samples[i].pitch > r.samples[i - 1].pitch - minStep) return true;
+    return false;
+}
+
+int longestPitchBand(const Route& r, const ElemRun& run, float lo, float hi) {
+    int best = 0, cur = 0;
+    for (int i = run.i0; i <= run.i1; i++) {
+        float p = r.samples[i].pitch;
+        cur = (p >= lo && p <= hi) ? cur + 1 : 0;
+        if (cur > best) best = cur;
+    }
+    return best;
+}
+
+void fail(ValidationReport& rep, const ElemRun& run, const Route& r, const char* msg) {
+    char buf[160];
+    snprintf(buf, sizeof buf, "%s@s=%.0f..%.0f: %s", tagName(run.tag),
+             r.segs[run.firstSeg].s0, r.segs[run.lastSeg].s1, msg);
+    rep.elementFailures.push_back(buf);
+}
+
+void checkTopHat(const Route& r, const ElemRun& run, ValidationReport& rep) {
+    if (countHeightApexes(r, run) != 1) fail(rep, run, r, "crest apex count != 1");
+    if (crestHasShelf(r, run)) fail(rep, run, r, "flat shelf at crest");
+    float peakUp = -10.0f, peakDown = 10.0f;
+    for (int i = run.i0; i <= run.i1; i++) {
+        peakUp = fmaxf(peakUp, r.samples[i].pitch);
+        peakDown = fminf(peakDown, r.samples[i].pitch);
+    }
+    // Sustained faces in the 60–70 deg band, both signs (acceptance test 2).
+    if (longestPitchBand(r, run, degToRad(60.0f), degToRad(70.0f)) < 5)
+        fail(rep, run, r, "ascent face not sustained in 60..70 deg");
+    if (longestPitchBand(r, run, degToRad(-70.0f), degToRad(-60.0f)) < 5)
+        fail(rep, run, r, "descent face not sustained in -60..-70 deg");
+    if (fabsf(peakUp + peakDown) > degToRad(5.0f))
+        fail(rep, run, r, "ascent/descent peak grades differ by > 5 deg");
+}
+
+void checkCamelback(const Route& r, const ElemRun& run, ValidationReport& rep) {
+    if (countHeightApexes(r, run) != 1) fail(rep, run, r, "crest count != 1");
+    if (crestHasShelf(r, run)) fail(rep, run, r, "plateau at crest");
+    // No mid-hill flattening: between the steepest-up and steepest-down
+    // points, pitch must fall monotonically (the parabola+blend construction
+    // guarantees it; terrain feedback or a bad blend would break it).
+    int iMax = run.i0, iMin = run.i0;
+    for (int i = run.i0; i <= run.i1; i++) {
+        if (r.samples[i].pitch > r.samples[iMax].pitch) iMax = i;
+        if (r.samples[i].pitch < r.samples[iMin].pitch) iMin = i;
+    }
+    if (iMax >= iMin) {
+        fail(rep, run, r, "pitch extremes out of order");
+        return;
+    }
+    for (int i = iMax + 1; i <= iMin; i++)
+        if (r.samples[i].pitch > r.samples[i - 1].pitch + 1e-4f) {
+            fail(rep, run, r, "mid-hill flattening (pitch not monotone over the hill)");
+            break;
+        }
+}
+
+void checkDrop(const Route& r, const ElemRun& run, ValidationReport& rep) {
+    // The drop must hold a sustained face and finish its planned pull-out
+    // (exit pitch equals the segment record's plan — no early hand-off).
+    float minPitch = 10.0f;
+    for (int i = run.i0; i <= run.i1; i++) minPitch = fminf(minPitch, r.samples[i].pitch);
+    if (minPitch > degToRad(-30.0f)) fail(rep, run, r, "no real descent face");
+    if (longestPitchBand(r, run, minPitch - degToRad(1.0f), minPitch + degToRad(1.0f)) < 3)
+        fail(rep, run, r, "descent face not sustained");
+    const Pose& planned = r.segs[run.lastSeg].exit;
+    const Sample& last = r.samples[run.i1];
+    if (fabsf(last.pitch - planned.pitch) > degToRad(1.5f))
+        fail(rep, run, r, "pull-out did not complete to planned exit pitch");
+    for (int i = run.i0 + 1; i <= run.i1; i++)
+        if (r.samples[i].pos.y > r.samples[i - 1].pos.y + 1e-3f) {
+            fail(rep, run, r, "height rises inside drop");
+            break;
+        }
+}
+
+} // namespace
+
 ValidationReport validateRoute(const Route& r, const TerrainQuery* terrain) {
     ValidationReport rep;
     if (r.samples.size() < 2) {
@@ -154,8 +295,14 @@ ValidationReport validateRoute(const Route& r, const TerrainQuery* terrain) {
     sweepSamples(r, rep);
     if (terrain && terrain->height) sweepClearance(r, *terrain, rep);
 
-    // Per-element acceptance checks (top-hat apex/faces, camelback symmetry,
-    // drop pull-out) land with their primitives in migration step 2.
+    for (const ElemRun& run : elementRuns(r)) {
+        switch (run.tag) {
+            case Tag::TopHat:    checkTopHat(r, run, rep); break;
+            case Tag::Camelback: checkCamelback(r, run, rep); break;
+            case Tag::Drop:      checkDrop(r, run, rep); break;
+            default: break;
+        }
+    }
     return rep;
 }
 

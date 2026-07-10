@@ -56,7 +56,19 @@ struct Profile1D {
 // A constant-value profile (df == 0).
 Profile1D constantProfile(float value);
 // S5 ramp from v0 at s=0 to v1 at s=length (zero slope and curvature at ends).
+// Identical to quinticProfile(v0,0,0, v1,0,0, length).
 Profile1D rampProfile(float v0, float v1, float length);
+// Full quintic Hermite 1D profile: value, first and second derivative
+// prescribed at BOTH ends. Lets a ramp join a curved segment (nonzero end
+// curvature/jerk) with C3 continuity — e.g. a camelback blend meeting the
+// parabolic core at the parabola's own curvature and curvature rate.
+Profile1D quinticProfile(float v0, float d0, float dd0,
+                         float v1, float d1, float dd1, float length);
+
+// Integral of sin(profile(s)) over [s0, s1] (Simpson) — the elevation gained
+// by a pitch profile. Used to solve face/segment lengths from a requested
+// raw element height.
+float profileRise(const Profile1D& pitch, float s0, float s1);
 
 // ---------------------------------------------------------------------------
 // Route emission. startRoute seeds sample 0 at s=0 from the given pose.
@@ -70,6 +82,19 @@ void startRoute(Route& r, const Pose& p0, float ds);
 Pose emitSchedule(Route& r, float length,
                   const Profile1D& pitch, const Profile1D& yaw,
                   const Profile1D& roll, Tag tag, bool chain);
+
+// Planar Cartesian emitter: a curve y(x) in the vertical plane at the route's
+// current heading (yaw fixed, roll held constant). x runs over [0, xLen];
+// y/dy/ddy are the height profile and its x-derivatives. y(0) must sit at the
+// route end (heights are relative: the emitted y = endPose.pos.y + (y(x)-y(0))),
+// and dy(0)/ddy(0) must match the end pose pitch/curvature (asserted).
+// Used for primitives whose contract is a closed-form Cartesian shape
+// (camelback's parabolic core, SHAPES.md).
+Pose emitPlanarY(Route& r,
+                 const std::function<float(float)>& y,
+                 const std::function<float(float)>& dy,
+                 const std::function<float(float)>& ddy,
+                 float xLen, Tag tag, bool chain);
 
 // ---------------------------------------------------------------------------
 // Quintic Hermite position curve on t in [0,1] with full endpoint control:

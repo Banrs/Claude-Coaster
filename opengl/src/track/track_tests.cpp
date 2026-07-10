@@ -152,10 +152,124 @@ static void testAdapter() {
 }
 
 // ---------------------------------------------------------------------------
+static void testQuinticProfile() {
+    // Prescribed value + first/second derivative at both ends.
+    float L = 37.0f;
+    Profile1D p = quinticProfile(0.2f, 0.01f, -0.002f, -0.9f, 0.03f, 0.004f, L);
+    CHECK(fabsf(p.f(0.0f) - 0.2f) < 1e-4f, "qp f(0)=%g", p.f(0.0f));
+    CHECK(fabsf(p.f(L) + 0.9f) < 1e-4f, "qp f(L)=%g", p.f(L));
+    CHECK(fabsf(p.df(0.0f) - 0.01f) < 1e-4f, "qp df(0)=%g", p.df(0.0f));
+    CHECK(fabsf(p.df(L) - 0.03f) < 1e-4f, "qp df(L)=%g", p.df(L));
+    // Second derivative endpoints via finite differences of df.
+    float h = 0.05f;
+    float dd0 = (p.df(h) - p.df(0.0f)) / h;
+    float ddL = (p.df(L) - p.df(L - h)) / h;
+    CHECK(fabsf(dd0 + 0.002f) < 2e-3f, "qp ddf(0)=%g", dd0);
+    CHECK(fabsf(ddL - 0.004f) < 2e-3f, "qp ddf(L)=%g", ddL);
+    // df consistent with f mid-profile.
+    for (float s = 5.0f; s < L; s += 8.0f) {
+        float fd = (p.f(s + 0.1f) - p.f(s - 0.1f)) / 0.2f;
+        CHECK(fabsf(fd - p.df(s)) < 1e-3f, "qp df at %g", s);
+    }
+}
+
+// Height rise/drop of an element run, from the samples (raw dimension).
+static void elemHeights(const Route& r, Tag tag, float& rise, float& drop, int& runs) {
+    rise = drop = 0.0f;
+    runs = 0;
+    size_t k = 0;
+    while (k < r.segs.size()) {
+        if (r.segs[k].tag != tag) { k++; continue; }
+        size_t k1 = k;
+        while (k1 + 1 < r.segs.size() && r.segs[k1 + 1].tag == tag) k1++;
+        float entryY = r.segs[k].entry.pos.y;
+        float exitY = r.segs[k1].exit.pos.y;
+        float peakY = entryY;
+        for (size_t j = k; j <= k1; j++) peakY = fmaxf(peakY, r.segs[j].exit.pos.y);
+        for (const Sample& s : r.samples)
+            if (s.s >= r.segs[k].s0 && s.s <= r.segs[k1].s1) peakY = fmaxf(peakY, s.pos.y);
+        if (runs == 0) { // report the FIRST run of this tag
+            rise = peakY - entryY;
+            drop = peakY - exitY;
+        }
+        runs++;
+        k = k1 + 1;
+    }
+}
+
+static void testStep2Route() {
+    Route r = buildStep2Route(1);
+    CHECK(r.samples.size() > 1000, "step2 route has %zu samples", r.samples.size());
+
+    ValidationReport rep = validateRoute(r, nullptr);
+    for (const Discontinuity& d : rep.discontinuities)
+        printf("  discontinuity: s=%.1f %s jump=%g tag=%s\n", d.s, d.quantity, d.jump,
+               tagName(d.tag));
+    for (const std::string& e : rep.elementFailures) printf("  element: %s\n", e.c_str());
+    CHECK(rep.pass(), "step2 route validation: %zu discont, %zu elem failures",
+          rep.discontinuities.size(), rep.elementFailures.size());
+
+    // Raw element dimensions must equal the specs (element height is the
+    // element's own dimension — REALISM_SCALE.md hard rule).
+    float rise, drop;
+    int runs;
+    elemHeights(r, Tag::TopHat, rise, drop, runs);
+    CHECK(runs == 1, "one top hat, got %d", runs);
+    CHECK(fabsf(rise - 180.0f) < 1.0f, "top hat rise %g (want 180)", rise);
+    CHECK(fabsf(drop - 175.0f) < 1.0f, "top hat drop %g (want 175)", drop);
+
+    elemHeights(r, Tag::Camelback, rise, drop, runs);
+    CHECK(runs == 2, "two camelbacks, got %d", runs);
+    CHECK(fabsf(rise - 50.0f) < 0.5f, "camelback rise %g (want 50)", rise);
+    CHECK(fabsf(drop - 50.0f) < 0.5f, "camelback symmetric, drop %g", drop);
+
+    elemHeights(r, Tag::Drop, rise, drop, runs);
+    CHECK(runs == 1, "one drop, got %d", runs);
+    CHECK(fabsf(drop - 60.0f) < 0.5f, "drop descent %g (want 60)", drop);
+    CHECK(rise < 0.01f, "drop never rises, rise=%g", rise);
+
+    // Top-hat peak faces actually hit the signature grade.
+    float peakUp = 0.0f, peakDown = 0.0f;
+    for (const Sample& s : r.samples)
+        if (s.tag == Tag::TopHat) {
+            peakUp = fmaxf(peakUp, s.pitch);
+            peakDown = fminf(peakDown, s.pitch);
+        }
+    CHECK(fabsf(radToDeg(peakUp) - 65.0f) < 0.5f, "face +%g deg", radToDeg(peakUp));
+    CHECK(fabsf(radToDeg(peakDown) + 65.0f) < 0.5f, "face %g deg", radToDeg(peakDown));
+}
+
+// The element checks must actually FAIL bad geometry: a hill with a flat
+// crest shelf (the V1 symptom class) must be flagged.
+static void testValidatorCatchesShelf() {
+    Route r;
+    Pose p0;
+    p0.pos = Vector3{0, 50, 0};
+    startRoute(r, p0, 1.0f);
+    // Fake "camelback": ramp up, FLAT SHELF, ramp down — all tagged Camelback.
+    emitSchedule(r, 40.0f, rampProfile(0.0f, 0.6f, 40.0f), constantProfile(0.0f),
+                 constantProfile(0.0f), Tag::Camelback, false);
+    emitSchedule(r, 40.0f, rampProfile(0.6f, 0.0f, 40.0f), constantProfile(0.0f),
+                 constantProfile(0.0f), Tag::Camelback, false);
+    emitSchedule(r, 12.0f, constantProfile(0.0f), constantProfile(0.0f),
+                 constantProfile(0.0f), Tag::Camelback, false); // the shelf
+    emitSchedule(r, 40.0f, rampProfile(0.0f, -0.6f, 40.0f), constantProfile(0.0f),
+                 constantProfile(0.0f), Tag::Camelback, false);
+    emitSchedule(r, 40.0f, rampProfile(-0.6f, 0.0f, 40.0f), constantProfile(0.0f),
+                 constantProfile(0.0f), Tag::Camelback, false);
+    buildFrames(r);
+    ValidationReport rep = validateRoute(r, nullptr);
+    CHECK(!rep.elementFailures.empty(), "validator must flag a crest shelf");
+}
+
+// ---------------------------------------------------------------------------
 int main() {
     testS5();
+    testQuinticProfile();
     testHermiteBasis();
     testSmokeRoute();
+    testStep2Route();
+    testValidatorCatchesShelf();
     testAdapter();
     printf("%s: %d checks, %d failures\n", g_fails == 0 ? "PASS" : "FAIL", g_checks, g_fails);
     return g_fails == 0 ? 0 : 1;

@@ -17,6 +17,30 @@ Profile1D rampProfile(float v0, float v1, float length) {
         [dv, length](float s) { return dv * s5d(s / length) / length; }};
 }
 
+// Scalar quintic Hermite over t in [0,1] (same basis as QuinticHermite below,
+// declared ahead of it for quinticProfile).
+static inline float qh(float t, float y0, float d0, float dd0, float dd1, float d1, float y1);
+static inline float qhd(float t, float y0, float d0, float dd0, float dd1, float d1, float y1);
+
+Profile1D quinticProfile(float v0, float d0, float dd0,
+                         float v1, float d1, float dd1, float length) {
+    // Convert arc-space derivatives to t-space (t = s/length).
+    float L = length, L2 = length * length;
+    return Profile1D{
+        [=](float s) { return qh(s / L, v0, d0 * L, dd0 * L2, dd1 * L2, d1 * L, v1); },
+        [=](float s) { return qhd(s / L, v0, d0 * L, dd0 * L2, dd1 * L2, d1 * L, v1) / L; }};
+}
+
+float profileRise(const Profile1D& pitch, float s0, float s1) {
+    // Simpson over a fixed fine grid.
+    const int n = 256; // even
+    float h = (s1 - s0) / (float)n;
+    float sum = sinf(pitch.f(s0)) + sinf(pitch.f(s1));
+    for (int i = 1; i < n; i++)
+        sum += sinf(pitch.f(s0 + h * (float)i)) * ((i & 1) ? 4.0f : 2.0f);
+    return sum * h / 3.0f;
+}
+
 void startRoute(Route& r, const Pose& p0, float ds) {
     r.samples.clear();
     r.segs.clear();
@@ -132,6 +156,13 @@ static inline float ddH3(float t) { return t * (3.0f + t * (-12.0f + 10.0f * t))
 static inline float ddH4(float t) { return t * (-24.0f + t * (84.0f - 60.0f * t)); }
 static inline float ddH5(float t) { return t * (60.0f + t * (-180.0f + 120.0f * t)); }
 
+static inline float qh(float t, float y0, float d0, float dd0, float dd1, float d1, float y1) {
+    return y0 * H0(t) + d0 * H1(t) + dd0 * H2(t) + dd1 * H3(t) + d1 * H4(t) + y1 * H5(t);
+}
+static inline float qhd(float t, float y0, float d0, float dd0, float dd1, float d1, float y1) {
+    return y0 * dH0(t) + d0 * dH1(t) + dd0 * dH2(t) + dd1 * dH3(t) + d1 * dH4(t) + y1 * dH5(t);
+}
+
 static Vector3 combine(const QuinticHermite& q, float b0, float b1, float b2,
                        float b3, float b4, float b5) {
     Vector3 out;
@@ -240,6 +271,80 @@ Pose emitHermite(Route& r, const QuinticHermite& h, float exitRoll, Tag tag, boo
     exit.roll = exitRoll;
     r.segs.push_back(SegmentRec{segStart, segStart + length, r.endPose, exit, tag});
     r.endS = segStart + length;
+    r.endPose = exit;
+    return exit;
+}
+
+Pose emitPlanarY(Route& r,
+                 const std::function<float(float)>& y,
+                 const std::function<float(float)>& dy,
+                 const std::function<float(float)>& ddy,
+                 float xLen, Tag tag, bool chain) {
+    assert(!r.samples.empty() && "call startRoute first");
+    assert(xLen > 0.0f);
+    // Entry consistency: the curve must take over exactly at the end pose.
+    assert(fabsf(atanf(dy(0.0f)) - r.endPose.pitch) < 1e-3f && "planar dy(0) vs end pitch");
+    {
+        float g0 = dy(0.0f);
+        float k0 = ddy(0.0f) / powf(1.0f + g0 * g0, 1.5f);
+        assert(fabsf(k0 - r.endPose.kPitch) < 1e-3f && "planar ddy(0) vs end curvature");
+    }
+
+    const float yaw = r.endPose.yaw;
+    const float roll = r.endPose.roll;
+    const Vector3 h = Vector3{sinf(yaw), 0.0f, cosf(yaw)}; // horizontal heading
+    const Vector3 p0 = r.endPose.pos;
+    const float y0 = y(0.0f);
+    const float segStart = r.endS;
+
+    auto poseAtX = [&](float x) {
+        Pose q;
+        q.pos = Vector3Add(p0, Vector3Add(Vector3Scale(h, x), Vector3{0, y(x) - y0, 0}));
+        float g = dy(x);
+        q.pitch = atanf(g);
+        q.yaw = yaw;
+        q.roll = roll;
+        q.kPitch = ddy(x) / powf(1.0f + g * g, 1.5f);
+        q.kYaw = 0.0f;
+        return q;
+    };
+
+    // Walk x with fine steps, accumulating arc; emit at global grid crossings
+    // (linear inverse within a substep, error << mm at this resolution).
+    const float dx = 0.05f;
+    float x = 0.0f;
+    float sLoc = 0.0f;
+    while (x < xLen - 1e-6f) {
+        float xn = fminf(x + dx, xLen);
+        float gm = dy(0.5f * (x + xn));
+        float stepArc = (xn - x) * sqrtf(1.0f + gm * gm);
+        float nextGrid = (float)r.samples.size() * r.ds - segStart;
+        while (nextGrid <= sLoc + stepArc + 1e-7f) {
+            float f = (nextGrid - sLoc) / stepArc;
+            if (f < 0.0f) f = 0.0f;
+            if (f > 1.0f) f = 1.0f;
+            Pose q = poseAtX(x + f * (xn - x));
+            Sample smp;
+            smp.pos = q.pos;
+            smp.s = (float)r.samples.size() * r.ds;
+            smp.pitch = q.pitch;
+            smp.yaw = q.yaw;
+            smp.roll = q.roll;
+            smp.kPitch = q.kPitch;
+            smp.kYaw = 0.0f;
+            smp.tan = dirFromAngles(q.pitch, q.yaw);
+            smp.tag = tag;
+            smp.chain = chain;
+            r.samples.push_back(smp);
+            nextGrid = (float)r.samples.size() * r.ds - segStart;
+        }
+        sLoc += stepArc;
+        x = xn;
+    }
+
+    Pose exit = poseAtX(xLen);
+    r.segs.push_back(SegmentRec{segStart, segStart + sLoc, r.endPose, exit, tag});
+    r.endS = segStart + sLoc;
     r.endPose = exit;
     return exit;
 }
