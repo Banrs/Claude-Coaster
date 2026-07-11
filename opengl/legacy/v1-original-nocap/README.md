@@ -18,7 +18,13 @@ src/render_fx.cpp     # V1-era shader/render engine of that day
 src/pathtrace.cpp     # V1-era voxel path tracer of that day
 ```
 
-## Build & run (inside this folder)
+## Play (double-click)
+
+Double-click **`PLAY-nocap.command`** in Finder — it builds the executable on first run
+(fetches raylib 5.5, ~1–3 min) and launches the game. Later runs launch instantly. It is a
+frozen archive, so it does NOT pull from git.
+
+## Build & run manually (inside this folder)
 
 ```sh
 cmake -B build -S . && cmake --build build -j   # first build fetches raylib 5.5 (network)
