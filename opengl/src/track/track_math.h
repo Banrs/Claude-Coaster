@@ -129,4 +129,10 @@ Pose emitHermite(Route& r, const QuinticHermite& h, float exitRoll, Tag tag, boo
 // ---------------------------------------------------------------------------
 // (declared in track_types.h: void buildFrames(Route&);)
 
+// Signed roll of a frame `up` relative to upright (world up projected
+// perpendicular to `tan`), about the tangent. Zero for a vertical tangent.
+// Used by buildFrames' roll-reset servo, the validator's stuck-roll check
+// and the SVG profile audit's measured-roll panel.
+float frameRollAngle(Vector3 up, Vector3 tan);
+
 } // namespace v2

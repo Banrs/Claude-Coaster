@@ -208,6 +208,9 @@ static void testStep2Route() {
         printf("  discontinuity: s=%.1f %s jump=%g tag=%s\n", d.s, d.quantity, d.jump,
                tagName(d.tag));
     for (const std::string& e : rep.elementFailures) printf("  element: %s\n", e.c_str());
+    for (const OverlapHit& o : rep.overlaps)
+        printf("  overlap: s=%.0f vs s=%.0f dist=%.1f m (%s/%s)\n", o.sA, o.sB, o.dist,
+               tagName(o.tagA), tagName(o.tagB));
     CHECK(rep.pass(), "step2 route validation: %zu discont, %zu elem failures",
           rep.discontinuities.size(), rep.elementFailures.size());
 
@@ -274,6 +277,9 @@ static void testStep3Route() {
         printf("  discontinuity: s=%.1f %s jump=%g tag=%s\n", d.s, d.quantity, d.jump,
                tagName(d.tag));
     for (const std::string& e : rep.elementFailures) printf("  element: %s\n", e.c_str());
+    for (const OverlapHit& o : rep.overlaps)
+        printf("  overlap: s=%.0f vs s=%.0f dist=%.1f m (%s/%s)\n", o.sA, o.sB, o.dist,
+               tagName(o.tagA), tagName(o.tagB));
     CHECK(rep.pass(), "step3 route validation: %zu discont, %zu elem failures",
           rep.discontinuities.size(), rep.elementFailures.size());
 
@@ -454,6 +460,12 @@ static void testStep4CliffDive() {
     // just off the terrain face — remaining lip interference becomes a CUT,
     // the preferred outcome, not something to dodge.
     CliffDiveSpec spec;
+    // Signature-band rule (same as the planner): the powered climb tops the
+    // natural relief up so the dive lands in the 1.0-1.5x WR drop band.
+    {
+        float natural = (site.crestY + 2.0f) - (site.valleyY + 3.0f);
+        spec.climbHeight = fminf(fmaxf(wr::kDrop * 1.02f - natural, 60.0f), 150.0f);
+    }
     float diveDirX = sinf(site.heading), diveDirZ = cosf(site.heading);
     float lipOffset = 8.0f;
     for (float w = 8.0f; w <= 60.0f; w += 4.0f) {
@@ -502,6 +514,9 @@ static void testStep4CliffDive() {
         printf("  discontinuity: s=%.1f %s jump=%g tag=%s\n", d.s, d.quantity, d.jump,
                tagName(d.tag));
     for (const std::string& e : rep.elementFailures) printf("  element: %s\n", e.c_str());
+    for (const OverlapHit& o : rep.overlaps)
+        printf("  overlap: s=%.0f vs s=%.0f dist=%.1f m (%s/%s)\n", o.sA, o.sB, o.dist,
+               tagName(o.tagA), tagName(o.tagB));
     CHECK(rep.pass(), "cliff route validation: %zu discont, %zu elem failures",
           rep.discontinuities.size(), rep.elementFailures.size());
 
@@ -523,6 +538,9 @@ static void testStep5Route() {
         printf("  discontinuity: s=%.1f %s jump=%g tag=%s\n", d.s, d.quantity, d.jump,
                tagName(d.tag));
     for (const std::string& e : rep.elementFailures) printf("  element: %s\n", e.c_str());
+    for (const OverlapHit& o : rep.overlaps)
+        printf("  overlap: s=%.0f vs s=%.0f dist=%.1f m (%s/%s)\n", o.sA, o.sB, o.dist,
+               tagName(o.tagA), tagName(o.tagB));
     CHECK(rep.pass(), "step5 route validation: %zu discont, %zu elem failures",
           rep.discontinuities.size(), rep.elementFailures.size());
 
@@ -615,6 +633,9 @@ static void testFineResolutionSweep() {
             printf("  fine discontinuity: s=%.1f %s jump=%g tag=%s\n", d.s, d.quantity,
                    d.jump, tagName(d.tag));
         for (const std::string& e : rep.elementFailures) printf("  fine element: %s\n", e.c_str());
+        for (const OverlapHit& o : rep.overlaps)
+            printf("  fine overlap: s=%.0f vs s=%.0f dist=%.1f m (%s/%s)\n", o.sA, o.sB,
+                   o.dist, tagName(o.tagA), tagName(o.tagB));
         CHECK(rep.pass(), "step%d route at ds=0.5: %zu discont, %zu elem failures", which,
               rep.discontinuities.size(), rep.elementFailures.size());
     }
@@ -640,6 +661,9 @@ static void testStep6Rides() {
                    d.jump, tagName(d.tag));
         for (const std::string& e : rep.elementFailures)
             printf("  seed%u element: %s\n", seed, e.c_str());
+        for (const OverlapHit& o : rep.overlaps)
+            printf("  seed%u overlap: s=%.0f vs s=%.0f dist=%.1f m (%s/%s)\n", seed, o.sA,
+                   o.sB, o.dist, tagName(o.tagA), tagName(o.tagB));
         bool ok = rep.pass() &&
                   clearanceDecision(rep, ClearanceLimits{}) != ClearanceDecision::Reject;
         CHECK(ok, "seed %u ride invalid", seed);

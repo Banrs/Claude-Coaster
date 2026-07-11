@@ -39,6 +39,20 @@ from scratch, never guessed from the element's name alone.
 below) — this game's default scale sits *above* today's tallest/fastest real ride, not at parity
 with it.
 
+**Style rule (user, 2026-07-10, refined same day): follow the RECORD-SETTERS, whichever
+manufacturer built them — always the most modern/latest record-holding designs.** This is not
+a brand preference: Intamin simply holds the most current records, so its language dominates
+today — the Falcon's Flight / Millennium Force lineage: LSM launches on straight, at-most-
+gently-inclined track (distributed boost sections, never steep powered climbs), giant smooth
+arches with visible "thirds" transitions, sequences of decreasing airtime hills after the big
+drop, drawn-out swooping curves and terrain flight between elements, sparse inversions, one
+signature near-vertical dive. **Where another maker holds the relevant record, reference THAT
+ride for both the size anchor and the element's styling**: Tormenta Rampaging Run (B&M, the
+first giga with inversions) is the reference for giga-scale inversions — it already supplies
+the loop/Immelmann anchors — and B&M's and Vekoma's record-setting rides are equally valid
+references for whatever records they hold. When new records land, the reference moves with
+them.
+
 **Note: this doc's scope is the track generator's element sizing/pacing.** The rendering/shader
 layer (fog, sky, lighting — `render_fx.cpp`, `environment.cpp`, the GLSL shaders) is a **separate**
 rewrite target to hit the "shader Minecraft" look, at a full-to-partial rewrite depending on the
@@ -118,10 +132,10 @@ acceptable, closer is better.** That tolerance philosophy applies to the user's 
 targets in this doc too, unless one is explicitly marked as a hard cap.
 
 **Consequence for planner speed targets (user re-confirmed 2026-07-10: transit stays ~1x in BOTH
-directions — do not let it drift to ~1.25x through under-scaled entry speeds):** with sizes
-locked at ~1.4–1.5x WR, **`k_v ≈ k_r` per element** — each element's in-game entry speed is its
-real anchor entry speed × its size multiplier (flagship camelback anchored to Falcon's ~250 km/h
-entry wants ~100 m/s in-game, not 82). Where the live route arrives far above an element's
+directions — do not let it drift to ~1.25x through under-scaled entry speeds):** whatever size
+multiplier an instance draws from the 1.0–1.5x band, **`k_v ≈ k_r` per element** — each element's
+in-game entry speed is its real anchor entry speed × its own instance size multiplier (a 1.5x
+camelback anchored to Falcon's ~250 km/h entry wants ~100 m/s in-game; a 1.1x instance wants ~76). Where the live route arrives far above an element's
 matched entry, shed the excess with geometry (conditioning climbs, ride ordering) — climbs
 capped at a sane height, after which the entry may run up to ~1.7x real with size at the band
 top, per the standing "user accepts the higher g" position and the soft tolerances.
@@ -187,22 +201,41 @@ especially for elements where the research below found no solid real-world ancho
 corkscrew roll rate — see gaps below). The user may want specific elements pushed toward the top
 or bottom of the range for pacing/variety reasons that aren't derivable from research alone.
 
-## Locked element targets (user decisions, 2026-07-10 — supersede "provisional" markers)
+## Locked element targets (user decisions, 2026-07-10 — REVISED same day, supersedes the ~1.4–1.5x "grand" pins)
 
-Confirmed via the ask-before-locking-in process; the ±5%/±10% soft-tolerance rule applies:
+**Revision (user, 2026-07-10, after seeing V2 output "balloon over requirements"):** element sizes
+must **range across 1.0–1.5x of each element's real WR anchor, with 1.5x as a HARD CAP on built
+size** (not a soft target to hover at). The earlier table pinning every signature element at
+~1.4–1.5x is superseded — that pin is what let everything drift grand-and-uniform. Requirements:
 
-| Decision | Value | Basis |
+- **Per-instance size multiplier is drawn from the 1.0–1.5x band with real variety** — a ride
+  shows a SPREAD of instance sizes (tiers), not a fleet of near-cap elements. Flagship/signature
+  instances may sit near the top (~1.4–1.5x); ordinary instances sit anywhere in the band.
+- **1.5x WR is a hard cap on every element's built primary dimension** (height for
+  drops/hills/hats, radius for loops/turns). Never below 1.0x for a family's flagship instance;
+  smaller repeat instances (hill chains, secondary loops) follow the instance-size note below.
+- **Everything downstream scales proportionally with size** — element count per lap, spacing
+  between elements, and ride pacing all account for bigger elements eating more track length and
+  time (fewer, farther apart when large; see "Element occurrence & density"). V1 did this
+  explicitly (its element budget dropped ~28% when it adopted WR-class sizes); V2 must too.
+- `k_r/k_v ≈ 0.9–1.1` (transit ≈ real time) still holds, with `k_v ≈ k_r` per element.
+
+Per-element WR anchors (unchanged, re-verified 2026-07-10) and the resulting hard caps:
+
+| Element | WR anchor | Built-size range (1.0–1.5x) |
 |---|---|---|
-| Signature element size | **~1.4–1.5x WR** ("grand"), `k_r/k_v ≈ 0.95–1.0` (transit ≈ real time) | User pick; anchors per element below |
-| Top hat (signature) | **~230 m** rise | 1.4x Falcon's Flight 163 m structure |
-| Camelback (flagship) | **~240 m** | 1.45x Falcon's 165 m airtime hill; smaller instances scale down with entry speed (see note below) |
-| Vertical loop | **~78 m** | 1.43x Tormenta 54.6 m |
-| Immelmann | **~95 m** | 1.43x Tormenta 66.4 m |
-| Main drop | **~280 m** | 1.44x Falcon's 195 m elevation drop |
-| Corkscrew roll rate | **90–100°/s** (S5-eased ends) | User pick over a GENUINE data gap — **flagged: re-research if real data ever surfaces**; radius from the loop family scaled down (~10–14 m, design estimate) |
-| Zero-g stall hold | **2–2.5 s** inverted weightless hold | User pick; real anchor is a weak ~2 s estimate (Pantheon) |
-| Inversions per lap | **1–3** | User pick (was 2–4 in V1-era rules) |
-| Inversion roster | loop, Immelmann, dive loop, corkscrew, zero-g stall — **banana roll, heartline roll, wingover/overbank-inversion, pretzel stay excluded** | User re-confirmed the old exclusions |
+| Top hat (structure rise) | Falcon's Flight 163 m structure | 163–245 m, tiers required (e.g. mid ~90–160 m instances exist too) |
+| Camelback | Falcon's ~165 m airtime hill | 165–247 m flagship; smaller hills scale down (El Toro-class 25–34 m floor for chain hills) |
+| Vertical loop | Tormenta 54.6 m | 54.6–82 m |
+| Immelmann | Tormenta 66.4 m | 66.4–100 m |
+| Main drop (elevation change) | Falcon's 195 m | 195–292 m |
+| Corkscrew roll rate | GENUINE data gap | **90–100°/s** (S5-eased ends), radius ~10–14 m design estimate — flagged: re-research if data surfaces |
+| Zero-g stall hold | weak ~2 s anchor (Pantheon) | **2–2.5 s** inverted hold |
+| Inversions per lap | — | **1–3** |
+| Inversion roster | — | loop, Immelmann, dive loop, corkscrew, zero-g stall — **banana, heartline, wingover, pretzel stay excluded** |
+
+The ±5%/±10% soft-tolerance rule applies to targets *within* the band; it does **not** soften the
+1.5x cap — a built size past 1.5x WR is a validation failure, not a tolerance case.
 
 **Instance-size note (this project's interpretation, flag if wrong):** the 1.0x floor binds each
 element family's *flagship* instance (the grandest camelback ≥ its WR anchor); smaller instances
@@ -255,9 +288,12 @@ conventions:
   than a dedicated inversion coaster, but present, unlike its real anchors. Don't treat "zero
   inversions" as the target; the old REALISM.md's "2–4 inversions/lap" range is a reasonable
   starting point to re-validate against the new size/speed rules, not a fixed carry-over.
-- Element density (elements per lap/minute) should be **similar to real coasters, adjusted slightly
-  lower** to account for elements being physically bigger (bigger elements eat more track length
-  and time per instance, so fewer fit in the same ride duration at similar pacing quality).
+- Element density (elements per lap/minute) should be **similar to real coasters, scaled down
+  proportionally with the size multiplier** (user, 2026-07-10): bigger elements eat more track
+  length and time per instance, so element count per lap and spacing between elements must both
+  scale with the actual instance sizes drawn — a lap of near-1.5x instances holds proportionally
+  fewer elements, spaced proportionally farther, than a lap of near-1.0x instances. (Precedent:
+  V1 cut its element budget ~28% when it adopted WR-class sizes.)
 - Historical note requiring reconfirmation, not silent inheritance: a past decision (recorded in
   git history, `REALISM.md` as of commit `782e56d^`) removed banana roll, heartline roll, and
   overbanked turn (WINGOVER) from generation per a past "roll overload" complaint. Re-confirm with

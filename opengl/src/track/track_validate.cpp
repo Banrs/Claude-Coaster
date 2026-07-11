@@ -15,6 +15,8 @@
 // exempt from the C2 criteria.
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <unordered_map>
 
 #include "track_math.h"
 
@@ -90,9 +92,11 @@ static void sweepSamples(const Route& r, ValidationReport& rep) {
             rep.discontinuities.push_back(Discontinuity{B.s, "position", chord - ds, B.tag});
 
         // Normalization joints (inversion exits re-express the same tangent
-        // as (pi-theta, psi+pi, phi+pi)) are geometrically continuous but
-        // step the raw bookkeeping angles; geometry checks still apply there.
-        bool flipPair = fabsf(B.pitch - A.pitch) > 2.0f;
+        // as (pi-theta, psi+pi, phi+pi); full-rotation roll wraps) are
+        // geometrically continuous but step the raw bookkeeping angles; the
+        // emitters flag them EXPLICITLY (Sample::frameJoint) — no magnitude
+        // heuristics. Geometry checks still apply there.
+        bool flipPair = B.frameJoint;
 
         // Stored schedule vs itself, in tangent space: rotate A's tangent
         // through the stored curvature step (midpoint rule) and compare with
@@ -123,9 +127,6 @@ static void sweepSamples(const Route& r, ValidationReport& rep) {
 
         // Roll rate must be continuous everywhere outside deliberate joints
         // (the railway-transition constraint: no step in droll/ds).
-        // Bookkeeping wraps (|dRoll| > 1: full-rotation unwind at a stall/
-        // corkscrew exit) are joints like the pitch flips.
-        if (fabsf(B.roll - A.roll) > 1.0f) flipPair = true;
         float rollRate = (B.roll - A.roll) / ds;
         if (havePrevRollRate && !flipPair && !prevFlipPair) {
             float jump = fabsf(rollRate - prevRollRate);
@@ -153,6 +154,88 @@ static void sweepSamples(const Route& r, ValidationReport& rep) {
         if (upTwistCos < cosf(0.15f))
             rep.discontinuities.push_back(
                 Discontinuity{B.s, "frameTwist", acosf(fmaxf(-1.0f, fminf(1.0f, upTwistCos))), B.tag});
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Track-to-track clearance (user 2026-07-10: "V2 forgets about overlaps in
+// inversions"). Any two samples closer in space than the train envelope while
+// far apart along the rail is a violation — the route passes through itself.
+// Spatial hash over XZ cells; arc distance measured modulo length on closed
+// routes so the station seam is not a false positive.
+// ---------------------------------------------------------------------------
+static void sweepOverlaps(const Route& r, ValidationReport& rep) {
+    const float kMinClear = 4.2f;  // train envelope + margin (rail-to-rail);
+                                   // the smallest loops saturate their
+                                   // incline solve at ~4.5 m — keep margin
+    const float kMinArc = 25.0f;   // closer along the rail = same stretch
+    const float cell = 8.0f;
+    size_t n = r.samples.size();
+    if (n < 8) return;
+    float total = r.length();
+    std::unordered_map<uint64_t, std::vector<int>> grid;
+    auto key = [&](float x, float z) {
+        int gx = (int)floorf(x / cell), gz = (int)floorf(z / cell);
+        return ((uint64_t)(uint32_t)gx << 32) | (uint32_t)gz;
+    };
+    grid.reserve(n);
+    for (size_t i = 0; i < n; i++)
+        grid[key(r.samples[i].pos.x, r.samples[i].pos.z)].push_back((int)i);
+    int flagged = 0;
+    for (size_t i = 0; i < n && flagged < 24; i++) {
+        const Sample& a = r.samples[i];
+        int gx = (int)floorf(a.pos.x / cell), gz = (int)floorf(a.pos.z / cell);
+        float best = 1e9f;
+        int bestJ = -1;
+        for (int dx = -1; dx <= 1; dx++)
+            for (int dz = -1; dz <= 1; dz++) {
+                uint64_t k = ((uint64_t)(uint32_t)(gx + dx) << 32) | (uint32_t)(gz + dz);
+                auto it = grid.find(k);
+                if (it == grid.end()) continue;
+                for (int j : it->second) {
+                    if (j <= (int)i) continue;
+                    float dArc = r.samples[j].s - a.s;
+                    if (r.closed) dArc = fminf(dArc, total - dArc);
+                    if (dArc < kMinArc) continue;
+                    float d = Vector3Distance(a.pos, r.samples[j].pos);
+                    if (d < best) { best = d; bestJ = j; }
+                }
+            }
+        if (bestJ >= 0 && best < kMinClear) {
+            // One hit per local cluster: skip ahead past this stretch.
+            rep.overlaps.push_back(OverlapHit{a.s, r.samples[bestJ].s, best,
+                                              a.tag, r.samples[bestJ].tag});
+            flagged++;
+            i += (size_t)(12.0f / r.ds);
+        }
+    }
+}
+
+// Stuck-roll check (user 2026-07-10: "does not reset roll at all"): at the
+// end of any long glue run whose DESIGNED roll is zero, the MEASURED frame
+// roll (transport holonomy included) must be back at upright. This is the
+// check the designed-roll plots could never fail.
+static void sweepFrameRoll(const Route& r, ValidationReport& rep) {
+    auto glue = [](Tag t) {
+        return t == Tag::Line || t == Tag::Connector || t == Tag::Launch ||
+               t == Tag::Brake || t == Tag::Station;
+    };
+    const float kTol = degToRad(2.0f);
+    size_t n = r.samples.size();
+    size_t runStart = 0;
+    bool inRun = false;
+    for (size_t i = 0; i <= n; i++) {
+        bool ok = i < n && glue(r.samples[i].tag) && fabsf(r.samples[i].roll) < 1e-4f;
+        if (ok && !inRun) { runStart = i; inRun = true; }
+        if (!ok && inRun) {
+            inRun = false;
+            size_t last = i - 1;
+            if ((r.samples[last].s - r.samples[runStart].s) < 60.0f) continue;
+            float resid = frameRollAngle(r.samples[last].up, r.samples[last].tan);
+            if (fabsf(resid) > kTol)
+                rep.discontinuities.push_back(Discontinuity{
+                    r.samples[last].s, "stuckRoll", resid, r.samples[last].tag});
+        }
     }
 }
 
@@ -311,6 +394,53 @@ void fail(ValidationReport& rep, const ElemRun& run, const Route& r, const char*
     rep.elementFailures.push_back(buf);
 }
 
+// Built-size band enforcement (REALISM_SCALE.md revised 2026-07-10): the
+// measured raw dimension must land inside [1.0, 1.5] x the WR anchor, with a
+// 2% measurement tolerance. The 1.5x cap is HARD — this check is why planner
+// sizing can never silently balloon again.
+void checkSizeBand(const Route& r, const ElemRun& run, ValidationReport& rep,
+                   float measured, float anchor, bool enforceFloor) {
+    char buf[96];
+    if (measured > wr::kMulMax * anchor * 1.02f) {
+        snprintf(buf, sizeof buf, "built size %.0f m exceeds 1.5x WR anchor %.0f m",
+                 measured, anchor);
+        fail(rep, run, r, buf);
+    }
+    if (enforceFloor && measured < wr::kMulMin * anchor * 0.98f) {
+        snprintf(buf, sizeof buf, "built size %.0f m below 1.0x WR anchor %.0f m",
+                 measured, anchor);
+        fail(rep, run, r, buf);
+    }
+}
+
+// Pull-out taper rule (user 2026-07-10, Falcon's Flight camelback photo): the
+// gradient-to-flat taper must start EARLY — the height consumed after the
+// sustained face ends (last sample within 1 deg of the steepest descent) must
+// be at least `minFrac` of the element's total descent.
+void checkPullOutFraction(const Route& r, const ElemRun& run, ValidationReport& rep,
+                          float minFrac) {
+    float minPitch = 10.0f;
+    for (int i = run.i0; i <= run.i1; i++)
+        minPitch = fminf(minPitch, r.samples[i].pitch);
+    int lastFace = -1;
+    for (int i = run.i0; i <= run.i1; i++)
+        if (r.samples[i].pitch < minPitch + degToRad(1.0f)) lastFace = i;
+    if (lastFace < 0) return;
+    int iTop = run.i0;
+    for (int i = run.i0; i <= run.i1; i++)
+        if (r.samples[i].pos.y > r.samples[iTop].pos.y) iTop = i;
+    float total = r.samples[iTop].pos.y - r.samples[run.i1].pos.y;
+    if (total < 20.0f) return; // tiny descents have no meaningful fraction
+    float afterFace = r.samples[lastFace].pos.y - r.samples[run.i1].pos.y;
+    if (afterFace < minFrac * total) {
+        char buf[96];
+        snprintf(buf, sizeof buf,
+                 "pull-out starts too late: %.0f%% of descent after the face (need %.0f%%)",
+                 100.0f * afterFace / total, 100.0f * minFrac);
+        fail(rep, run, r, buf);
+    }
+}
+
 void checkTopHat(const Route& r, const ElemRun& run, ValidationReport& rep) {
     if (countHeightApexes(r, run) != 1) fail(rep, run, r, "crest apex count != 1");
     if (crestHasShelf(r, run)) fail(rep, run, r, "flat shelf at crest");
@@ -326,6 +456,13 @@ void checkTopHat(const Route& r, const ElemRun& run, ValidationReport& rep) {
         fail(rep, run, r, "descent face not sustained in -60..-70 deg");
     if (fabsf(peakUp + peakDown) > degToRad(5.0f))
         fail(rep, run, r, "ascent/descent peak grades differ by > 5 deg");
+    // Raw rise (entry grade to crest) against the WR band; pull-out taper.
+    int iTop = run.i0;
+    for (int i = run.i0; i <= run.i1; i++)
+        if (r.samples[i].pos.y > r.samples[iTop].pos.y) iTop = i;
+    float rise = r.samples[iTop].pos.y - r.segs[run.firstSeg].entry.pos.y;
+    checkSizeBand(r, run, rep, rise, wr::kTopHatRise, true);
+    checkPullOutFraction(r, run, rep, 0.24f);
 }
 
 void checkCamelback(const Route& r, const ElemRun& run, ValidationReport& rep) {
@@ -376,6 +513,16 @@ void checkCamelback(const Route& r, const ElemRun& run, ValidationReport& rep) {
             fail(rep, run, r, "halves are not mirror images (pitch asymmetry > 1 deg)");
             break;
         }
+    // Rise against the camelback band: capped at 1.5x the Falcon anchor; the
+    // floor for repeat hills is the El Toro-class small-hill scale, not the
+    // flagship anchor (REALISM_SCALE instance-size note).
+    int iTop = run.i0;
+    for (int i = run.i0; i <= run.i1; i++)
+        if (r.samples[i].pos.y > r.samples[iTop].pos.y) iTop = i;
+    float rise = r.samples[iTop].pos.y - r.segs[run.firstSeg].entry.pos.y;
+    checkSizeBand(r, run, rep, rise, wr::kCamelback, false);
+    if (rise < wr::kHillFloor * 0.9f)
+        fail(rep, run, r, "hill below the small-hill floor");
 }
 
 void checkCliffDive(const Route& r, const ElemRun& run, ValidationReport& rep) {
@@ -425,6 +572,16 @@ void checkCliffDive(const Route& r, const ElemRun& run, ValidationReport& rep) {
     const Pose& planned = r.segs[run.lastSeg].exit;
     if (fabsf(r.samples[run.i1].pitch - planned.pitch) > degToRad(1.5f))
         fail(rep, run, r, "pull-out did not complete");
+    // The cliff dive is the ride's main drop: its descent (peak to exit)
+    // must land inside the WR drop band, and its pull-out tapers early.
+    {
+        int iPeak = run.i0;
+        for (int i = run.i0; i <= run.i1; i++)
+            if (r.samples[i].pos.y > r.samples[iPeak].pos.y) iPeak = i;
+        float descent = r.samples[iPeak].pos.y - r.segs[run.lastSeg].exit.pos.y;
+        checkSizeBand(r, run, rep, descent, wr::kDrop, true);
+    }
+    checkPullOutFraction(r, run, rep, 0.20f);
 }
 
 void checkLoop(const Route& r, const ElemRun& run, ValidationReport& rep) {
@@ -444,7 +601,10 @@ void checkLoop(const Route& r, const ElemRun& run, ValidationReport& rep) {
         if (r.samples[i].pos.y > r.samples[iTop].pos.y) iTop = i;
         minUpY = fminf(minUpY, r.samples[i].up.y);
     }
-    if (minUpY > -0.9f) fail(rep, run, r, "never inverted at the top");
+    // Inclined loops (the lateral-separation solve) tilt the plane up to
+    // ~30 deg, so up.y at the top bottoms out near -cos(tilt), not -1 —
+    // the rider is still fully inverted (real inclined loops tilt further).
+    if (minUpY > -0.78f) fail(rep, run, r, "never inverted at the top");
     // Teardrop signature: top curvature well above the curvature at quarter
     // height on the way up (a circle would be flat; V1-style generic
     // smoothing would flatten it too).
@@ -457,6 +617,7 @@ void checkLoop(const Route& r, const ElemRun& run, ValidationReport& rep) {
         fail(rep, run, r, "not a teardrop: top curvature not tighter than the flank");
     float dh = fabsf(r.segs[run.lastSeg].exit.pos.y - r.segs[run.firstSeg].entry.pos.y);
     if (dh > 2.0f) fail(rep, run, r, "loop does not close back to its entry height");
+    checkSizeBand(r, run, rep, yTop - yEntry, wr::kLoop, true);
 }
 
 void checkImmelmann(const Route& r, const ElemRun& run, ValidationReport& rep) {
@@ -478,8 +639,7 @@ void checkImmelmann(const Route& r, const ElemRun& run, ValidationReport& rep) {
         fail(rep, run, r, "entry/exit not upright");
     float rise = r.segs[run.lastSeg].exit.pos.y - r.segs[run.firstSeg].entry.pos.y;
     if (rise < 10.0f) fail(rep, run, r, "does not exit high");
-    float dTop = fabsf(r.segs[run.lastSeg].exit.pos.y - r.samples[run.i0 == 0 ? 0 : run.i0].pos.y - rise);
-    (void)dTop; // exit height == rise by definition; kept for clarity
+    checkSizeBand(r, run, rep, rise, wr::kImmelmann, true);
 }
 
 void checkDiveLoop(const Route& r, const ElemRun& run, ValidationReport& rep) {
@@ -501,6 +661,7 @@ void checkDiveLoop(const Route& r, const ElemRun& run, ValidationReport& rep) {
         fail(rep, run, r, "entry/exit not upright");
     float fall = r.segs[run.firstSeg].entry.pos.y - r.segs[run.lastSeg].exit.pos.y;
     if (fall < 10.0f) fail(rep, run, r, "does not exit low");
+    checkSizeBand(r, run, rep, fall, wr::kImmelmann, true);
 }
 
 void checkZeroGStall(const Route& r, const ElemRun& run, ValidationReport& rep) {
@@ -585,9 +746,225 @@ void checkDrop(const Route& r, const ElemRun& run, ValidationReport& rep) {
             fail(rep, run, r, "height rises inside drop");
             break;
         }
+    // Descent never exceeds the WR drop band top (no floor: mid-ride drops
+    // legitimately come in all sizes); taper starts early.
+    float descent = r.segs[run.firstSeg].entry.pos.y - r.segs[run.lastSeg].exit.pos.y;
+    checkSizeBand(r, run, rep, descent, wr::kDrop, false);
+    checkPullOutFraction(r, run, rep, 0.24f);
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// SVG profile "photo" (the V1 --audit SVG, rewritten for V2 from scratch):
+// three stacked panels over one arc-length axis — elevation (terrain fill +
+// track colored by element), pitch, and roll. The roll panel draws BOTH the
+// designed roll schedule and the MEASURED frame roll (the transported up's
+// angle from upright) — transport holonomy, the stuck-roll defect, is only
+// visible in the measured trace. Element labels sit above the elevation
+// panel; red bands mark discontinuities and overlap hits.
+// ---------------------------------------------------------------------------
+namespace {
+
+const char* tagColor(Tag t) {
+    switch (t) {
+        case Tag::Station:
+        case Tag::Brake:      return "#8a8f98";
+        case Tag::Launch:     return "#d9a520";
+        case Tag::Line:       return "#4a76c9";
+        case Tag::Connector:  return "#7fa3e0";
+        case Tag::TopHat:     return "#c94a4a";
+        case Tag::Camelback:  return "#e0b13d";
+        case Tag::Drop:       return "#d95f3b";
+        case Tag::Turn:       return "#e08b3d";
+        case Tag::SCurve:     return "#c9a24a";
+        case Tag::Helix:      return "#3da864";
+        case Tag::CliffDive:  return "#b3303f";
+        case Tag::Loop:       return "#8a4ac9";
+        case Tag::Immelmann:  return "#a34ac9";
+        case Tag::DiveLoop:   return "#c94aa3";
+        case Tag::Corkscrew:  return "#6a4ac9";
+        case Tag::ZeroGStall: return "#4ac9b3";
+        default:              return "#666666";
+    }
+}
+
+float wrapAngle(float a) {
+    while (a > kPi) a -= 2.0f * kPi;
+    while (a < -kPi) a += 2.0f * kPi;
+    return a;
+}
+
+} // namespace
+
+bool writeRouteSVG(const Route& r, const TerrainQuery* terrain,
+                   const ValidationReport& rep, const char* path) {
+    if (r.samples.empty()) return false;
+    FILE* f = fopen(path, "w");
+    if (!f) return false;
+
+    const int W = 1680, LM = 52, RM = 12;
+    const int elevH = 300, angH = 150, gap = 26, top = 34;
+    const int plotW = W - LM - RM;
+    const float total = r.length();
+    auto X = [&](float s) { return (float)LM + (s / total) * (float)plotW; };
+
+    // Elevation range over track and terrain.
+    float yMin = 1e9f, yMax = -1e9f;
+    for (const Sample& s : r.samples) {
+        yMin = fminf(yMin, s.pos.y);
+        yMax = fmaxf(yMax, s.pos.y);
+    }
+    if (terrain && terrain->height)
+        for (size_t i = 0; i < r.samples.size(); i += 8) {
+            float g = terrain->height(r.samples[i].pos.x, r.samples[i].pos.z);
+            yMin = fminf(yMin, g);
+            yMax = fmaxf(yMax, g);
+        }
+    yMin -= 10.0f;
+    yMax += 10.0f;
+    const int H = top + elevH + gap + angH + gap + angH + 58;
+    auto YE = [&](float y) {
+        return (float)(top + elevH) - (y - yMin) / (yMax - yMin) * (float)elevH;
+    };
+
+    fprintf(f, "<svg xmlns='http://www.w3.org/2000/svg' width='%d' height='%d' "
+               "font-family='Menlo,monospace' font-size='11'>\n", W, H);
+    fprintf(f, "<rect width='%d' height='%d' fill='#101318'/>\n", W, H);
+
+    // ---- panel frames + axis labels ------------------------------------
+    struct Panel { int y0, h; const char* name; };
+    Panel panels[3] = {{top, elevH, "elevation (m)"},
+                       {top + elevH + gap, angH, "pitch (deg)"},
+                       {top + elevH + gap + angH + gap, angH,
+                        "roll (deg): designed=blue measured=red"}};
+    for (const Panel& p : panels) {
+        fprintf(f, "<rect x='%d' y='%d' width='%d' height='%d' fill='#161b22' "
+                   "stroke='#2c333d'/>\n", LM, p.y0, plotW, p.h);
+        fprintf(f, "<text x='%d' y='%d' fill='#9aa4b2'>%s</text>\n", LM, p.y0 - 5, p.name);
+    }
+    // km ticks.
+    for (float s = 0.0f; s <= total; s += 1000.0f) {
+        fprintf(f, "<line x1='%.0f' y1='%d' x2='%.0f' y2='%d' stroke='#2c333d'/>\n",
+                X(s), top, X(s), panels[2].y0 + angH);
+        fprintf(f, "<text x='%.0f' y='%d' fill='#77808c'>%.0fkm</text>\n", X(s) + 2,
+                panels[2].y0 + angH + 14, s / 1000.0f);
+    }
+
+    // ---- elevation panel -------------------------------------------------
+    if (terrain && terrain->height) {
+        fprintf(f, "<path d='M%.1f,%.1f ", X(0.0f), YE(terrain->height(
+                    r.samples[0].pos.x, r.samples[0].pos.z)));
+        for (size_t i = 8; i < r.samples.size(); i += 8)
+            fprintf(f, "L%.1f,%.1f ", X(r.samples[i].s),
+                    YE(terrain->height(r.samples[i].pos.x, r.samples[i].pos.z)));
+        fprintf(f, "L%.1f,%d L%d,%d Z' fill='#1d3020' stroke='none'/>\n",
+                X(r.samples.back().s), top + elevH, LM, top + elevH);
+        // Water line.
+        if (terrain->waterY > yMin && terrain->waterY < yMax)
+            fprintf(f, "<line x1='%d' y1='%.1f' x2='%d' y2='%.1f' stroke='#2a5f8a' "
+                       "stroke-dasharray='3,3'/>\n", LM, YE(terrain->waterY),
+                    LM + plotW, YE(terrain->waterY));
+    }
+    // Track, one polyline per tag run (color = element).
+    {
+        size_t i = 0;
+        while (i < r.samples.size()) {
+            size_t j = i;
+            Tag t = r.samples[i].tag;
+            while (j + 1 < r.samples.size() && r.samples[j + 1].tag == t) j++;
+            fprintf(f, "<polyline fill='none' stroke='%s' stroke-width='1.6' points='",
+                    tagColor(t));
+            for (size_t k = i; k <= j; k += 2)
+                fprintf(f, "%.1f,%.1f ", X(r.samples[k].s), YE(r.samples[k].pos.y));
+            fprintf(f, "'/>\n");
+            // Element label above the run (named elements only, wide runs only).
+            bool named = t != Tag::Line && t != Tag::Connector && t != Tag::Station &&
+                         t != Tag::Brake;
+            if (named && (r.samples[j].s - r.samples[i].s) > 60.0f) {
+                float xm = X(0.5f * (r.samples[i].s + r.samples[j].s));
+                float ytop = 1e9f;
+                for (size_t k = i; k <= j; k++) ytop = fminf(ytop, YE(r.samples[k].pos.y));
+                fprintf(f, "<text x='%.0f' y='%.0f' fill='%s' text-anchor='middle'>%s</text>\n",
+                        xm, fmaxf(ytop - 6.0f, (float)top + 10.0f), tagColor(t), tagName(t));
+            }
+            i = j + 1;
+        }
+    }
+
+    // ---- pitch + roll panels --------------------------------------------
+    auto plotAngle = [&](const Panel& p, float lo, float hi,
+                         const std::function<float(const Sample&)>& fn,
+                         const char* color) {
+        auto Y = [&](float v) {
+            float c = fminf(fmaxf(v, lo), hi);
+            return (float)(p.y0 + p.h) - (c - lo) / (hi - lo) * (float)p.h;
+        };
+        // Zero + guide lines.
+        fprintf(f, "<line x1='%d' y1='%.1f' x2='%d' y2='%.1f' stroke='#39414d' "
+                   "stroke-dasharray='4,3'/>\n", LM, Y(0.0f), LM + plotW, Y(0.0f));
+        fprintf(f, "<polyline fill='none' stroke='%s' stroke-width='1.2' points='",
+                color);
+        for (size_t i = 0; i < r.samples.size(); i += 2)
+            fprintf(f, "%.1f,%.1f ", X(r.samples[i].s), Y(fn(r.samples[i])));
+        fprintf(f, "'/>\n");
+        fprintf(f, "<text x='%d' y='%d' fill='#77808c'>%+.0f</text>\n", 8, p.y0 + 12, hi);
+        fprintf(f, "<text x='%d' y='%d' fill='#77808c'>%+.0f</text>\n", 8, p.y0 + p.h - 2, lo);
+    };
+    plotAngle(panels[1], -95.0f, 95.0f,
+              [](const Sample& s) { return radToDeg(wrapAngle(s.pitch)); }, "#e0b13d");
+    // +-65 deg reference (top-hat face band).
+    {
+        const Panel& p = panels[1];
+        for (float ref : {65.0f, -65.0f}) {
+            float y = (float)(p.y0 + p.h) - (ref + 95.0f) / 190.0f * (float)p.h;
+            fprintf(f, "<line x1='%d' y1='%.1f' x2='%d' y2='%.1f' stroke='#4d3939' "
+                       "stroke-dasharray='2,4'/>\n", LM, y, LM + plotW, y);
+        }
+    }
+    plotAngle(panels[2], -190.0f, 190.0f,
+              [](const Sample& s) { return radToDeg(wrapAngle(s.roll)); }, "#4a76c9");
+    plotAngle(panels[2], -190.0f, 190.0f,
+              [](const Sample& s) { return radToDeg(frameRollAngle(s.up, s.tan)); },
+              "#d95f3b");
+
+    // ---- failure bands ----------------------------------------------------
+    auto band = [&](float s0, float s1, const char* label) {
+        float x0 = X(s0), x1 = fmaxf(X(s1), x0 + 2.0f);
+        fprintf(f, "<rect x='%.1f' y='%d' width='%.1f' height='%d' fill='#ff3030' "
+                   "opacity='0.16'/>\n", x0, top, x1 - x0, panels[2].y0 + angH - top);
+        if (label)
+            fprintf(f, "<text x='%.1f' y='%d' fill='#ff7070'>%s</text>\n", x0,
+                    panels[2].y0 + angH + 28, label);
+    };
+    for (const Discontinuity& d : rep.discontinuities) band(d.s - 4.0f, d.s + 4.0f, d.quantity);
+    for (const OverlapHit& o : rep.overlaps) {
+        band(o.sA - 8.0f, o.sA + 8.0f, "overlap");
+        band(o.sB - 8.0f, o.sB + 8.0f, nullptr);
+    }
+
+    // ---- legend + summary -------------------------------------------------
+    {
+        int x = LM;
+        const int y = H - 8;
+        for (int t = 0; t < (int)Tag::COUNT; t++) {
+            Tag tg = (Tag)t;
+            if (tg == Tag::Brake || tg == Tag::Connector) continue;
+            fprintf(f, "<rect x='%d' y='%d' width='9' height='9' fill='%s'/>"
+                       "<text x='%d' y='%d' fill='#9aa4b2'>%s</text>\n",
+                    x, y - 9, tagColor(tg), x + 12, y, tagName(tg));
+            x += 13 + 8 * (int)strlen(tagName(tg)) + 14;
+        }
+    }
+    fprintf(f, "<text x='%d' y='%d' fill='#c8d1dc'>%.0f m | %zu segs | disc %zu | "
+               "elem-fail %zu | overlaps %zu | cut %.0f m | tunnel %.0f m</text>\n",
+            LM, top - 18, total, r.segs.size(), rep.discontinuities.size(),
+            rep.elementFailures.size(), rep.overlaps.size(), rep.cutLength,
+            rep.tunnelLength);
+    fprintf(f, "</svg>\n");
+    fclose(f);
+    return true;
+}
 
 ValidationReport validateRoute(const Route& r, const TerrainQuery* terrain) {
     ValidationReport rep;
@@ -612,6 +989,8 @@ ValidationReport validateRoute(const Route& r, const TerrainQuery* terrain) {
     }
 
     sweepSamples(r, rep);
+    sweepOverlaps(r, rep);
+    sweepFrameRoll(r, rep);
     if (terrain && terrain->height) sweepClearance(r, *terrain, rep);
 
     for (const ElemRun& run : elementRuns(r)) {

@@ -2,11 +2,10 @@
 
 Status: authoritative implementation brief. Do **not** add corrective passes to the V1
 generator. V2 is a **full, ground-up rewrite** — not a refactor, not a cleanup, not a port. V1
-stays in the tree only so the game keeps building/running while V2 is developed alongside it, and
-as a *conceptual* pointer to which element names/behaviors need to exist (a loop, a top hat, a
-helix) — it is **not** a proper reference for *how* to build any of them. V1 is the ten days of
-overlapping, conflicting patches that caused this rewrite; treat its actual code, formulas, and
-approach as untrustworthy by default, not as prior art to consult, port, or match output against.
+is a valid reference for *vision and design* — its element language, mechanisms, and intent are
+what the ride should be — but not for *code*: days of overlapping, conflicting patches inflated
+and destroyed its geometry, which is what caused this rewrite. Study V1's design intent freely;
+never port, copy, or match its patched code, formulas, or control flow verbatim.
 
 ## Start here
 
@@ -15,11 +14,10 @@ approach as untrustworthy by default, not as prior art to consult, port, or matc
    [`docs/REALISM_SCALE.md`](../docs/REALISM_SCALE.md) (element sizing/speed/pacing rules and the
    real-world research behind every number — read this before assigning any size, speed, or
    duration target to an element).
-2. Do not open `coaster_track.cpp` planning to patch it — and do not open it planning to *learn
-   from* it either. It's not a working reference to consult for "how does V1 do X" before writing
-   the V2 version; it's the untrusted output of ten days of overlapping patches, which is why V2
-   exists. Any fix for a symptom described below goes into the new `opengl/src/track/` modules,
-   built from this doc's primitives and real-world research, not from reading V1's code.
+2. `opengl/legacy/coaster_track.cpp` may be read for design intent (what an element is meant to
+   be, how the ride should feel, how V1's mechanisms worked) — but never patched, and never used
+   as a source of code or formulas to port. Any fix for a symptom described below goes into the
+   new `opengl/src/track/` modules, built from this doc's primitives and real-world research.
 3. First concrete step is Migration sequence item 1: create the `opengl/src/track/` module
    skeleton and a `TrackV2` adapter that matches the existing `Track` interface, with no V1
    behavior changes. Do not begin with turns/inversions/terrain — line, connector, top-hat,
@@ -188,16 +186,13 @@ face with zero curvature at both ends, and cannot create a horizontal shelf.
 - Generated wave turns. Until a dedicated primitive is implemented, map them to the single
   camelback primitive.
 
-The V1 code and its diagnostics are intentionally quarantined as baseline code, not as a reference
-implementation. **Do not copy or port any of it into V2** — not its state-machine fields, not its
-target-slope rules, not its comments, not its formulas, not its overall approach or control flow.
-Treating V1 as something to consult "just for how it handles X" is exactly how the old spaghetti
-pattern re-enters V2 — every V1 fix was itself a patch on top of prior patches; there is no clean
-layer in it worth extracting. If a V1 function's *name* or a comment nearby happens to describe a
-real requirement (e.g., "cliff dive must aim at a scanned ridge"), treat that as a hint to verify
-against `SHAPES.md`/`TERRAIN_CONTRACT.md`/`REALISM_SCALE.md` or fresh research — never as something
-to read the implementing code for. Git history is the archive for historical tuning notes; no
-previous handoff or TODO file, and no V1 source file, is normative for V2's design.
+The V1 code and its diagnostics are quarantined as unbuilt reference code. Its *design* —
+mechanism intent, element language, ride feel — is a legitimate reference (see
+`docs/V3_GEN_REWRITE_PROMPT.md`); its *code* is not: every V1 fix was a patch on top of prior
+patches, so **do not copy or port its state-machine fields, target-slope rules, formulas, or
+control flow into the new modules**. When a V1 mechanism describes a real requirement (e.g.,
+"cliff dive must aim at a scanned ridge"), verify it against
+`SHAPES.md`/`TERRAIN_CONTRACT.md`/`REALISM_SCALE.md` or fresh research before building it.
 
 ## Acceptance harness for V2
 
@@ -226,6 +221,37 @@ Run this before replacing the old generator:
 5. Add inversion primitives one at a time.
 6. Switch the OpenGL host to V2 after the fixed-seed visual and continuity suite passes.
 7. Port the renderer backends to the V2 adapter, then retire the V1 generator + dead diagnostics.
+
+### Generation-quality rewrite (2026-07-10, post-step-7 — user defect report)
+
+After the host switch the user reported: sizes ballooned past the 1.5x WR cap, inversions
+overlapping other track, no roll reset (stuck at a roll angle), support pillars too close,
+drop tapers starting far too late, and element names flickering off. The affected units were
+REWRITTEN (not patched) with V1's *vision* (its mechanisms' intent, per explicit user
+direction this one time — the code itself stays quarantined):
+
+- **Sizing**: WR anchors + the hard 1.0–1.5x band live in `track_types.h` (`v2::wr`); the
+  planner draws per-instance multipliers with mandatory tier variety; every descent path
+  (settle/condition/cliff fallback) is capped; the VALIDATOR enforces the band per element,
+  so planner drift can never ship again.
+- **Taper rule**: a drop's pull-out consumes ~1/3 of its height (top hat, drop, cliff dive —
+  validator-enforced ≥ 24%/20% of descent after the face); all transitions are g-budgeted at
+  the live speed (`vertRampLen`), killing the 10–30g fixed-length kinks.
+- **Roll reset**: `buildFrames` servos the frame back to upright on every designed-roll-zero
+  glue stretch (bounded twist rate) instead of one seam correction per lap; bookkeeping
+  joints are now explicit (`Sample::frameJoint`), not magnitude heuristics; the validator's
+  `stuckRoll` check gates it.
+- **Track-to-track clearance**: `sweepOverlaps` (spatial hash, 4.2 m envelope, arc-distance
+  aware) fails any route that passes near itself; the loop primitive now solves a real
+  lateral flank separation (eased yaw offset windows — the Stengel incline); the planner's
+  Immelmann→dive-loop pair takes an S-curve offset so the return pass sits beside the
+  outbound track.
+- **Supports** (host, `main.cpp`): one precomputed plan per built track — height-scaled XZ
+  bay spacing (12–30 m) between FEET, corridor check against ANY nearby track below the rail.
+- **Audit**: `--v2audit N` also writes per-seed SVG profile photos (`opengl/audit/seedN.svg`)
+  — elevation/pitch/roll panels with element labels, failure bands, and BOTH designed and
+  measured frame roll (the stuck-roll exposer). Debug: `V2_DEBUG_ATTEMPTS=1` (per-attempt
+  planner outcomes), `V2_DEBUG_LOOP=1` (loop separation solve).
 
 **Status: steps 1–7 DONE (2026-07-10).** The live OpenGL host runs only the V2 `TrackV2`
 generator. V1 (`coaster_track.cpp`, `coaster_elements_ext.cpp`, `audit_diagnostics.cpp`) was

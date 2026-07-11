@@ -70,41 +70,80 @@ Pose emitConnector(Route& r, const Pose& target, Tag tag, bool chain) {
 }
 
 // ---------------------------------------------------------------------------
-// Top hat — five C2-joined pitch-schedule segments. The crest transition is
-// COASTER_REWRITE.md's deterministic form theta(u) = thetaMax*(1 - 2*S5(u)):
-// single tangent-zero apex, zero curvature into both constant-grade faces,
-// no horizontal shelf possible.
+// Top hat — the Falcon's Flight-class giant hill (user redefinition,
+// 2026-07-10 second pass): CAMELBACK GEOMETRY at a 65-degree max pitch, one
+// smooth arch built from five C2-joined pitch segments with the real ride's
+// "thirds" silhouette solved INTERNALLY per side — one third of the height
+// curves out of the base, one third runs the straight thetaFace flank, one
+// third curves over the crest. The crest transition keeps the deterministic
+// form theta(u) = thetaFace*(1 - 2*S5(u)) (single apex, no shelf); its
+// length now comes from the thirds rule, so the crest radius is the huge,
+// visible sweep of the reference photo, never a tight flip.
 // ---------------------------------------------------------------------------
-Pose emitTopHat(Route& r, const TopHatSpec& t) {
+// Shared smooth-arch construction: one camelback-like hill of max pitch
+// thetaMax. Per side, ~40% of the height curves out of the base, ~40% sweeps
+// the crest, and only ~20% runs the straight flank — the silhouette is
+// dominated by the two giant sweeps (the Falcon's Flight reference photo),
+// not by tower faces. Used by the top hat and by camelbacks too tall for a
+// pure parabola within the pitch cap.
+static Pose emitArchThirds(Route& r, float riseH, float dropH, float thetaMax,
+                           float exitPitch, Tag tag) {
     const Pose e = r.endPose;
-    assert(fabsf(e.kPitch) < 1e-4f && fabsf(e.kYaw) < 1e-4f && "top hat needs a straight entry");
-    const float th = t.thetaFace;
-    const float Lc = t.crestLen;
-
-    Profile1D rampUp = rampProfile(e.pitch, th, t.rampIn);
+    const float th = thetaMax;
+    const float kSweep = 0.40f; // vertical share of base AND crest sweeps
+    auto solveThird = [&](float a, float b, float target) {
+        float L = fmaxf(target / (0.5f * sinf(th)), 12.0f);
+        for (int i = 0; i < 3; i++) {
+            Profile1D p = rampProfile(a, b, L);
+            float rise = fabsf(profileRise(p, 0.0f, L));
+            if (rise > 1e-3f) L = fmaxf(L * target / rise, 12.0f);
+        }
+        return L;
+    };
+    float rampInLen = solveThird(e.pitch, th, riseH * kSweep);
+    float rampOutLen = solveThird(-th, exitPitch, dropH * kSweep);
+    // Crest: theta(u) = th*(1-2*S5(u)) over Lc; its ascending half must lift
+    // kSweep of the rise (the descending half mirrors for the drop side).
+    float Lc = 2.0f * (riseH * kSweep) / (0.5f * sinf(th));
+    for (int i = 0; i < 3; i++) {
+        float LcC = Lc;
+        Profile1D crestP{
+            [th, LcC](float s) { return th * (1.0f - 2.0f * s5(s / LcC)); },
+            [th, LcC](float s) { return th * -2.0f * s5d(s / LcC) / LcC; }};
+        float half = profileRise(crestP, 0.0f, 0.5f * Lc);
+        if (half > 1e-3f) Lc = fmaxf(Lc * (riseH * kSweep) / half, 24.0f);
+    }
+    const float LcF = Lc;
+    Profile1D rampUp = rampProfile(e.pitch, th, rampInLen);
     Profile1D crest{
-        [th, Lc](float s) { return th * (1.0f - 2.0f * s5(s / Lc)); },
-        [th, Lc](float s) { return th * -2.0f * s5d(s / Lc) / Lc; }};
-    Profile1D rampOut = rampProfile(-th, t.exitPitch, t.rampOut);
+        [th, LcF](float s) { return th * (1.0f - 2.0f * s5(s / LcF)); },
+        [th, LcF](float s) { return th * -2.0f * s5d(s / LcF) / LcF; }};
+    Profile1D rampOut = rampProfile(-th, exitPitch, rampOutLen);
 
-    // Solve the straight-face lengths from the element's raw rise/drop.
-    float riseIn = profileRise(rampUp, 0.0f, t.rampIn);
-    float riseCrestUp = profileRise(crest, 0.0f, 0.5f * Lc);
-    float dropCrestDown = -profileRise(crest, 0.5f * Lc, Lc);
-    float dropOut = -profileRise(rampOut, 0.0f, t.rampOut);
-    float faceUp = (t.riseH - riseIn - riseCrestUp) / sinf(th);
-    float faceDown = (t.dropH - dropCrestDown - dropOut) / sinf(th);
+    // The straight faces carry whatever the transitions don't (~one third).
+    float riseIn = profileRise(rampUp, 0.0f, rampInLen);
+    float riseCrestUp = profileRise(crest, 0.0f, 0.5f * LcF);
+    float dropCrestDown = -profileRise(crest, 0.5f * LcF, LcF);
+    float dropOut = -profileRise(rampOut, 0.0f, rampOutLen);
+    float faceUp = (riseH - riseIn - riseCrestUp) / sinf(th);
+    float faceDown = (dropH - dropCrestDown - dropOut) / sinf(th);
     // "Sustained over multiple samples, not a one-point spike" (SHAPES.md):
     // an unbuildable spec is a planner bug, not something to truncate around.
-    assert(faceUp > 8.0f && faceDown > 8.0f && "top hat height too small for its transitions");
+    assert(faceUp > 8.0f && faceDown > 8.0f && "arch height too small for its transitions");
 
     Profile1D yawC = constantProfile(e.yaw);
     Profile1D rollC = constantProfile(e.roll);
-    emitSchedule(r, t.rampIn, rampUp, yawC, rollC, Tag::TopHat, false);
-    emitSchedule(r, faceUp, constantProfile(th), yawC, rollC, Tag::TopHat, false);
-    emitSchedule(r, Lc, crest, yawC, rollC, Tag::TopHat, false);
-    emitSchedule(r, faceDown, constantProfile(-th), yawC, rollC, Tag::TopHat, false);
-    return emitSchedule(r, t.rampOut, rampOut, yawC, rollC, Tag::TopHat, false);
+    emitSchedule(r, rampInLen, rampUp, yawC, rollC, tag, false);
+    emitSchedule(r, faceUp, constantProfile(th), yawC, rollC, tag, false);
+    emitSchedule(r, LcF, crest, yawC, rollC, tag, false);
+    emitSchedule(r, faceDown, constantProfile(-th), yawC, rollC, tag, false);
+    return emitSchedule(r, rampOutLen, rampOut, yawC, rollC, tag, false);
+}
+
+Pose emitTopHat(Route& r, const TopHatSpec& t) {
+    const Pose e = r.endPose;
+    assert(fabsf(e.kPitch) < 1e-4f && fabsf(e.kYaw) < 1e-4f && "top hat needs a straight entry");
+    return emitArchThirds(r, t.riseH, t.dropH, t.thetaFace, t.exitPitch, Tag::TopHat);
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +161,18 @@ Pose emitCamelback(Route& r, const CamelbackSpec& cb) {
     const float H = cb.height;
     const float Lb = cb.blendLen;
     const float thIn = e.pitch;
+
+    // Pitch cap (user round 2, Falcon's Flight reference): a camelback's
+    // flanks never exceed ~65 degrees. When the pure parabola can't deliver
+    // the height within the cap, the hill is the same arch-with-thirds shape
+    // as the top hat — straight capped flanks with giant base/crest sweeps.
+    const float kMaxPitch = 1.13446401f; // 65 deg
+    {
+        float xjCap = tanf(kMaxPitch) / (2.0f * c);
+        float capRise = 0.45f * sinf(kMaxPitch) * Lb + c * xjCap * xjCap;
+        if (capRise < H)
+            return emitArchThirds(r, H, H, kMaxPitch, -thIn, Tag::Camelback);
+    }
 
     auto blendInFor = [&](float xj) {
         float thj = atanf(2.0f * c * xj);
@@ -419,18 +470,103 @@ PitchTable solveTeardrop(float height, float sweep, float rampLen, float v0,
 
 } // namespace
 
+namespace {
+
+// Lateral-separation yaw schedule for the loop (the Stengel incline, resolved
+// in this module's pitch/yaw schedule language): a planar teardrop's entry and
+// exit flanks intersect at one point in the loop plane, so real loops mount
+// inclined and the tracks pass beside each other. Yaw eases to +dPsi across
+// the ascending flank and back to the entry heading across the descending
+// flank; entry and exit stay EXACTLY parallel (a net heading change would
+// make the exit flank re-cross the entry flank in plan — measured, not
+// hypothetical), and the drift accumulated between the two windows survives
+// as a parallel lateral displacement between the flanks. S5-eased and chain-
+// ruled through the teardrop's own kappa, so kYaw is analytic and C2.
+PitchTable loopYawTable(const PitchTable& t, float yaw0, float dPsi) {
+    PitchTable y;
+    y.th = std::make_shared<std::vector<float>>();
+    y.k = std::make_shared<std::vector<float>>();
+    y.h = t.h;
+    y.len = t.len;
+    const float a = 0.25f, b = 1.35f;          // ascending window in theta
+    const float a2 = 2.0f * kPi - b, b2 = 2.0f * kPi - a; // descending window
+    const float inv = 1.0f / (b - a);
+    for (size_t i = 0; i < t.th->size(); i++) {
+        float th = (*t.th)[i];
+        float kap = (*t.k)[i];
+        float w1 = fminf(fmaxf((th - a) * inv, 0.0f), 1.0f);
+        float w2 = fminf(fmaxf((th - a2) * inv, 0.0f), 1.0f);
+        y.th->push_back(yaw0 + dPsi * (s5(w1) - s5(w2)));
+        float dw1 = (th > a && th < b) ? s5d(w1) * inv : 0.0f;
+        float dw2 = (th > a2 && th < b2) ? s5d(w2) * inv : 0.0f;
+        y.k->push_back(dPsi * (dw1 - dw2) * kap);
+    }
+    return y;
+}
+
+// Smallest 3D distance between loop samples more than minArc apart along the
+// rail — the flank-crossing clearance the yaw schedule above exists to create.
+float minSelfDistance(const Route& probe, float minArc) {
+    float best = 1e9f;
+    size_t n = probe.samples.size();
+    int skip = (int)(minArc / probe.ds);
+    for (size_t i = 0; i + skip < n; i++)
+        for (size_t j = i + skip; j < n; j++) {
+            float d = Vector3Distance(probe.samples[i].pos, probe.samples[j].pos);
+            if (d < best) best = d;
+        }
+    return best;
+}
+
+} // namespace
+
 Pose emitLoop(Route& r, const LoopSpec& sp) {
     const Pose e = r.endPose;
     assert(fabsf(e.kPitch) < 1e-4f && fabsf(e.kYaw) < 1e-4f && "loop needs a straight entry");
     assert(fabsf(e.roll) < 1e-4f && fabsf(e.pitch) < 0.02f && "loop needs a level unbanked entry");
     float aC;
     PitchTable t = solveTeardrop(sp.height, 2.0f * kPi, sp.rampLen, sp.vEntry, e.pitch, &aC);
-    emitSchedule(r, t.len, t.profile(), constantProfile(e.yaw), constantProfile(0.0f),
+
+    // Solve the yaw-offset amplitude against the actually-emitted geometry:
+    // bisect dPsi until the flank crossing clears sp.lateralSep. Emission is
+    // pose-independent up to rigid motion, so the probe uses a level origin.
+    float dPsi = 0.0f;
+    if (sp.lateralSep > 0.0f) {
+        const float kDPsiMax = 0.90f; // keep the incline look plausible
+        float lo = 0.0f, hi = kDPsiMax;
+        auto sepFor = [&](float d) {
+            Route probe;
+            Pose o;
+            o.pitch = e.pitch;
+            startRoute(probe, o, r.ds);
+            PitchTable yt = loopYawTable(t, 0.0f, d);
+            emitSchedule(probe, t.len, t.profile(), yt.profile(),
+                         constantProfile(0.0f), Tag::Loop, false);
+            return minSelfDistance(probe, 3.0f * sp.rampLen);
+        };
+        if (sepFor(hi) <= sp.lateralSep) {
+            dPsi = hi; // cap reached: emit the widest separation available
+        } else {
+            for (int i = 0; i < 7; i++) {
+                float mid = 0.5f * (lo + hi);
+                (sepFor(mid) < sp.lateralSep ? lo : hi) = mid;
+            }
+            dPsi = hi;
+        }
+        if (getenv("V2_DEBUG_LOOP"))
+            fprintf(stderr, "[loop] h=%.0f v=%.0f dPsi=%.3f sep=%.2f\n",
+                    sp.height, sp.vEntry, dPsi, sepFor(dPsi));
+    }
+
+    PitchTable yt = loopYawTable(t, e.yaw, dPsi);
+    emitSchedule(r, t.len, t.profile(), yt.profile(), constantProfile(0.0f),
                  Tag::Loop, false);
     // A full loop sweeps pitch through 2*pi; hand the next primitive the
     // wrapped value so its profiles start from a conventional level pose.
-    // (Join validation compares angles modulo 2*pi.)
+    // (Join validation compares angles modulo 2*pi.) The wrap is bookkeeping
+    // only — flag it so buildFrames applies no physical twist across it.
     r.endPose.pitch -= 2.0f * kPi;
+    r.pendingFrameJoint = true;
     return r.endPose;
 }
 
@@ -454,6 +590,7 @@ Pose emitImmelmann(Route& r, const ImmelmannSpec& sp) {
     n.roll = n.roll - kPi;                // ~0
     n.kPitch = -n.kPitch;
     r.endPose = n;
+    r.pendingFrameJoint = true; // bookkeeping re-expression, zero physical twist
     return n;
 }
 
@@ -478,6 +615,7 @@ Pose emitDiveLoop(Route& r, const DiveLoopSpec& sp) {
     n.roll = n.roll - kPi;
     n.kPitch = -n.kPitch;
     r.endPose = n;
+    r.pendingFrameJoint = true; // bookkeeping re-expression, zero physical twist
     return n;
 }
 
@@ -542,6 +680,7 @@ Pose emitZeroGStall(Route& r, const ZeroGStallSpec& sp) {
     emitSchedule(r, sp.pullOutLen, rampProfile(thExit, 0.0f, sp.pullOutLen), yawC,
                  constantProfile(2.0f * kPi), Tag::ZeroGStall, false);
     r.endPose.roll -= 2.0f * kPi;
+    r.pendingFrameJoint = true; // full-rotation wrap, zero physical twist
     return r.endPose;
 }
 
@@ -641,6 +780,7 @@ Pose emitCorkscrew(Route& r, const CorkscrewSpec& sp) {
     // physically it is).
     r.endPose.roll -= rollTotal;
     r.segs.back().exit.roll -= rollTotal;
+    r.pendingFrameJoint = true; // roll wrap (holonomy completes the rotation)
 
     // Exit pitch ramp alpha -> level.
     Pose x = r.endPose;
@@ -756,9 +896,9 @@ Pose emitDrop(Route& r, const DropSpec& d) {
 
     Profile1D yawC = constantProfile(e.yaw);
     Profile1D rollC = constantProfile(e.roll);
-    emitSchedule(r, d.rampIn, in, yawC, rollC, Tag::Drop, false);
-    emitSchedule(r, face, constantProfile(-th), yawC, rollC, Tag::Drop, false);
-    return emitSchedule(r, d.rampOut, out, yawC, rollC, Tag::Drop, false);
+    emitSchedule(r, d.rampIn, in, yawC, rollC, d.tag, false);
+    emitSchedule(r, face, constantProfile(-th), yawC, rollC, d.tag, false);
+    return emitSchedule(r, d.rampOut, out, yawC, rollC, d.tag, false);
 }
 
 } // namespace v2

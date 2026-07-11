@@ -9,8 +9,10 @@ compiled** — the unity build (`opengl/src/main.cpp`) no longer `#include`s the
 - `coaster_elements_ext.cpp` — V1 element builders (was `#include`d by `coaster_track.cpp`).
 - `audit_diagnostics.cpp` — V1-only audit/census diagnostics.
 
-**Rules:** do not modify these, do not re-include them in the build, and do not consult them as a
-reference for V2 work — V2 was a ground-up rewrite precisely because V1 is untrustworthy spaghetti
-(see `opengl/COASTER_REWRITE.md`). Their only purpose here is historical: to compare against, or to
-recover a V1 behavior/name if ever genuinely needed. The live headless correctness check that
+**Rules:** do not modify these and do not re-include them in the build. They ARE a valid
+**design reference** — V1's vision and basic design (hill chains, organic roll easing, altitude
+bands, pacing rhythm) are the design language the generator should have. What failed was its
+execution: days of stacked patches catastrophically inflated and destroyed the geometry. So
+study V1's mechanisms and intent freely; never port its patched code, formulas, or control flow
+verbatim (see `docs/V3_GEN_REWRITE_PROMPT.md`). The live headless correctness check that
 replaced V1's `--census`/`--audit` modes is `./opengl/minecoaster --v2audit N`.

@@ -103,6 +103,58 @@ int main(int argc, char **argv) {
                     printf("[v2audit]   discontinuity s=%.1f %s jump=%g\n", d.s, d.quantity, d.jump);
                 for (const std::string &e : rep.elementFailures)
                     printf("[v2audit]   element: %s\n", e.c_str());
+                for (const v2::OverlapHit &o : rep.overlaps)
+                    printf("[v2audit]   overlap s=%.0f vs s=%.0f dist=%.1f m\n", o.sA, o.sB, o.dist);
+            }
+            // Per-element metrics (user round 2: "track it to see how much
+            // needs to be done") — height, minimum vertical curvature radius
+            // (the smoothing radius), and pull-out share of the descent.
+            {
+                size_t k = 0;
+                while (k < r.segs.size()) {
+                    size_t k1 = k;
+                    v2::Tag tg2 = r.segs[k].tag;
+                    while (k1 + 1 < r.segs.size() && r.segs[k1 + 1].tag == tg2) k1++;
+                    bool named = tg2 != v2::Tag::Line && tg2 != v2::Tag::Connector &&
+                                 tg2 != v2::Tag::Station && tg2 != v2::Tag::Brake &&
+                                 tg2 != v2::Tag::Launch;
+                    if (named) {
+                        int i0 = (int)ceilf(r.segs[k].s0 / r.ds - 1e-4f);
+                        int i1 = (int)floorf(r.segs[k1].s1 / r.ds + 1e-4f);
+                        if (i1 >= (int)r.samples.size()) i1 = (int)r.samples.size() - 1;
+                        float topY = -1e9f, minPitch = 10.0f, maxK = 0.0f;
+                        for (int q = i0; q <= i1; q++) {
+                            topY = fmaxf(topY, r.samples[q].pos.y);
+                            minPitch = fminf(minPitch, r.samples[q].pitch);
+                            maxK = fmaxf(maxK, fabsf(r.samples[q].kPitch));
+                        }
+                        int lastFace = -1;
+                        for (int q = i0; q <= i1; q++)
+                            if (r.samples[q].pitch < minPitch + 0.0175f) lastFace = q;
+                        float exitY = r.samples[i1].pos.y;
+                        float entryY = r.samples[i0].pos.y;
+                        float desc = topY - exitY;
+                        float pull = (lastFace >= 0 && desc > 20.0f)
+                                         ? 100.0f * (r.samples[lastFace].pos.y - exitY) / desc
+                                         : -1.0f;
+                        printf("[v2audit]   %-10s rise=%.0f m  drop=%.0f m  minR=%.0f m  pullout=%.0f%%\n",
+                               v2::tagName(tg2), topY - entryY, desc,
+                               maxK > 1e-5f ? 1.0f / maxK : 9999.0f, pull);
+                    }
+                    k = k1 + 1;
+                }
+            }
+            // Per-seed SVG profile "photo" (elevation/pitch/roll incl. the
+            // MEASURED frame roll) — the visual half of the audit.
+            {
+                char svgPath[256];
+                snprintf(svgPath, sizeof svgPath, "opengl/audit/seed%d.svg", sd);
+                bool wrote = v2::writeRouteSVG(r, &terrain, rep, svgPath);
+                if (!wrote) { // cwd == opengl/
+                    snprintf(svgPath, sizeof svgPath, "audit/seed%d.svg", sd);
+                    wrote = v2::writeRouteSVG(r, &terrain, rep, svgPath);
+                }
+                if (wrote) printf("[v2audit]   profile -> %s\n", svgPath);
             }
         }
         printf("[v2audit] fleet: %d/%d clean, cut %.0f m + tunnel %.0f m + unsupported %.0f m "
@@ -1223,10 +1275,14 @@ int main(int argc, char **argv) {
         double dwT1 = diagWorld ? GetTime() : 0.0;
         if (diagWorld) dwTerrainAcc += (dwT1 - dwT0) * 1000.0;
 
-        int k0 = (int)(u - 196.0f), k1 = (int)(u + 896.0f);   // metres now (~14x the V1 u-window)
-        // Closed-route seam wrap: the draw window straddles the seam near the station,
-        // so index cp[]/kind[]/up[]/arc[] through wrapIdx (float accessors already wrap).
+        // Track render range (user round 2: "the coaster track does not
+        // de-render unless the entire chunk does"): iterate the WHOLE route
+        // and let the per-item distance/fog culls decide — the old ±u sample
+        // window popped distant track out while its terrain chunk was still
+        // visible. trackFog (fogEnd*1.9) is beyond the terrain cull radius,
+        // so track now outlives every chunk it crosses.
         const int NSMP = (int)trk.cp.size();
+        int k0 = 0, k1 = NSMP - 1;
         const bool wrapU = trk.route.closed && NSMP > 1;
         auto wrapIdx = [&](int i) -> int {
             if (wrapU) { i %= NSMP; if (i < 0) i += NSMP; return i; }
@@ -1287,56 +1343,100 @@ int main(int argc, char **argv) {
             drawCubeTex(T_IRON, Vector3{ 0, 0, 0 }, 0.56f, 0.56f, 1.0f, sc);
             popFrame();
         };
+        // ---- support plan: computed ONCE per built track, not per frame ----
+        // (rewritten 2026-07-10, user: "support pillars are too close"). The
+        // old rule placed a V-bent every 9 ARC-meters, so tight curves
+        // (helix, loop flanks, crests) bunched pillars in space; and its
+        // anti-clip scan only checked the SAME element's track. Now:
+        //  - spacing is a real XZ distance between consecutive FEET, scaled
+        //    with rail height (tall track = wider bays, 12..30 m), matching
+        //    COASTER_REWRITE.md's "separate support-spacing pass (18-30 m)";
+        //  - a strut is skipped when its vertical corridor passes within 3 m
+        //    of ANY other track sample below the rail — cross-element clips
+        //    (a pillar through a camelback under a turn) included.
+        static std::vector<unsigned char> supPlan;
+        static size_t supPlanN = 0;
+        static float supPlanX0 = 1e30f;
+        if (supPlanN != trk.cp.size() ||
+            (NSMP > 0 && supPlanX0 != trk.cp[0].x)) {
+            supPlanN = trk.cp.size();
+            supPlanX0 = NSMP > 0 ? trk.cp[0].x : 1e30f;
+            supPlan.assign(supPlanN, 0);
+            // Spatial hash of all samples for the corridor check.
+            const float cell = 4.0f;
+            std::unordered_map<uint64_t, std::vector<int>> grid;
+            auto keyOf = [&](float x, float z) {
+                int gx = (int)floorf(x / cell), gz = (int)floorf(z / cell);
+                return ((uint64_t)(uint32_t)gx << 32) | (uint32_t)gz;
+            };
+            grid.reserve(supPlanN);
+            for (int j = 0; j < (int)supPlanN; j++)
+                grid[keyOf(trk.cp[j].x, trk.cp[j].z)].push_back(j);
+            float lastFx = 1e30f, lastFz = 1e30f;
+            for (int i2 = 0; i2 < (int)supPlanN; i2++) {
+                Vector3 p2 = trk.cp[i2];
+                unsigned char tg2 = trk.kind[i2];
+                bool tightShape = (tg2 == M_LOOP || tg2 == M_ROLL || tg2 == M_IMMEL ||
+                                   tg2 == M_STALL || tg2 == M_DIVELOOP);
+                if (tightShape && trk.up[i2].y < 0.35f) continue;
+                float g2 = groundTopAt(p2.x, p2.z);
+                float hgt2 = (p2.y - 0.5f) - g2;
+                if (hgt2 < 0.5f || p2.y - g2 < 1.5f) continue;
+                // Height-scaled bay spacing between consecutive FEET (XZ),
+                // densified through curves: turning track loads its supports
+                // laterally, so real bents bunch up in curves and stretch
+                // out on straights. Local plan curvature from tangents +-6 m.
+                float spacing = Clamp(hgt2 * 0.34f, 12.0f, 30.0f);
+                {
+                    int ia = i2 >= 6 ? i2 - 6 : 0;
+                    int ib = i2 + 6 < (int)supPlanN ? i2 + 6 : (int)supPlanN - 1;
+                    Vector3 ta = trk.tangent((float)ia), tb = trk.tangent((float)ib);
+                    float ha = atan2f(ta.x, ta.z), hb = atan2f(tb.x, tb.z);
+                    float dh = fabsf(hb - ha);
+                    if (dh > PI) dh = 2.0f * PI - dh;
+                    float curv = dh / (float)(ib - ia > 0 ? ib - ia : 1);
+                    spacing *= Clamp(1.0f / (1.0f + 35.0f * curv), 0.5f, 1.0f);
+                }
+                float fdx = p2.x - lastFx, fdz = p2.z - lastFz;
+                if (fdx * fdx + fdz * fdz < spacing * spacing) continue;
+                // Corridor check vs ANY nearby track below this rail point.
+                bool blocked = false;
+                int gx = (int)floorf(p2.x / cell), gz = (int)floorf(p2.z / cell);
+                for (int dxc = -1; dxc <= 1 && !blocked; dxc++)
+                    for (int dzc = -1; dzc <= 1 && !blocked; dzc++) {
+                        uint64_t k = ((uint64_t)(uint32_t)(gx + dxc) << 32) |
+                                     (uint32_t)(gz + dzc);
+                        auto it = grid.find(k);
+                        if (it == grid.end()) continue;
+                        for (int j : it->second) {
+                            if (abs(j - i2) < 8) continue; // own stretch
+                            Vector3 q = trk.cp[j];
+                            float qdx = q.x - p2.x, qdz = q.z - p2.z;
+                            if (qdx * qdx + qdz * qdz < 9.0f && q.y > g2 + 1.0f &&
+                                q.y < p2.y - 1.0f) { blocked = true; break; }
+                        }
+                    }
+                if (blocked) continue;
+                supPlan[i2] = 1;
+                lastFx = p2.x;
+                lastFz = p2.z;
+            }
+        }
         for (int iv = k0; iv <= k1; iv++) {
             int i = wrapIdx(iv), prev = wrapIdx(iv - 1);
             Vector3 p = trk.cp[i];
             unsigned char tg = trk.kind[i];
-            bool tightShape = (tg == M_LOOP || tg == M_ROLL || tg == M_IMMEL ||
-                                tg == M_STALL || tg == M_DIVELOOP || tg == M_COBRA ||
-                                tg == M_HEARTLINE || tg == M_PRETZEL);
-            // BANANA and WINGOVER are deliberately NOT in this exclusion list: unlike the tight,
-            // self-contained loop-shaped elements below (whose top/bottom sit at nearly the same
-            // X/Z), both travel forward continuously across their whole length while banking/
-            // inverting, so the inverted midpoint is tens of meters from every other point of the
-            // same element -- a straight-down support there can't clip through its own track, and
-            // excluding them left a large unsupported gap during the tallest, most inverted part.
-            if (tightShape && trk.up[i].y < 0.35f) continue;
             float ddx = p.x - P.x, ddz = p.z - P.z;
             float dist = sqrtf(ddx * ddx + ddz * ddz);
             float fog = Clamp((dist - trackFog * 0.70f) / (trackFog * 0.27f), 0.0f, 1.0f);
             if (fog > 0.97f) continue;
-            float g = groundTopAt(p.x, p.z);
-            if (p.y - g < 1.5f) continue;
-            // The up.y check above only excludes the bottom of THIS point's own rotation phase --
-            // it doesn't stop a strut placed during the "upright" phase (up.y>=0.35) from clipping
-            // through the SAME loop/roll/etc.'s own track at a nearby point along its length that
-            // happens to pass through where the strut physically runs (straight down from p to the
-            // ground). Scan a local window (one full rotation of these elements is well under ~300
-            // dense samples at 1 m ds) and skip the support if another point of the same element
-            // sits close in XZ while between the ground and this point's height.
-            if (tightShape) {
-                bool blocked = false;
-                for (int jv = iv - 300; jv <= iv + 300; jv++) {
-                    int j = wrapIdx(jv);
-                    if (j == i || trk.kind[j] != tg) continue;
-                    Vector3 q = trk.cp[j];
-                    float qdx = q.x - p.x, qdz = q.z - p.z;
-                    if (qdx*qdx + qdz*qdz < 9.0f && q.y > g + 1.0f && q.y < p.y - 1.0f) { blocked = true; break; }
-                }
-                if (blocked) continue;
-            }
             Vector3 t = trk.tangent((float)i);   // analytic, seam-safe (was cp[i+1]-cp[i-1])
             Vector3 lat = Vector3Normalize(Vector3CrossProduct(Vector3{ t.x, 0, t.z }, Vector3{ 0, 1, 0 }));
             Color sc = mixc(Color{ 118, 122, 130, 255 }, FOG, fog);
 
             float topY = p.y - 0.5f;
             float gC   = groundTopAt(p.x, p.z);
-            float hgt  = topY - gC;
-            const float SUP_SP = 9.0f;
-            // Support cadence keys off arc[] METRES (correct as-is): one V-bent every SUP_SP.
-            bool placeHere =
-                floorf(trk.arc[i] / SUP_SP) != floorf(trk.arc[prev] / SUP_SP);
-            if (hgt > 0.5f && placeHere)
+            if (supPlan[(size_t)i])
                 drawVBent(p, topY, gC, lat, t, trk.up[i], sc);
 
             // LSM grate: gate to one SEG_LEN-long tile per SEG_LEN of arc so the 1 m dense
@@ -1367,7 +1467,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        int kS = (int)(u - 196.0f), kE = (int)(u + 644.0f);   // metres now (~14x); float accessors wrap the seam
+        int kS = 0, kE = NSMP - 1;   // full route; per-segment distance cull below decides
         float spineCull2 = (trackFog + SEG_LEN) * (trackFog + SEG_LEN);
         for (int k = kS; k <= kE; k++) {
 
@@ -2085,13 +2185,32 @@ int main(int argc, char **argv) {
         }
 
         if (dispatched && !paused) {
-            // Shared honest-name diagnosis (rideElemName in coaster_track.cpp): tag + actual local
+            // Shared honest-name diagnosis (rideElemName in presentation.cpp): tag + actual local
             // geometry (pitch, height over ground/water), so SPLASHDOWN only shows when genuinely
             // skimming water, a valley-guarded high DIP relabels by pitch, a DROP forced up a
             // rising hillside reads CLIMB, etc. The Vulkan HUD calls the SAME function.
+            //
+            // Banner HYSTERESIS (user 2026-07-10: "element names forget to be shown"): the
+            // planner brackets named elements with short unnamed glue (connectors, conditioning
+            // lines), so the raw per-sample name flickers off right at element entries/exits.
+            // Hold the last name ~1.2 s through unnamed gaps; a NEW name replaces it instantly.
             bool special = false;
             const char *en = rideElemName(trk.tagAt(u), trk.tangent(u).y,
                                           P.y, gY, special);
+            static const char *bannerName = nullptr;
+            static bool bannerSpecial = false;
+            static double bannerUntil = 0.0;
+            double nowT = GetTime();
+            if (en) {
+                bannerName = en;
+                bannerSpecial = special;
+                bannerUntil = nowT + 1.2;
+            } else if (bannerName && nowT < bannerUntil) {
+                en = bannerName;
+                special = bannerSpecial;
+            } else {
+                bannerName = nullptr;
+            }
             if (en) {
                 int fs = 18;
                 int tw = MeasureText(en, fs);

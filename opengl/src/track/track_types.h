@@ -44,6 +44,31 @@ enum class Tag : uint8_t {
 const char* tagName(Tag t);
 
 // ---------------------------------------------------------------------------
+// World-record anchors and the built-size band (REALISM_SCALE.md "Locked
+// element targets", REVISED by the user 2026-07-10): every element's built
+// primary dimension must land in [1.0, 1.5] x its real WR anchor, with 1.5x a
+// HARD CAP (a build past it is a validation failure, not a tolerance case),
+// and instance sizes must show real variety across the band. The table lives
+// here so the planner (sizing), validator (enforcement) and tests (gating)
+// share one source of truth — the V2 defect this fixes was planner-only
+// constants with no downstream check.
+// ---------------------------------------------------------------------------
+namespace wr {
+constexpr float kMulMin = 1.0f;       // flagship floor (smaller repeat instances
+                                      // may scale below — see kHillFloor)
+constexpr float kMulMax = 1.5f;       // HARD CAP on built size vs anchor
+constexpr float kTopHatRise = 163.0f; // Falcon's Flight structure height
+constexpr float kCamelback = 165.0f;  // Falcon's Flight airtime hill
+constexpr float kLoop = 54.6f;        // Tormenta Rampaging Run vertical loop
+constexpr float kImmelmann = 66.4f;   // Tormenta Rampaging Run Immelmann
+constexpr float kDrop = 195.0f;       // Falcon's Flight total elevation drop
+constexpr float kHillFloor = 25.0f;   // El Toro-class small hill (chain floor)
+// Real anchor entry speeds (m/s) for k_v ~ k_r scaling: Falcon's ~250 km/h.
+constexpr float kVTopHat = 69.4f;
+constexpr float kVCamelback = 69.4f;
+} // namespace wr
+
+// ---------------------------------------------------------------------------
 // Pose — the full boundary state of a beat/primitive. Continuity at a join is
 // defined as: position, pitch, yaw, roll all equal AND both curvature
 // components equal (C2, per SHAPES.md "Shared rules").
@@ -79,6 +104,13 @@ struct Sample {
     float   kYaw   = 0.0f;  // dyaw/ds at this sample
     Tag     tag   = Tag::Line;
     bool    chain = false;  // powered (launch/lift) flag for the car
+    // Explicit frame joint: TRUE on the first sample after a bookkeeping
+    // renormalization (inversion-exit pose re-expression, full-rotation roll
+    // wrap). buildFrames applies ZERO physical twist across a flagged sample.
+    // Set by the emitters via Route::pendingFrameJoint — never inferred from
+    // angle-step magnitudes (the old |dRoll|>1 heuristic was a silent-corruption
+    // trap once a primitive's real per-sample delta approached it).
+    bool    frameJoint = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -106,6 +138,10 @@ struct Route {
     // the grid stays globally uniform across primitive joins.
     float endS = 0.0f;
     Pose  endPose;
+    // Set by an emitter right after it renormalizes endPose bookkeeping
+    // (pitch/roll re-expression with an identical physical frame); consumed by
+    // the next emitted sample, which is marked Sample::frameJoint.
+    bool  pendingFrameJoint = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -146,9 +182,18 @@ struct ClearanceSpan {
     float maxDepth = 0.0f;    // deepest encroachment (Cut/Tunnel), meters
 };
 
+// Track-to-track proximity violation: two route samples far apart along the
+// rail but closer in space than the train envelope allows.
+struct OverlapHit {
+    float sA = 0.0f, sB = 0.0f; // arc positions of the two samples
+    float dist = 0.0f;          // 3D distance between them, meters
+    Tag tagA = Tag::Line, tagB = Tag::Line;
+};
+
 struct ValidationReport {
     std::vector<Discontinuity> discontinuities;
     std::vector<ClearanceSpan> clearance;
+    std::vector<OverlapHit> overlaps; // track passing through/too near itself
     // Element acceptance failures, human-readable ("TOPHAT@s=412: two apexes").
     std::vector<std::string> elementFailures;
     float cutLength = 0.0f;     // total cut length, meters — report explicitly:
@@ -156,7 +201,8 @@ struct ValidationReport {
     float unsupportedLength = 0.0f; // rail higher above ground than supports reach
     bool  terrainMutated = false; // must stay false
     bool  pass() const {
-        return discontinuities.empty() && elementFailures.empty() && !terrainMutated;
+        return discontinuities.empty() && elementFailures.empty() &&
+               overlaps.empty() && !terrainMutated;
     }
 };
 
@@ -178,22 +224,19 @@ Pose emitLine(Route& r, float lengthM, Tag tag, bool chain);
 // tangent and curvature at both ends (C2), roll blended through S5.
 Pose emitConnector(Route& r, const Pose& target, Tag tag, bool chain);
 
-// Launched top hat (SHAPES.md "Top hat", COASTER_REWRITE.md crest law):
-// S5 pull-up to +thetaFace, sustained face, ONE crest transition
-// theta(u) = thetaFace*(1 - 2*S5(u)), sustained -thetaFace face, pull-out.
-// riseH/dropH are the element's own raw dimensions (entry->crest and
-// crest->exit heights, meters) — never terrain-relative. Face lengths are
-// solved from them; too-small heights for the given transitions are a
-// planner error (asserted).
-// Defaults marked LOCKED come from REALISM_SCALE.md "Locked element targets"
-// (user decisions 2026-07-10); the rest remain provisional harness values.
+// Launched top hat — REDEFINED per user 2026-07-10 (second pass): this is
+// the FALCON'S FLIGHT-class giant hill, with CAMELBACK GEOMETRY — one smooth
+// arch, max pitch capped at thetaFace (65 deg), and the "thirds" proportions
+// visible in the real ride's silhouette: on each side, roughly one third of
+// the height curves out of the base, one third runs the straight 65-degree
+// face, and one third curves over the crest. It is NOT a Kingda-Ka-style
+// vertical tower with a tight crest. The transition lengths are solved
+// INTERNALLY from riseH/dropH to hit those thirds — geometry is intrinsic to
+// the element, not a per-call tuning surface.
 struct TopHatSpec {
-    float riseH = 230.0f;   // LOCKED 2026-07-10: 1.4x Falcon's Flight 163 m
+    float riseH = 230.0f;   // instance size: [1.0,1.5] x Falcon's 163 m (wr::)
     float dropH = 225.0f;
-    float thetaFace = 1.13446401f; // 65 deg
-    float rampIn = 100.0f;         // entry transition arc length
-    float crestLen = 60.0f;        // crest transition arc length
-    float rampOut = 100.0f;        // pull-out arc length
+    float thetaFace = 1.13446401f; // 65 deg max pitch (camelback-like cap)
     float exitPitch = 0.0f;
 };
 Pose emitTopHat(Route& r, const TopHatSpec& spec);
@@ -222,6 +265,11 @@ struct DropSpec {
     float rampIn = 30.0f;
     float rampOut = 40.0f;
     float exitPitch = 0.0f;
+    // Real drop elements carry Tag::Drop; the planner emits its shallow
+    // conditioning/settling descents (thetaDrop under ~30 deg) as Tag::Line —
+    // they are glue, not a named drop, and the drop acceptance checks
+    // (sustained steep face) rightly do not apply to them.
+    Tag tag = Tag::Drop;
 };
 Pose emitDrop(Route& r, const DropSpec& spec);
 
@@ -283,7 +331,7 @@ Pose emitHelix(Route& r, const HelixSpec& spec);
 // geometry, and a ride with no qualifying site gets NO cliff dive.
 struct CliffDiveSpec {
     float climbHeight = 70.0f;    // extra track height gained by the climb (m)
-    float climbAngle = 0.43633231f; // 25 deg
+    float climbAngle = 0.32f;     // ~18 deg — LSM climbs stay gently inclined
     float climbRamp = 40.0f;
     float edgeAngle = 1.30899694f; // 75 deg summit turn (signed)
     float edgeRadius = 60.0f;
@@ -293,8 +341,8 @@ struct CliffDiveSpec {
                                    // Flight (REALISM_SCALE.md flags the gap)
     float diveHeight = 220.0f;     // raw descent, edge to valley pull-out (m)
     float thetaDive = 1.51843645f; // 87 deg near-vertical signature face
-    float diveRampIn = 30.0f;
-    float diveRampOut = 55.0f;
+    float diveRampIn = 75.0f;      // push-over sweeps ~16% of the dive
+    float diveRampOut = 145.0f;    // pull-out tapers over ~30% of the dive
 };
 Pose emitCliffDive(Route& r, const CliffDiveSpec& spec);
 
@@ -306,9 +354,15 @@ Pose emitCliffDive(Route& r, const CliffDiveSpec& spec);
 // (opened 2026-07-09) -> game band 55-82 m; the default below is PROVISIONAL
 // pending the ask-before-locking-in pass.
 struct LoopSpec {
-    float height = 78.0f;   // LOCKED 2026-07-10: 1.43x Tormenta 54.6 m
+    float height = 78.0f;   // instance size: [1.0,1.5] x Tormenta 54.6 m
     float vEntry = 44.0f;   // design entry speed (m/s) — shapes the teardrop
     float rampLen = 25.0f;  // entry/exit clothoid length
+    // Lateral self-separation at the flank crossing (the Stengel incline,
+    // resolved as a small eased yaw offset through the loop's middle): a
+    // planar teardrop's entry/exit flanks intersect in the loop plane; this
+    // pushes the exit flank sideways so the tracks pass beside each other.
+    // Solved numerically in emitLoop against the emitted geometry.
+    float lateralSep = 6.0f;
 };
 Pose emitLoop(Route& r, const LoopSpec& spec);
 
@@ -399,6 +453,15 @@ void buildFrames(Route& r);
 // track_validate.cpp — continuity sweep at 0.25–0.5 m plus per-element checks.
 ValidationReport validateRoute(const Route& r, const TerrainQuery* terrain);
 
+// Diagnostics "photo": per-route SVG profile — stacked elevation (terrain fill
+// + track colored by element tag), pitch, designed roll AND measured frame
+// roll (the transported up's angle from upright — this is what exposes
+// stuck-roll defects the designed-roll plot can't see), with element-name
+// labels and red bands over failed spans. Pure file output, no renderer.
+// Returns false if the file could not be written.
+bool writeRouteSVG(const Route& r, const TerrainQuery* terrain,
+                   const ValidationReport& rep, const char* path);
+
 // track_terrain.cpp — escarpment scan + the planner's clearance policy.
 std::vector<EscarpmentSite> scanEscarpments(const TerrainQuery& terrain,
                                             Vector3 center, float radiusM);
@@ -408,8 +471,12 @@ std::vector<EscarpmentSite> scanEscarpments(const TerrainQuery& terrain,
 // note: near-zero cut usage across seeds is a red flag, not a success).
 enum class ClearanceDecision { Accept, AcceptWithCuts, Reject };
 struct ClearanceLimits {
-    float maxCutLen = 260.0f;     // longest contiguous cut/tunnel span (m), PROVISIONAL
-    float maxTunnelDepth = 45.0f; // deepest bore (m), PROVISIONAL
+    // PROVISIONAL, recalibrated 2026-07-10 to this world's actual relief: a
+    // giga-scale ride crossing a mountainous map legitimately bores a few
+    // hundred meters at 50-70 m depth; the failure mode the contract guards
+    // against is the KILOMETER-scale bore, not every honest ridge crossing.
+    float maxCutLen = 420.0f;     // longest contiguous cut/tunnel span (m)
+    float maxTunnelDepth = 70.0f; // deepest bore (m)
 };
 ClearanceDecision clearanceDecision(const ValidationReport& rep,
                                     const ClearanceLimits& lim);

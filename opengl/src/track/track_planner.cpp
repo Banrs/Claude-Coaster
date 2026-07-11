@@ -4,6 +4,8 @@
 // primitives beat by beat. buildRide is the real generator; the buildStepN
 // routes are the per-step acceptance-harness fixtures.
 #include <cassert>
+#include <cstdio>
+#include <cstdlib>
 
 #include "track_math.h"
 
@@ -49,49 +51,120 @@ float v2Drag(float v2, float meters) {
     return fmaxf(u, 0.0f);
 }
 
-// Level the route out (elements and lines need a level, straight entry).
-// Safe to call anywhere; a no-op when already level.
-void levelOut(Route& r) {
-    if (fabsf(r.endPose.pitch) > 0.012f)
-        emitGradeChange(r, 0.0f, fmaxf(18.0f, fabsf(r.endPose.pitch) * 70.0f), Tag::Line);
+// Vertical-transition length budget: an S5 pitch ramp of dTheta over L peaks
+// at curvature 1.875*|dTheta|/L; keeping |v^2 * kappa| within ~5g bounds the
+// felt g at roughly [-4, +6] — the user's accepted "higher than real but
+// physical" band. Every planner-emitted pitch transition must obey this at
+// the LIVE speed; fixed-length ramps were the source of the 10-30g kinks
+// that made sections read as nonsense.
+float vertRampLen(float dTheta, float v2, float minLen) {
+    return fmaxf(minLen, 1.875f * fabsf(dTheta) * v2 / (5.0f * kG));
 }
 
-// Planner-side drop with ramps PROPORTIONAL to the height, so any terrain- or
-// speed-derived dy keeps a real sustained face (fixed ramps eat small heights
-// whole and trip the primitive's solvability assert). LEVELS the entry first:
-// emitDrop starts its push-over from the current pitch, so a positive (still
-// climbing) entry would make the drop RISE at its mouth — exactly the
-// "height rises inside drop" element failure. A drop is a pure vertical
-// element; the terrain-following grade lives in emitGroundLeg, not here.
-void plannerDrop(Route& r, float dy) {
-    levelOut(r);
+// Level the route out (elements and lines need a level, straight entry).
+// Safe to call anywhere; a no-op when already level.
+void levelOut(Route& r, float v2) {
+    float p = r.endPose.pitch;
+    if (fabsf(p) > 0.012f)
+        emitGradeChange(r, 0.0f, vertRampLen(p, v2, fmaxf(18.0f, fabsf(p) * 70.0f)),
+                        Tag::Line);
+}
+
+// Instance-size multiplier draw (REALISM_SCALE.md, revised 2026-07-10):
+// sizes must SPREAD across the 1.0–1.5x WR band — tiers, not a fleet of
+// near-cap elements. Signature draws lean grand but still vary.
+float drawMul(Rng& rng, bool signature) {
+    float u = rng.uni();
+    if (signature)
+        return (u < 0.55f) ? rng.range(1.32f, wr::kMulMax)
+                           : rng.range(1.05f, 1.32f);
+    if (u < 0.30f) return rng.range(1.28f, wr::kMulMax);
+    if (u < 0.70f) return rng.range(1.12f, 1.28f);
+    return rng.range(wr::kMulMin, 1.12f);
+}
+
+// Solve an S5 exit-ramp length so the ramp's own vertical share equals
+// `targetRise` (the pull-out fraction rule below). profileRise is exact for
+// the actual ramp; two fixed-point passes land within ~1%.
+float solveRampForRise(float theta0, float theta1, float targetRise, float guess) {
+    float L = fmaxf(guess, 8.0f);
+    for (int i = 0; i < 3; i++) {
+        Profile1D p = rampProfile(theta0, theta1, L);
+        float rise = fabsf(profileRise(p, 0.0f, L));
+        if (rise < 1e-3f) break;
+        L *= targetRise / rise;
+        L = fmaxf(L, 8.0f);
+    }
+    return L;
+}
+
+// Planner-side drop. LEVELS the entry first: emitDrop starts its push-over
+// from the current pitch, so a positive (still climbing) entry would make the
+// drop RISE at its mouth. A drop is a pure vertical element; the terrain-
+// following grade lives in emitGroundLeg, not here.
+//
+// PULL-OUT RULE (user 2026-07-10, Falcon's Flight camelback reference; V1
+// carried the same rule): the taper from the sustained face down to flat is
+// NOT a fixed-length tail — it consumes ~1/3 of the drop's height, starting
+// well up the descent, whatever the drop's size. The old fixed ~40 m rampOut
+// became a vanishing fraction of big drops — pull-outs visibly started far
+// too late. The push-over similarly takes ~15% of the height.
+void plannerDrop(Route& r, float dy, float v2) {
+    // Level EXACTLY: emitDrop's push-over starts from the entry pitch, and
+    // even a +0.7 deg residual makes the mouth of a long S5 ramp rise for
+    // meters ("height rises inside drop"). A drop's entry is level, period.
+    if (fabsf(r.endPose.pitch) > 1e-4f)
+        emitGradeChange(r, 0.0f,
+                        vertRampLen(r.endPose.pitch, v2,
+                                    fmaxf(8.0f, fabsf(r.endPose.pitch) * 70.0f)),
+                        Tag::Line);
+    assert(dy <= wr::kMulMax * wr::kDrop * 1.02f &&
+           "drop exceeds the 1.5x WR cap: split or replan upstream");
     DropSpec d;
     d.height = dy;
     d.thetaDrop = 0.35f + fminf(0.87f, dy / 90.0f);
-    // Ramps scale with the face angle as well as the height: a steep
-    // push-over over a short ramp is a ~3 m radius (validator-visible kink
-    // territory), not a coaster transition.
-    d.rampIn = fminf(42.0f, fmaxf(fmaxf(10.0f, dy * 0.35f), d.thetaDrop * 24.0f));
-    d.rampOut = d.rampIn + 6.0f;
-    // Very small drops can't afford the full angle; shrink it.
-    while (d.thetaDrop > 0.3f) {
+    float v2Bottom = v2 + 2.0f * kG * dy;
+    // Very small drops can't afford the full angle; shrink until the face has
+    // real length between the proportional, g-budgeted ramps.
+    while (true) {
+        // Intamin-style drawn-out transitions (user round 2: "smoothing radii
+        // many times too small"): push-over curves out over ~22% of the
+        // height, pull-out over ~35% — both VISIBLE sweeps, g-floored too.
+        d.rampIn = fmaxf(solveRampForRise(0.0f, -d.thetaDrop, 0.22f * dy, dy * 0.45f),
+                         vertRampLen(d.thetaDrop, v2, d.thetaDrop * 24.0f));
+        d.rampOut = fmaxf(solveRampForRise(-d.thetaDrop, 0.0f, 0.35f * dy, dy * 0.75f),
+                          fmaxf(vertRampLen(d.thetaDrop, v2Bottom, 12.0f),
+                                d.rampIn + 6.0f));
         Profile1D in = rampProfile(0.0f, -d.thetaDrop, d.rampIn);
         Profile1D out = rampProfile(-d.thetaDrop, 0.0f, d.rampOut);
         float need = -profileRise(in, 0.0f, d.rampIn) - profileRise(out, 0.0f, d.rampOut);
-        if (dy - need > 4.5f * sinf(d.thetaDrop)) break;
+        if (dy - need > 4.5f * sinf(d.thetaDrop) || d.thetaDrop <= 0.3f) break;
         d.thetaDrop *= 0.8f;
-        d.rampIn = fminf(42.0f, fmaxf(fmaxf(10.0f, dy * 0.35f), d.thetaDrop * 24.0f));
-        d.rampOut = d.rampIn + 6.0f;
     }
+    // Shallow conditioning descents are glue, not a named DROP element.
+    if (d.thetaDrop < 0.55f || dy < 30.0f) d.tag = Tag::Line;
     emitDrop(r, d);
 }
 
 // Planner-side climb (drop mirrored). Levels the entry for the same reason:
-// emitClimb's pull-up starts from the current pitch.
-void plannerClimb(Route& r, float dy, Tag tag, bool chain) {
-    levelOut(r);
-    float theta = dy > 60.0f ? 0.61f : 0.42f; // 35 or 24 deg
-    float ramp = fminf(40.0f, fmaxf(10.0f, dy * 0.5f));
+// emitClimb's pull-up starts from the current pitch. Ramps are g-budgeted at
+// the live speed; the angle shrinks until the height affords both ramps.
+void plannerClimb(Route& r, float dy, float v2, Tag tag, bool chain) {
+    levelOut(r, v2);
+    // Powered (LSM) climbs stay shallow: real launch/booster track is
+    // straight and at most gently inclined (launch-track convention; user
+    // round 2: "some elements can't be on such high pitch — launch LSM
+    // boosters"). Unpowered conditioning climbs may coast up steeper.
+    float theta = chain ? 0.24f : (dy > 60.0f ? 0.61f : 0.42f);
+    float ramp;
+    while (true) {
+        ramp = fmaxf(fminf(40.0f, fmaxf(10.0f, dy * 0.5f)),
+                     vertRampLen(theta, v2, 10.0f));
+        Profile1D up = rampProfile(0.0f, theta, ramp);
+        float rise = 2.0f * profileRise(up, 0.0f, ramp); // ~symmetric pair
+        if (dy - rise > 2.5f * sinf(theta) || theta <= 0.12f) break;
+        theta *= 0.8f;
+    }
     emitClimb(r, dy, theta, ramp, ramp, tag, chain);
 }
 
@@ -109,20 +182,41 @@ float emitGroundLeg(Route& r, float v2, const TerrainQuery& terrain, float lengt
     const float step = 40.0f;
     const float startY = r.endPose.pos.y;
     float done = 0.0f;
+    float v2Cur = v2;
     while (length - done > 1.0f) {
         float seg = fminf(step, length - done);
         float dx = sinf(r.endPose.yaw), dz = cosf(r.endPose.yaw);
-        float gAhead = terrain.height(r.endPose.pos.x + dx * seg, r.endPose.pos.z + dz * seg);
-        float dy = (gAhead + clearance) - r.endPose.pos.y;
+        // ANTICIPATORY grade: probe up to 3 steps ahead and take the pitch
+        // the steepest upcoming requirement demands NOW. The old one-step
+        // reactive grade started climbing only when already at the flank —
+        // at speed (g-budgeted, gentle ramps) that bored 50-90 m deep
+        // tunnels through every rise.
+        float need = -1e9f;
+        for (int k = 1; k <= 3; k++) {
+            float w = fminf(seg * (float)k, fmaxf(length - done, seg));
+            float g = terrain.height(r.endPose.pos.x + dx * w, r.endPose.pos.z + dz * w);
+            need = fmaxf(need, atanf(((g + clearance) - r.endPose.pos.y) / w));
+        }
         // Climb steeper than descend: keeping up with a rising flank avoids a
         // tunnel; a fast descent just floats (unsupported, harmless).
-        float pitch = fmaxf(-0.42f, fminf(0.52f, atanf(dy / seg)));
-        float rampLen = fminf(seg, fmaxf(10.0f, fabsf(pitch - r.endPose.pitch) * 60.0f));
+        float pitch = fmaxf(-0.42f, fminf(0.52f, need));
+        float dTheta = fabsf(pitch - r.endPose.pitch);
+        // g-budgeted grade ramps at the LIVE speed, bounded by the step so
+        // the leg still tracks relief; the pitch delta shrinks if the budget
+        // can't fit the step (gentler grading beats a g spike).
+        float rampLen = vertRampLen(dTheta, v2Cur, fmaxf(10.0f, dTheta * 60.0f));
+        if (rampLen > seg) {
+            dTheta *= seg / rampLen;
+            pitch = r.endPose.pitch +
+                    (pitch > r.endPose.pitch ? dTheta : -dTheta);
+            rampLen = seg;
+        }
         emitGradeChange(r, pitch, rampLen, Tag::Line);
         if (seg - rampLen > 1.0f) emitLine(r, seg - rampLen, Tag::Line, false);
         done += seg;
+        v2Cur = fmaxf(v2After(v2, r.endPose.pos.y - startY), 100.0f);
     }
-    levelOut(r);
+    levelOut(r, v2Cur);
     return fmaxf(v2After(v2, r.endPose.pos.y - startY), 100.0f);
 }
 
@@ -131,27 +225,30 @@ float emitGroundLeg(Route& r, float v2, const TerrainQuery& terrain, float lengt
 // taller than ~150 m stops being ride texture); when capped, the element
 // simply takes the residual higher entry speed — sizes sit at the band top
 // and the user accepts the higher g (REALISM_SCALE, 2026-07-10 note).
+// Drops are capped at the 1.5x WR drop band like every other descent.
 // Returns the ACHIEVED v^2.
 float conditionSpeed(Route& r, float v2, float v2Target) {
     float dy = (v2 - v2Target) / (2.0f * kG);
     if (fabsf(dy) < 6.0f) return v2; // close enough — soft tolerances
     if (dy > 0.0f) {
         float climb = fminf(dy, 150.0f);
-        plannerClimb(r, climb, Tag::Line, false);
+        plannerClimb(r, climb, v2, Tag::Line, false);
         return v2After(v2, climb);
     }
-    plannerDrop(r, -dy);
-    return v2Target;
+    float drop = fminf(-dy, wr::kMulMax * wr::kDrop);
+    plannerDrop(r, drop, v2);
+    return v2After(v2, -drop);
 }
 
-// Grade the upcoming turn so its (constant-pitch) arc CLEARS every bit of
-// ground it sweeps over. A turn is a single-grade ramp — it cannot follow a
+// Grade the upcoming turn (g-budgeted grade ramp at the live speed) so its
+// (constant-pitch) arc CLEARS every bit of ground it sweeps over. A turn is a single-grade ramp — it cannot follow a
 // mid-arc hump — so instead of grading toward the exit alone, sample the whole
 // sweep and take the pitch that clears the HIGHEST point (+clearance). Ground
 // lower than that line passes beneath the arc as an unsupported span (harmless
 // to the clearance gate); only a hump steeper than the pitch cap leaves a
 // bounded cut, never a long bore from a level arc sitting under a rising flank.
-void gradeTurnToTerrain(Route& r, const TerrainQuery& terrain, const TurnSpec& t) {
+void gradeTurnToTerrain(Route& r, const TerrainQuery& terrain, const TurnSpec& t,
+                        float v2) {
     float s1 = t.totalAngle >= 0.0f ? 1.0f : -1.0f;
     float yaw = r.endPose.yaw;
     float R = t.radius;
@@ -169,8 +266,10 @@ void gradeTurnToTerrain(Route& r, const TerrainQuery& terrain, const TurnSpec& t
         need = fmaxf(need, req);
     }
     float pitch = fminf(0.30f, fmaxf(-0.30f, need));
-    if (fabsf(pitch - r.endPose.pitch) > 0.02f)
-        emitGradeChange(r, pitch, fmaxf(18.0f, fabsf(pitch - r.endPose.pitch) * 70.0f),
+    float dTheta = fabsf(pitch - r.endPose.pitch);
+    if (dTheta > 0.02f)
+        emitGradeChange(r, pitch,
+                        vertRampLen(dTheta, v2, fmaxf(18.0f, dTheta * 70.0f)),
                         Tag::Line);
 }
 
@@ -216,9 +315,9 @@ float steerToward(Route& r, Rng& rng, const TerrainQuery& terrain, float targetY
     t.radius = radius;
     // The ramps must leave a real constant-radius middle.
     if (fabsf(d) * t.radius < 2.4f * t.rampLen) t.radius = 2.6f * t.rampLen / fabsf(d);
-    gradeTurnToTerrain(r, terrain, t);
+    gradeTurnToTerrain(r, terrain, t, v2);
     emitTurn(r, t);
-    levelOut(r);
+    levelOut(r, v2);
     return d;
 }
 
@@ -230,11 +329,17 @@ float settleToGround(Route& r, float v2, const TerrainQuery& terrain, float clea
     float ground = terrain.height(r.endPose.pos.x, r.endPose.pos.z);
     float dy = r.endPose.pos.y - (ground + clearance);
     if (dy > 25.0f) {
-        plannerDrop(r, dy);
-        return v2After(v2, -dy);
+        // One drop element never exceeds the 1.5x WR drop band; any residual
+        // altitude rides the relief down as a graded ground leg instead.
+        float cap = wr::kMulMax * wr::kDrop;
+        float drop = fminf(dy, cap);
+        plannerDrop(r, drop, v2);
+        v2 = v2After(v2, -drop);
+        if (dy > cap) v2 = emitGroundLeg(r, v2, terrain, (dy - cap) * 2.6f, clearance);
+        return v2;
     }
     if (dy < -25.0f) {
-        plannerClimb(r, -dy, Tag::Line, false);
+        plannerClimb(r, -dy, v2, Tag::Line, false);
         return v2After(v2, -dy);
     }
     return v2;
@@ -310,9 +415,9 @@ float dockTo(Route& r, Rng& rng, float v2, const TerrainQuery& terrain,
             t.rampLen = fmaxf(1.875f * t.bank * v / 1.5f, 24.0f);
             if (fabsf(bestA1) * t.radius < 2.4f * t.rampLen)
                 t.radius = 2.6f * t.rampLen / fabsf(bestA1);
-            gradeTurnToTerrain(r, terrain, t);
+            gradeTurnToTerrain(r, terrain, t, v2);
             emitTurn(r, t);
-            levelOut(r);
+            levelOut(r, v2);
         }
         // The long haul between the arcs rides the relief (bounded cuts),
         // never a plain straight boring through it. The target's own
@@ -327,9 +432,9 @@ float dockTo(Route& r, Rng& rng, float v2, const TerrainQuery& terrain,
             t.rampLen = fmaxf(1.875f * t.bank * v / 1.5f, 24.0f);
             if (fabsf(bestA2) * t.radius < 2.4f * t.rampLen)
                 t.radius = 2.6f * t.rampLen / fabsf(bestA2);
-            gradeTurnToTerrain(r, terrain, t);
+            gradeTurnToTerrain(r, terrain, t, v2);
             emitTurn(r, t);
-            levelOut(r);
+            levelOut(r, v2);
         }
         (void)rng;
     }
@@ -398,20 +503,44 @@ static Route buildRideOnce(uint32_t seed, const TerrainQuery& terrain) {
         return out;
     };
 
-    // Main launch: k_v ~ k_r (transit ~1x real) — Falcon-anchored entries
-    // at the locked 1.4-1.5x sizes want ~100 m/s (360 km/h) here.
-    emitLine(r, 150.0f, Tag::Launch, true);
-    float v2 = 100.0f * 100.0f;
-    sMark = r.endS;
-
-    // Signature top hat (locked 230 m rise), exiting ~12 m above the entry.
+    // Signature top hat: instance size drawn from the 1.0–1.5x WR band
+    // (anchor: Falcon's 163 m structure), exiting ~12 m above the entry.
+    // LAUNCH SPEED is energy-consistent, not naive k_v-scaled: the launch
+    // carries the train over the crest with a bounded margin (real launched
+    // hats run ~1.15-1.2x the minimum crest energy — Top Thrill 2-class), so
+    // crest speed — and with it crest airtime g — stays sane at every drawn
+    // size. The old fixed 100 m/s launch left a 230 m hat cresting at 74 m/s,
+    // which no crest transition length could keep physical.
+    float hatMul = drawMul(rng, true);
     TopHatSpec hat;
-    hat.riseH = 230.0f * rng.range(0.95f, 1.05f);
+    hat.riseH = wr::kTopHatRise * hatMul;
+    // Descend CONTINUOUSLY onto the terrain past the hat (user round 3: the
+    // hat used to pull out to a level shelf ~station height and then a glue
+    // drop re-descended — a mid-air flat notch). Target the ground under the
+    // landing point: estimate the arch's horizontal reach, sample terrain
+    // there, and size dropH so the pull-out finishes at clearance height.
     hat.dropH = hat.riseH - 12.0f;
+    {
+        float dx = sinf(r.endPose.yaw), dz = cosf(r.endPose.yaw);
+        float entryY = r.endPose.pos.y;
+        for (int it = 0; it < 2; it++) {
+            float horiz = 150.0f + 1.35f * (hat.riseH + hat.dropH); // launch + arch reach
+            float g = terrain.height(r.endPose.pos.x + dx * horiz,
+                                     r.endPose.pos.z + dz * horiz);
+            float want = (entryY + hat.riseH) - (g + 10.0f);
+            hat.dropH = fminf(fmaxf(want, hat.riseH - 40.0f), hat.riseH + 90.0f);
+        }
+    }
+    // The hat's smooth-arch geometry is intrinsic to emitTopHat now. Launch
+    // energy stays bounded (crest carries a real but sane margin).
+    float launchV2 = 2.0f * kG * hat.riseH * rng.range(1.12f, 1.22f);
+    emitLine(r, 150.0f, Tag::Launch, true);
+    float v2 = launchV2;
+    sMark = r.endS;
     emitTopHat(r, hat);
-    v2 = drag(v2After(v2, 12.0f));
+    v2 = drag(v2After(v2, hat.riseH - hat.dropH));
 
-    // Long descending transition onto the terrain.
+    // Settle any residual (usually a no-op now — the hat already landed).
     v2 = settleToGround(r, v2, terrain, 10.0f);
     v2 = drag(v2);
 
@@ -424,13 +553,32 @@ static Route buildRideOnce(uint32_t seed, const TerrainQuery& terrain) {
     v2 = drag(v2);
     v2 = settleToGround(r, v2, terrain, 12.0f);
     {
-        float hillH = fminf(150.0f, 0.5f * v2 / (2.0f * kG));
-        float vc2 = fmaxf(v2After(v2, hillH), 150.0f);
-        CamelbackSpec cb;
-        cb.height = hillH;
-        cb.c = 1.35f * kG / (2.0f * vc2); // floater: 1.35x free-fall parabola
-        cb.blendLen = fmaxf(30.0f, hillH * 0.5f);
-        emitCamelback(r, cb);
+        // AIRTIME CHAIN (record-setter giga grammar; user round 3: chain
+        // hills "can't be this big and slow"): a rapid rhythm of hills
+        // anchored to REAL airtime-hill sizes (Millennium Force's ~55 m
+        // second hill / El Toro-class, x the instance tier) — NOT to the
+        // flagship camelback anchor. Each hill eats at most ~25% of the live
+        // energy so every crest stays fast; each following hill ~75% of the
+        // last. Between hills only a 2.5 m run separator: the valley is one
+        // continuous curve (a visible flat at the bottom of a trough was
+        // exactly V1's "flat bottom geo issue").
+        float hillH = fminf(55.0f * drawMul(rng, false),
+                            0.25f * v2 / (2.0f * kG));
+        int chain = 3 + rng.pick(2);
+        for (int hc = 0; hc < chain; hc++) {
+            hillH = fmaxf(hillH, wr::kHillFloor);
+            float vc2 = fmaxf(v2After(v2, hillH), 150.0f);
+            CamelbackSpec cb;
+            cb.height = hillH;
+            cb.c = 1.35f * kG / (2.0f * vc2); // floater: 1.35x free-fall parabola
+            cb.blendLen = fmaxf(24.0f, hillH * 0.62f); // visible base sweep
+            emitCamelback(r, cb);
+            v2 = drag(v2);
+            if (hc + 1 < chain) {
+                emitLine(r, 2.5f, Tag::Line, false); // run separator only
+                hillH = fminf(hillH * 0.75f, 0.25f * v2 / (2.0f * kG));
+            }
+        }
     }
     v2 = drag(v2);
     emitLine(r, rng.range(20.0f, 50.0f), Tag::Line, false);
@@ -459,17 +607,33 @@ static Route buildRideOnce(uint32_t seed, const TerrainQuery& terrain) {
     v2 = settleToGround(r, v2, terrain, 12.0f);
 
     // Inversions live in the naturally slower mid-ride leg (1-3 per lap,
-    // locked roster; reversers pair so the lap heading survives).
-    int nInv = 1 + rng.pick(3);
+    // locked roster; reversers pair so the lap heading survives). Element
+    // count scales with drawn size (user 2026-07-10: bigger elements, fewer
+    // of them): a grand-hat ride draws 1-2, a moderate one 1-3. Gaps between
+    // inversions scale with each instance's own size multiplier.
+    int nInv = 1 + rng.pick(hatMul > 1.32f ? 2 : 3);
     bool usedPair = false;
     for (int i = 0; i < nInv; i++) {
-        emitLine(r, rng.range(25.0f, 60.0f), Tag::Line, false);
+        float invMul = drawMul(rng, false);
+        // Intamin flow between elements: not element-line-element chaining —
+        // a drawn-out, low, valley-following swooping turn carries the route
+        // to the next inversion for most links (breath + terrain flight),
+        // with a plain conditioned straight as the occasional variant.
+        if (i > 0 && rng.uni() < 0.65f) {
+            steerToward(r, rng, terrain,
+                        pickLowHeading(r, terrain, r.endPose.yaw,
+                                       rng.range(0.7f, 1.2f), 420.0f, 9),
+                        rng.range(170.0f, 230.0f), 0.85f, v2);
+            v2 = drag(v2);
+            v2 = settleToGround(r, v2, terrain, 12.0f);
+        }
+        emitLine(r, rng.range(25.0f, 60.0f) * (0.5f + 0.5f * invMul), Tag::Line, false);
         v2 = drag(v2);
         int kind = rng.pick(usedPair || i + 1 >= nInv ? 3 : 4);
         switch (kind) {
             case 0: {
                 LoopSpec lp;
-                lp.height = 78.0f * rng.range(0.92f, 1.06f);
+                lp.height = wr::kLoop * invMul;
                 lp.vEntry = sqrtf(2.0f * kG * lp.height + rng.range(180.0f, 420.0f));
                 v2 = conditionSpeed(r, v2, lp.vEntry * lp.vEntry);
                 emitLoop(r, lp);
@@ -477,7 +641,13 @@ static Route buildRideOnce(uint32_t seed, const TerrainQuery& terrain) {
             }
             case 1: {
                 CorkscrewSpec cs;
-                cs.vElement = sqrtf(fminf(v2, 38.0f * 38.0f));
+                // Physical floor: element length = v*(360/rollRate) must keep
+                // the cone angle real (sin(alpha) = 2*pi*R/length well under
+                // 1) — slow entries get conditioned UP via a drop, exactly
+                // like fast ones get conditioned down.
+                float vMin = 2.0f * kPi * cs.radius * cs.rollRateDegS /
+                             (360.0f * 0.8f);
+                cs.vElement = sqrtf(fminf(fmaxf(v2, vMin * vMin), 38.0f * 38.0f));
                 v2 = conditionSpeed(r, v2, cs.vElement * cs.vElement);
                 emitCorkscrew(r, cs);
                 break;
@@ -494,7 +664,7 @@ static Route buildRideOnce(uint32_t seed, const TerrainQuery& terrain) {
                 float apexY = r.endPose.pos.y + climbToApex;
                 float deficit = (ground - 15.0f + 95.0f) - apexY;
                 if (deficit > 5.0f) {
-                    plannerClimb(r, deficit, Tag::Launch, true);
+                    plannerClimb(r, deficit, v2, Tag::Launch, true);
                     sMark = r.endS; // powered: speed maintained through it
                 }
                 v2 = conditionSpeed(r, v2, st.vApex * st.vApex);
@@ -504,15 +674,43 @@ static Route buildRideOnce(uint32_t seed, const TerrainQuery& terrain) {
                 break;
             }
             case 3: {
+                // Immelmann + dive loop pair. The linking leg between them
+                // must not be a level shelf in the sky (user round 2: the
+                // "immel to s-curve section" ran flat at ~+95 m — real
+                // layouts descend through their transitions): the S-curve
+                // offset now rides a DESCENDING grade, and the pair's height
+                // budget keeps the dive loop's remaining fall inside its WR
+                // band after that descent.
+                float jogDrop = rng.range(14.0f, 26.0f);
                 ImmelmannSpec im;
-                im.height = 95.0f * rng.range(0.92f, 1.05f);
+                im.height = fminf(fmaxf(wr::kImmelmann * invMul,
+                                        wr::kImmelmann + jogDrop + 4.0f),
+                                  wr::kMulMax * wr::kImmelmann);
                 im.vEntry = sqrtf(2.0f * kG * im.height + rng.range(220.0f, 450.0f));
                 v2 = conditionSpeed(r, v2, im.vEntry * im.vEntry);
                 emitImmelmann(r, im);
                 v2 = v2After(im.vEntry * im.vEntry, im.height);
-                emitLine(r, rng.range(30.0f, 60.0f), Tag::Line, false);
+                emitLine(r, rng.range(16.0f, 30.0f), Tag::Line, false);
+                // Parallel lateral offset on a falling grade: the dive
+                // loop's return pass descends BESIDE the Immelmann and its
+                // approach line instead of back through them (a heading jog
+                // alone would still cross the outbound track), and the leg
+                // sheds altitude the whole way instead of shelf-ing.
+                {
+                    SCurveSpec jog;
+                    jog.angle = rng.range(0.55f, 0.8f);
+                    jog.radius = 130.0f;
+                    jog.rampLen = 45.0f;
+                    float jogLen = 2.0f * (jog.angle / (1.0f / jog.radius)) +
+                                   4.0f * jog.rampLen; // rough arc estimate
+                    float grade = -atanf(jogDrop / jogLen);
+                    emitGradeChange(r, grade, vertRampLen(grade, v2, 20.0f), Tag::Line);
+                    emitSCurve(r, jog);
+                    emitGradeChange(r, 0.0f, vertRampLen(grade, v2, 20.0f), Tag::Line);
+                    emitLine(r, 14.0f, Tag::Line, false);
+                }
                 DiveLoopSpec dl;
-                dl.height = im.height;
+                dl.height = im.height - jogDrop;
                 dl.vTop = sqrtf(fmaxf(v2, 140.0f));
                 emitDiveLoop(r, dl);
                 v2 = v2After(dl.vTop * dl.vTop, -dl.height);
@@ -526,15 +724,28 @@ static Route buildRideOnce(uint32_t seed, const TerrainQuery& terrain) {
     }
 
     // Uphill LSM, then hunt a natural escarpment for the signature dive.
-    plannerClimb(r, 24.0f, Tag::Launch, true);
+    plannerClimb(r, 24.0f, v2, Tag::Launch, true);
     v2 = fmaxf(v2, 55.0f * 55.0f);
     sMark = r.endS;
     std::vector<EscarpmentSite> sites =
         scanEscarpments(terrain, r.endPose.pos, 700.0f);
-    if (!sites.empty()) {
-        const EscarpmentSite& site = sites[0];
+    // The cliff dive IS this ride's main drop: its dive height must land in
+    // the 1.0–1.5x WR drop band (195–292 m vs Falcon's 195 m elevation
+    // change). The powered climb tops up shortfall (within reason); a site
+    // that still can't deliver the band is not a qualifying site.
+    const EscarpmentSite* sitePick = nullptr;
+    float pickClimb = 70.0f;
+    for (const EscarpmentSite& cand : sites) {
+        float natural = (cand.crestY + 2.0f) - (cand.valleyY + 3.0f);
+        // The powered climb tops the natural relief up to the band (Falcon
+        // itself pairs a ~163 m structure with the escarpment); cap 150 m.
+        float climb = fminf(fmaxf(wr::kDrop * 1.02f - natural, 60.0f), 150.0f);
+        if (natural + climb >= wr::kDrop) { sitePick = &cand; pickClimb = climb; break; }
+    }
+    if (sitePick) {
+        const EscarpmentSite& site = *sitePick;
         CliffDiveSpec cd;
-        cd.climbHeight = 70.0f;
+        cd.climbHeight = pickClimb;
         float dirX = sinf(site.heading), dirZ = cosf(site.heading);
         float lip = 8.0f;
         for (float w = 8.0f; w <= 60.0f; w += 4.0f) {
@@ -544,7 +755,23 @@ static Route buildRideOnce(uint32_t seed, const TerrainQuery& terrain) {
                 break;
         }
         float diveStartY = site.crestY + 2.0f + cd.climbHeight;
-        cd.diveHeight = diveStartY - (site.valleyY + 3.0f);
+        // Cap at the band top: over an unusually deep valley the pull-out
+        // simply completes above the floor (a supported span, not a bore).
+        cd.diveHeight = fminf(diveStartY - (site.valleyY + 3.0f),
+                              wr::kMulMax * wr::kDrop);
+        // Push-over is a VISIBLE proportional sweep (~16% of the dive), not
+        // just a g-budget minimum — a 13 m-radius flip over a 200 m cliff
+        // edge read as a kink (user round 2). The pull-out taper consumes
+        // ~30% of the dive height (the same rule as every drop).
+        const float vEdge2 = 30.0f * 30.0f;
+        cd.diveRampIn = fmaxf(solveRampForRise(0.0f, -cd.thetaDive,
+                                               0.16f * cd.diveHeight,
+                                               cd.diveHeight * 0.3f),
+                              1.875f * cd.thetaDive * vEdge2 / (7.3f * kG));
+        cd.diveRampOut = fmaxf(solveRampForRise(-cd.thetaDive, 0.0f,
+                                                0.30f * cd.diveHeight,
+                                                cd.diveHeight * 0.6f),
+                               cd.diveRampIn + 10.0f);
 
         Route probe;
         Pose o;
@@ -572,33 +799,34 @@ static Route buildRideOnce(uint32_t seed, const TerrainQuery& terrain) {
         v2 = fmaxf(v2, 72.0f * 72.0f);
         sMark = r.endS;
         float ground = terrain.height(r.endPose.pos.x, r.endPose.pos.z);
-        float dy = r.endPose.pos.y - (ground + 8.0f);
+        float dy = fminf(r.endPose.pos.y - (ground + 8.0f), wr::kMulMax * wr::kDrop);
         if (dy > 20.0f) {
-            plannerDrop(r, dy);
+            plannerDrop(r, dy, v2);
             v2 = v2After(v2, -dy);
         }
         v2 = drag(v2);
     }
 
-    // Flagship camelback (locked ~240 m) off an LSM boost to its MATCHED
-    // entry (~1.45x Falcon's ~250 km/h -> ~100 m/s), keeping transit ~1x.
-    // Orient it along low/descending ground first: a 240 m symmetric hill's
-    // far half must FLOAT over falling terrain (an unsupported span), not bury
-    // itself in a rising flank (a tunnel). Its own crest naturally clears any
-    // hump under the footprint.
+    // Flagship camelback: instance drawn from the WR band (anchor Falcon's
+    // 165 m hill) off an LSM boost to its MATCHED entry — k_v ~ k_r against
+    // Falcon's ~250 km/h hill entry, so transit stays ~1x at every size.
+    // Orient it along low/descending ground first: a WR-class symmetric
+    // hill's far half must FLOAT over falling terrain (an unsupported span),
+    // not bury itself in a rising flank (a tunnel).
     v2 = settleToGround(r, v2, terrain, 12.0f);
     steerToward(r, rng, terrain,
                 pickLowHeading(r, terrain, r.endPose.yaw, 1.4f, 700.0f, 11), 200.0f, 0.8f, v2);
     v2 = settleToGround(r, v2, terrain, 12.0f);
+    float cbMul = drawMul(rng, true);
     emitLine(r, 110.0f, Tag::Launch, true);
-    v2 = fmaxf(v2, 100.0f * 100.0f);
+    v2 = fmaxf(v2, (wr::kVCamelback * cbMul) * (wr::kVCamelback * cbMul));
     sMark = r.endS;
     {
         CamelbackSpec cb;
-        cb.height = 240.0f * rng.range(0.96f, 1.04f);
+        cb.height = wr::kCamelback * cbMul;
         float vc2 = fmaxf(v2After(v2, cb.height), 180.0f);
         cb.c = 1.25f * kG / (2.0f * vc2);
-        cb.blendLen = 120.0f;
+        cb.blendLen = fmaxf(30.0f, cb.height * 0.62f); // visible base sweep (photo rule)
         emitCamelback(r, cb);
     }
     v2 = drag(v2);
@@ -651,6 +879,25 @@ Route buildRide(uint32_t seed, const TerrainQuery& terrain) {
         Route r = buildRideOnce(seed + (uint32_t)attempt * 7919u, terrain);
         ValidationReport rep = validateRoute(r, &terrain);
         bool pass = rep.pass();
+        if (getenv("V2_DEBUG_ATTEMPTS")) {
+            fprintf(stderr,
+                    "[attempt %u.%d] pass=%d cliff=%d disc=%zu elem=%zu ovl=%zu "
+                    "dec=%d cut=%.0f tun=%.0f\n",
+                    seed, attempt, pass ? 1 : 0, hasCliff(r) ? 1 : 0,
+                    rep.discontinuities.size(), rep.elementFailures.size(),
+                    rep.overlaps.size(), (int)clearanceDecision(rep, lim),
+                    rep.cutLength, rep.tunnelLength);
+            for (const ClearanceSpan& c : rep.clearance)
+                if (c.kind == ClearanceSpan::Kind::Tunnel &&
+                    (c.s1 - c.s0 > lim.maxCutLen || c.maxDepth > lim.maxTunnelDepth))
+                    fprintf(stderr, "[attempt %u.%d]   BAD span %.0f..%.0f depth %.0f\n",
+                            seed, attempt, c.s0, c.s1, c.maxDepth);
+            for (const std::string& e : rep.elementFailures)
+                fprintf(stderr, "[attempt %u.%d]   %s\n", seed, attempt, e.c_str());
+            for (const OverlapHit& o : rep.overlaps)
+                fprintf(stderr, "[attempt %u.%d]   overlap s=%.0f/%.0f d=%.1f %s/%s\n",
+                        seed, attempt, o.sA, o.sB, o.dist, tagName(o.tagA), tagName(o.tagB));
+        }
         if (pass && clearanceDecision(rep, lim) != ClearanceDecision::Reject) {
             if (hasCliff(r)) return r;        // clean, bounded AND a cliff dive
             if (!haveClean) { cleanNoCliff = r; haveClean = true; } // keep as fallback
@@ -804,8 +1051,16 @@ Route buildStep5RouteDs(uint32_t seed, float ds) {
     ImmelmannSpec imm; // locked: 95 m half-loop + half-roll @ 47 m/s
     emitImmelmann(r, imm);
 
-    // Exits reversed, 95 m above the entry line — run back over the route.
+    // Exits reversed, 95 m above the entry line. Shift the return pass
+    // BESIDE the outbound track with a parallel S-curve offset before diving
+    // back down — retracing at the same altitude is exactly the overlap the
+    // validator now rejects.
     emitLine(r, 40.0f, Tag::Line, false);
+    {
+        SCurveSpec jog; // defaults: ~56 m parallel offset
+        emitSCurve(r, jog);
+        emitLine(r, 20.0f, Tag::Line, false);
+    }
 
     DiveLoopSpec dl; // the Immelmann's mirror: dives the 95 m back down
     emitDiveLoop(r, dl);

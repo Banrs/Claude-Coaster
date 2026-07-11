@@ -117,6 +117,8 @@ Pose emitSchedule(Route& r, float length,
         smp.tan = dirFromAngles(smp.pitch, smp.yaw);
         smp.tag = tag;
         smp.chain = chain;
+        smp.frameJoint = r.pendingFrameJoint;
+        r.pendingFrameJoint = false;
         r.samples.push_back(smp);
     }
     p = integrateDir(p, sLoc, length, pitch, yaw, hMax);
@@ -266,6 +268,8 @@ Pose emitHermite(Route& r, const QuinticHermite& h, float exitRoll, Tag tag, boo
         smp.tan = dirFromAngles(smp.pitch, smp.yaw);
         smp.tag = tag;
         smp.chain = chain;
+        smp.frameJoint = r.pendingFrameJoint;
+        r.pendingFrameJoint = false;
         r.samples.push_back(smp);
     }
 
@@ -340,6 +344,8 @@ Pose emitPlanarY(Route& r,
             smp.tan = dirFromAngles(q.pitch, q.yaw);
             smp.tag = tag;
             smp.chain = chain;
+            smp.frameJoint = r.pendingFrameJoint;
+            r.pendingFrameJoint = false;
             r.samples.push_back(smp);
             nextGrid = (float)r.samples.size() * r.ds - segStart;
         }
@@ -379,6 +385,33 @@ static Vector3 transportStep(Vector3 v, Vector3 ta, Vector3 tb) {
     return Vector3Normalize(v);
 }
 
+// The zero-roll ("upright") up vector for a tangent: world up projected
+// perpendicular to the tangent. Undefined only for a vertical tangent.
+static bool uprightFor(Vector3 tan, Vector3* out) {
+    Vector3 u = Vector3Subtract(Vector3{0, 1, 0}, Vector3Scale(tan, tan.y));
+    float len = Vector3Length(u);
+    if (len < 0.05f) return false; // near-vertical: no meaningful upright
+    *out = Vector3Scale(u, 1.0f / len);
+    return true;
+}
+
+// Signed roll of `up` relative to upright, about the tangent.
+float frameRollAngle(Vector3 up, Vector3 tan) {
+    Vector3 ideal;
+    if (!uprightFor(tan, &ideal)) return 0.0f;
+    float c = Vector3DotProduct(up, ideal);
+    float s = Vector3DotProduct(Vector3CrossProduct(ideal, up), tan);
+    return atan2f(s, c);
+}
+
+// Tags where the frame may be servoed back to upright: glue track whose
+// DESIGNED roll is zero. Elements own their frame (a loop's tiny transport
+// twist is part of its shape; a corkscrew's holonomy is load-bearing).
+static bool isUnwindTag(Tag t) {
+    return t == Tag::Line || t == Tag::Connector || t == Tag::Launch ||
+           t == Tag::Brake || t == Tag::Station;
+}
+
 void buildFrames(Route& r) {
     size_t n = r.samples.size();
     if (n == 0) return;
@@ -390,6 +423,18 @@ void buildFrames(Route& r) {
     // inversion-exit normalization joints, where the bookkeeping angles jump
     // to an equivalent expression ((pi-theta, psi+pi, phi+pi) — same tangent
     // and same frame) but the PHYSICAL twist across the pair is zero.
+    //
+    // ROLL RESET (rewritten 2026-07-10 — the "stuck at a roll angle" defect):
+    // any 3D path with bank + pitch together accumulates genuine parallel-
+    // transport holonomy that the designed-roll schedule returning to zero
+    // does NOT cancel. The old code corrected this ONCE per lap at the seam
+    // (and skipped even that above 2.9 rad), so mid-ride track ran visibly
+    // rolled for kilometers. Now: on every glue stretch whose designed roll
+    // is zero (line/connector/launch/brake/station), the frame is servoed
+    // back to upright at a bounded twist rate — the correction happens right
+    // after the element that caused it, exactly like a real layout's
+    // roll-out transition, and the seam residual becomes negligible.
+    const float kUnwindRate = 0.022f; // rad per meter (~1.26 deg/m), gentle
     Vector3 t0 = r.samples[0].tan;
     Vector3 u = Vector3Subtract(Vector3{0, 1, 0}, Vector3Scale(t0, t0.y));
     if (Vector3Length(u) < 1e-4f) u = Vector3{0, 0, 1}; // vertical start tangent (not expected)
@@ -399,34 +444,33 @@ void buildFrames(Route& r) {
         const Sample& A = r.samples[i - 1];
         Sample& B = r.samples[i];
         Vector3 v = transportStep(A.up, A.tan, B.tan);
-        float dRoll = B.roll - A.roll;
-        // Bookkeeping joints carry no physical twist: inversion-exit
-        // normalization flips pitch by ~pi, and full-rotation wraps step the
-        // stored roll by 2*pi (stall) or 2*pi*cos(alpha) (corkscrew, whose
-        // transport holonomy supplies the rest). Real designed roll never
-        // steps more than ~0.1 rad per sample, so |dRoll| > 1 is a joint.
-        if (fabsf(B.pitch - A.pitch) > 2.0f || fabsf(dRoll) > 1.0f) dRoll = 0.0f;
+        // Explicit joints carry no physical twist (see Sample::frameJoint).
+        float dRoll = B.frameJoint ? 0.0f : B.roll - A.roll;
         B.up = rotateAbout(v, B.tan, dRoll);
+        // Servo toward upright on designed-roll-zero glue: measure the
+        // residual (transport holonomy) and rotate a bounded step of it out.
+        if (isUnwindTag(B.tag) && fabsf(B.roll) < 1e-4f) {
+            float resid = frameRollAngle(B.up, B.tan);
+            float step = fmaxf(-kUnwindRate * r.ds,
+                               fminf(kUnwindRate * r.ds, -resid));
+            if (fabsf(resid) > 1e-5f) B.up = rotateAbout(B.up, B.tan, step);
+        }
     }
 
-    // Closed routes: measure the seam mismatch and distribute it linearly in
-    // s so the seam frame matches (zero for planar routes; small otherwise).
-    // Any genuinely 3D closed circuit accumulates transport holonomy (graded
-    // banked turns, inversions) — distributing it is the standard fix and
-    // stays invisible (worst case ~0.03 deg/m). Only a near-pi mismatch is
-    // ambiguous/degenerate; leave that at the seam for the validator (broken
-    // closure GEOMETRY is separately prevented by the connector cusp guard).
+    // Closed routes: distribute the (now small — continuous unwinding above
+    // has already trued the frame on every glue stretch) seam mismatch
+    // linearly in s so the wrap is exact. No magnitude guard: a residual big
+    // enough to be ambiguous can no longer accumulate, and the validator's
+    // seamFrame check still reports any distribution artifact.
     if (r.closed && n > 2) {
         Vector3 v = transportStep(r.samples[n - 1].up, r.samples[n - 1].tan, r.samples[0].tan);
         float cosA = Vector3DotProduct(v, r.samples[0].up);
         float sinA = Vector3DotProduct(Vector3CrossProduct(v, r.samples[0].up), r.samples[0].tan);
         float holonomy = atan2f(sinA, cosA);
-        if (fabsf(holonomy) < 2.9f) {
-            float total = r.length() > 0.0f ? r.length() : 1.0f;
-            for (size_t i = 0; i < n; i++)
-                r.samples[i].up = rotateAbout(r.samples[i].up, r.samples[i].tan,
-                                              holonomy * (r.samples[i].s / total));
-        }
+        float total = r.length() > 0.0f ? r.length() : 1.0f;
+        for (size_t i = 0; i < n; i++)
+            r.samples[i].up = rotateAbout(r.samples[i].up, r.samples[i].tan,
+                                          holonomy * (r.samples[i].s / total));
     }
 }
 
