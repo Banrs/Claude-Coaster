@@ -614,8 +614,30 @@ int main(int argc, char **argv) {
 
     Track trk;
     trk.reset();
+    float captureStartU = 0.5f;
+    if (captureShot && getenv("MC_CAPTURE_FAST")) {
+        trk.ensureFinalizedAhead(520.0f);
+        if (elemShot) {
+            for (float q = 0.5f; q <= trk.maxFinalU(); q += 0.25f) {
+                if (trk.tagAt(q) == (unsigned char)elemShotElem) {
+                    captureStartU = fmaxf(0.5f, q - 2.0f);
+                    break;
+                }
+            }
+        } else if (jointShot) {
+            for (float q = 0.5f; q + 0.25f <= trk.maxFinalU(); q += 0.25f) {
+                unsigned char a = trk.tagAt(q), b = trk.tagAt(q + 0.25f);
+                bool fromMatch = jointFrom == -2 || a == (unsigned char)jointFrom;
+                bool toMatch   = jointTo   == -2 || b == (unsigned char)jointTo;
+                if (a != b && fromMatch && toMatch) {
+                    captureStartU = fmaxf(0.5f, q - 1.0f);
+                    break;
+                }
+            }
+        }
+    }
     v1_track_render::V1TrackRenderCache trackRenderCache;
-    trackRenderCache.update(trk, 0);
+    trackRenderCache.update(trk, (int)captureStartU);
 
     const int   NCARS    = 2;
     const float CAR_GAP  = 4.2f;
@@ -631,7 +653,7 @@ int main(int argc, char **argv) {
     waterCells.reserve((2 * TERRA_R + 1) * (2 * TERRA_R + 1) / 3);
     std::shared_ptr<std::vector<Vector3>> pendingWaterCells;
 
-    float u = 0.5f, v = 7.0f;
+    float u = captureStartU, v = 7.0f;
     float boost = 40.0f, score = 0;
     float simTime = 0, clackTimer = 0, whooshCD = 0, prevSlope = 0;
     unsigned char prevTag = 255;
