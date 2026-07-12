@@ -11,7 +11,7 @@ on:
       - ".github/workflows/v1-cloud-capture.yml"
 
 jobs:
-  capture:
+  audit:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -40,7 +40,48 @@ jobs:
           rsvg-convert audit/seed1.svg -o captures/audit-seed1.png
           rsvg-convert audit/seed2.svg -o captures/audit-seed2.png
 
-      - name: Capture elements and transition joints
+      - name: Upload audit screenshots and pacing reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v1-audit-screenshots-and-pacing
+          path: |
+            opengl/captures/**
+            opengl/audit/*.svg
+          if-no-files-found: error
+
+  screenshots:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: top-hat
+            args: "--elementshot TOPHAT"
+          - id: hills
+            args: "--elementshot HILLS"
+          - id: loop
+            args: "--elementshot LOOP"
+          - id: into-flat
+            args: "--jointshot ANY FLAT"
+          - id: out-of-flat
+            args: "--jointshot FLAT ANY"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install software-rendering dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libasound2-dev libgl1-mesa-dev \
+            libx11-dev libxrandr-dev libxi-dev libxinerama-dev libxcursor-dev xvfb
+
+      - name: Build restored legacy V1
+        run: |
+          cmake -S opengl -B opengl/build-cloud -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build opengl/build-cloud --parallel 4
+
+      - name: Capture ${{ matrix.id }}
         working-directory: opengl
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
@@ -50,23 +91,15 @@ jobs:
           MC_CAPTURE_W: "960"
           MC_CAPTURE_H: "540"
           MC_DT: "0.05"
+          MC_MUTE: "1"
         run: |
-          pids=()
-          timeout 360 xvfb-run -a -s "-screen 0 960x540x24" ./minecoaster --elementshot TOPHAT captures & pids+=("$!")
-          timeout 360 xvfb-run -a -s "-screen 0 960x540x24" ./minecoaster --elementshot HILLS captures & pids+=("$!")
-          timeout 360 xvfb-run -a -s "-screen 0 960x540x24" ./minecoaster --elementshot LOOP captures & pids+=("$!")
-          timeout 360 xvfb-run -a -s "-screen 0 960x540x24" ./minecoaster --jointshot ANY FLAT captures & pids+=("$!")
-          timeout 360 xvfb-run -a -s "-screen 0 960x540x24" ./minecoaster --jointshot FLAT ANY captures & pids+=("$!")
-          status=0
-          for pid in "${pids[@]}"; do wait "$pid" || status=1; done
-          exit "$status"
+          mkdir -p captures
+          timeout 360 xvfb-run -a -s "-screen 0 960x540x24" ./minecoaster ${{ matrix.args }} captures
 
-      - name: Upload audit and in-game screenshots
+      - name: Upload ${{ matrix.id }} screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: v1-audit-and-element-screenshots
-          path: |
-            opengl/captures/**
-            opengl/audit/*.svg
+          name: v1-${{ matrix.id }}-screenshot
+          path: opengl/captures/*.png
           if-no-files-found: error
