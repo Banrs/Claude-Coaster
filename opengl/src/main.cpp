@@ -542,7 +542,9 @@ int main(int argc, char **argv) {
     SetConfigFlags(benchMode ? FLAG_WINDOW_HIDDEN
                  : rttestMode ? (FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT)
                              : (FLAG_VSYNC_HINT | FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT));
-    InitWindow(1280, 720, "VOXELCOASTER");
+    int windowW = getenv("MC_CAPTURE_W") ? atoi(getenv("MC_CAPTURE_W")) : 1280;
+    int windowH = getenv("MC_CAPTURE_H") ? atoi(getenv("MC_CAPTURE_H")) : 720;
+    InitWindow(windowW, windowH, "VOXELCOASTER");
     SetExitKey(KEY_NULL);
     SetTargetFPS(120);
     // Raise the near clip from raylib's default 0.01 m to 0.2 m: with far=1200 the old 0.01:1000
@@ -860,7 +862,7 @@ int main(int argc, char **argv) {
                 bool near = false;
                 for (float la = -1.0f; la <= 10.0f; la += 1.0f)
                     if (trk.tagAt(u + la) == (unsigned char)elemShotElem) { near = true; break; }
-                float cap = 26.0f;
+                float cap = getenv("MC_CAPTURE_FAST") ? 60.0f : 26.0f;
                 if (near && v > cap) v = cap;
             }
 
