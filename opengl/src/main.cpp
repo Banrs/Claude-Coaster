@@ -614,6 +614,8 @@ int main(int argc, char **argv) {
     Track trk;
     trk.reset();
     float captureStartU = 0.5f;
+    bool captureElemPreset = false;
+    Vector3 captureElemPos{}, captureElemTangent{}, captureElemUp{};
     bool captureJointPreset = false;
     Vector3 captureJointPos{}, captureJointTangent{};
     if (captureShot && getenv("MC_CAPTURE_FAST")) {
@@ -637,6 +639,10 @@ int main(int argc, char **argv) {
                     if (metric > bestMetric) {
                         bestMetric = metric;
                         captureStartU = q;
+                        captureElemPos = qp;
+                        captureElemTangent = trk.tangent(q);
+                        captureElemUp = trk.upAt(q);
+                        captureElemPreset = true;
                     }
                 }
             }
@@ -1143,8 +1149,12 @@ int main(int argc, char **argv) {
         }
         if (elemShot) {
 
-            float alt = P.y - groundTopAt(P.x, P.z);
-            Vector3 side = Vector3Normalize(Vector3CrossProduct(Th, Vector3{ 0, 1, 0 }));
+            bool fastElem = getenv("MC_CAPTURE_FAST") && captureElemPreset;
+            Vector3 elemP  = fastElem ? captureElemPos : P;
+            Vector3 elemTh = fastElem ? captureElemTangent : Th;
+            Vector3 elemN  = fastElem ? captureElemUp : N;
+            float alt = elemP.y - groundTopAt(elemP.x, elemP.z);
+            Vector3 side = Vector3Normalize(Vector3CrossProduct(elemTh, Vector3{ 0, 1, 0 }));
 
             float dist = 34.0f, camY = 6.0f, aimY = -6.0f;
             switch (elemShotElem) {
@@ -1163,25 +1173,25 @@ int main(int argc, char **argv) {
                                dist = 38.0f; camY =  7.0f; aimY =  -3.0f; break;
                 default: break;
             }
-            cam.position = Vector3Add(P, Vector3Add(Vector3Add(Vector3Scale(side, dist),
-                                       Vector3Scale(Th, -dist * 0.32f)), Vector3{ 0, camY, 0 }));
-            cam.target   = Vector3Add(P, Vector3{ 0, aimY, 0 });
+            cam.position = Vector3Add(elemP, Vector3Add(Vector3Add(Vector3Scale(side, dist),
+                                       Vector3Scale(elemTh, -dist * 0.32f)), Vector3{ 0, camY, 0 }));
+            cam.target   = Vector3Add(elemP, Vector3{ 0, aimY, 0 });
             cam.up       = Vector3{ 0, 1, 0 };
             cam.fovy     = 62;
 
-            bool onElem = trk.tagAt(u) == (unsigned char)elemShotElem;
+            bool onElem = fastElem || trk.tagAt(u) == (unsigned char)elemShotElem;
             float score;
             switch (elemShotElem) {
                 case M_LOOP: case M_ROLL: case M_IMMEL: case M_DIVELOOP: case M_COBRA:
                 case M_PRETZEL: case M_WINGOVER: case M_HEARTLINE: case M_BANANA: case M_STALL:
-                    score = -N.y;   break;
+                    score = -elemN.y; break;
                 case M_DIP:
                 case M_HELIX:
                     score = -alt;   break;
                 default:
                     score =  alt;   break;
             }
-            if (getenv("MC_CAPTURE_FAST") && onElem && frame > 4) {
+            if (fastElem && onElem && frame > 4) {
                 elemBest = score;
                 elemBestCam = cam;
                 elemArmed = true;
