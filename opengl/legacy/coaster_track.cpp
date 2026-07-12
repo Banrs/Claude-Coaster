@@ -9,10 +9,9 @@ struct Track {
     // is the last writer and commits cp[n-23]; spline evaluation additionally
     // needs three following control points. Anything past maxFinalU() is draft
     // geometry and must never reach physics, rendering, carving, or workers.
-    // The terrain floor is the last geometric writer at n-23. Four additional
-    // draft points keep a connective sample private while the publication
-    // low-pass converges, so rendered geometry is genuinely immutable.
-    static constexpr int ADAPTIVE_LAG = 27;
+    // The terrain floor is the last geometric writer at n-23; publishing only
+    // through that point keeps rendered and ridden geometry immutable.
+    static constexpr int ADAPTIVE_LAG = 23;
     std::deque<Vector3>       cp;
     std::deque<Vector3>       up;
     std::deque<Vector3>       geomUp;
@@ -92,7 +91,7 @@ struct Track {
     // force-ends an element (remain->1) or a boost is truncated, connLatch is armed so nextMode hands
     // to exactly ONE latched FLAT transition (>= MIN_CONN cps, smoothed terrain-follow) instead of
     // re-entering the scheduler and flipping modes every 1-2 cps.
-    static const int MIN_CONN = 4;   // 4 cps ~= 56 m
+    static const int MIN_CONN = 6;   // 6 cps ~= 84 m: enough room to unwind high-speed slope and bank continuously
     int     connLatch = 0;   // >0: the NEXT nextMode() emits the single latched FLAT transition
     int     flatRun = 0;     // consecutive committed M_FLAT cps so far (0-based): gates the FLAT->CLIMB wall reroute so a connective FLAT never converts before it has run MIN_CONN cps (no 1-3 cp FLAT stub)
     float   rollPh = 0.0f;   // phase of the gentle connective-track swell (M_FLAT/M_TURN undulation)
@@ -174,6 +173,7 @@ struct Track {
 
     // V1 closed-form cliff-dive state.
     int     cdPhase = 0;                 // 0 crest arc, 1 near-vertical face, 2 pullout arc
+    int     cdFaceN = 0;                 // guarantees the signature face remains visible at high launch speeds
     int     cdPulloutN = 0;             // steps taken in the pullout arc -- ramps the curvature in (clothoid) so the straight-face->arc junction is not an instant 1/Rp step
     static constexpr float CD_FACE_P = -88.0f * DEG2RAD;
     static constexpr float CD_HANDOFF_P = -35.0f * DEG2RAD;
@@ -501,9 +501,9 @@ struct Track {
         setClearance(10.0f, 24.0f);
 
         pushCP(gpos, WUP, (unsigned char)M_LAUNCH, 0, WUP, true);
-        // A 1.5x Formula Rossa profile needs about 245 m to accelerate from
-        // rest while retaining the real 4.9 s launch time.
-        for (int i = 0; i < 19; i++) {
+        // The 2x Do-Dodonpa profile needs about 77 m from the rolling start;
+        // seven spans provide the launch plus a small transition margin.
+        for (int i = 0; i < 7; i++) {
             gpos.x += sinf(gyaw) * SEG_LEN;
             gpos.z += cosf(gyaw) * SEG_LEN;
             pushCP(gpos, WUP, (unsigned char)M_LAUNCH, 0, WUP, true);
@@ -812,7 +812,7 @@ struct Track {
         cliffDone = false; hardInvCount = 0;   // signature dive + inversion budget re-arm each lap
         invBudget = irnd(2, 4); quotaMet = 0;   // spec occurrence rules: 2-4 inversions/lap, quota families unmet
         setClearance(10.0f, 36.0f);
-        mode = M_LAUNCH; remain = irnd(18, 22);  // 252-308 m: 1.5x Formula Rossa distance, real 4.9 s timing
+        mode = M_LAUNCH; remain = irnd(6, 8);  // 84-112 m: rolling 43->360 km/h needs about 77 m at 2x Do-Dodonpa acceleration
         // M_LAUNCH rides dead flat (dy is always 0.0f in stepGeneric -- a real LSM launch track
         // can't tilt), so unlike every other mode it has NO per-step terrain reaction once started.
         // This path is taken straight from whatever element/mode was running when elemLimit hit, with
@@ -845,7 +845,7 @@ struct Track {
         mode = M_BOOST;
         invSlotUsed = 0;   // re-powered: the next run-down window may go to inversions again
         boostCool = 3;   // no re-power for the next 3 element slots (see nextMode): the ride runs a real discharge arc between boosts instead of a dead-flat straight every ~14 s (measured 36 boosts/ride -> ~1/2 of that; real coasters have 1-3 mid-course boosts total)
-        remain = irnd(8, 12);   // ~112-168 m, ~2-3 s: FEWER but LONGER powered segments (Falcon's Flight's three long LSM stretches), recharging enough per boost that the cooldown doesn't sag the ride average
+        remain = irnd(4, 6);  // 56-84 m: rolling 144->360 km/h needs about 53 m at 2x Do-Dodonpa acceleration
         // INCLINED LSM (~45% of boosts): grade follows the terrain rise over the boost's own
         // footprint (clamped +4-8 deg). No thrust-model change is needed anywhere: both the ride
         // sim and genV integrate the real geometry, so the climb's energy cost stays consistent
@@ -2211,6 +2211,13 @@ struct Track {
                     float s = t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
                     dy = connDyStart + (entryDyFor(pendingPick) - connDyStart) * s;
                 }
+                // A plain connective entered directly from a descent has no
+                // pre-picked profile. Preserve and geometrically taper that
+                // incoming tangent instead of snapping to the near-level
+                // terrain target and manufacturing a flat-bottomed valley.
+                float incomingDy = cp.size() >= 2 ? cp.back().y - cp[cp.size() - 2].y : genPrevDy;
+                if (connLen == 0 && flatRun < MIN_CONN && incomingDy < -0.3f)
+                    dy = fminf(dy, incomingDy * 0.60f);
                 break;
             }
             case M_TURN: {
@@ -2768,9 +2775,13 @@ struct Track {
         // The analytic approach ends level at its qualified rim. The crest arc
         // therefore starts level and sweeps continuously into the dive face.
         cdPitch = atan2f(fmaxf(genPrevDy, 0.0f), SEG_LEN);
-        cdPhase = 0; cdPulloutN = 0;
+        cdPhase = 0; cdFaceN = 0; cdPulloutN = 0;
         mode    = M_CLIFFDIVE;
-        cdRc    = fmaxf(30.0f, genV * genV / (GRAV * 6.3f));
+        // At the 360 km/h game target, a purely force-derived radius would consume
+        // the entire 275 m drop before leaving any straight cliff face. Preserve the
+        // authored signature within its height envelope; this is intentionally a
+        // game-scale element paired with the intentionally super-real launch.
+        cdRc    = Clamp(genV * genV / (GRAV * 6.3f), 30.0f, 92.0f);
         // Valley target: natural ground ~85 m ahead (clear of the near-vertical face + the pullout footprint).
         float fx = gpos.x + sinf(cdYaw) * 85.0f, fz = gpos.z + cosf(cdYaw) * 85.0f;
         cdValleyY = groundTopAt(fx, fz) + 4.0f;
@@ -2785,7 +2796,7 @@ struct Track {
         float apexY = gpos.y + cdRc * (1.0f - cosf(cdPitch));
         cdValleyY = fmaxf(cdValleyY, apexY - 275.0f);   // MAX total dive drop ~275 m (user: crest-to-valley 250-275, keep the >=150 floor + 85 deg face); start the pullout higher where a deeper valley would exceed it
         float vb2 = genV * genV + 2.0f * GRAV * fmaxf(apexY - cdValleyY, 0.0f);   // bottom-of-face speed^2 (drag ignored: conservative)
-        cdRp = fmaxf(48.0f, vb2 / (GRAV * 11.0f));
+        cdRp = Clamp(vb2 / (GRAV * 11.0f), 48.0f, 100.0f);
         cdPulloutStartY = cdValleyY + cdRp * (1.0f - cosf(CD_FACE_P));   // start the pullout this high so its arc (from the ~88 deg face) bottoms out right at valleyY
         remain = 200;                      // generous guard; the phase machine ends the element via enterDrop
         if (getenv("MC_CLIFFDBG"))
@@ -2801,7 +2812,8 @@ struct Track {
             if (cdPitch <= faceP) { cdPitch = faceP; cdPhase = 1; }
         } else if (cdPhase == 1) {               // straight near-vertical face
             cdPitch = faceP;
-            if (gpos.y <= cdPulloutStartY) cdPhase = 2;
+            cdFaceN++;
+            if (cdFaceN >= 5 && gpos.y <= cdPulloutStartY) cdPhase = 2;
         } else {                                 // pullout arc: pitch faceP -> 0, clothoid curvature ramp-in
             cdPulloutN++;
             float ramp = fminf(1.0f, (float)cdPulloutN / 3.0f);   // 0 -> 1/Rp over ~3 cps: no instant 1/Rp step at the straight-face -> arc seam
@@ -3250,22 +3262,6 @@ struct Track {
                         if (kinkw > 0.0f)
                             cp[i].y += (0.5f * (cp[i - 1].y + cp[i + 1].y) - cp[i].y) * kinkw;
                     }
-                }
-            }
-        }
-
-        // Publication-stage low-pass for ordinary connective flats. Each point
-        // crosses this five-point window after the terrain floor and receives
-        // five converging passes before ADAPTIVE_LAG exposes it. Authored
-        // transitions and operational alignments retain their exact geometry.
-        if ((int)cp.size() >= ADAPTIVE_LAG) {
-            int first = (int)cp.size() - ADAPTIVE_LAG;
-            int last  = (int)cp.size() - 23;
-            for (int i = first; i <= last; ++i) {
-                if (i >= 1 && i + 1 < (int)cp.size() && kind[i] == M_FLAT &&
-                    !authoredf[i] && !alignmentf[i]) {
-                    float filtered = 0.25f*cp[i-1].y + 0.50f*cp[i].y + 0.25f*cp[i+1].y;
-                    cp[i].y = fmaxf(filtered, groundTopAt(cp[i].x, cp[i].z) - 18.0f);
                 }
             }
         }

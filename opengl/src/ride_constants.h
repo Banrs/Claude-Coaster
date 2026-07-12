@@ -13,24 +13,20 @@ static const float MAX_V     = 82.0f;
 static const float CLIMB_V   = 27.0f;
 static const float V_GUARD   =  6.0f;
 
-// Launch pacing is scaled from measured real launch-coaster profiles. Formula
-// Rossa's hydraulic launch reaches 240 km/h in 4.9 s; Red Force's LSM reaches
-// 180 km/h in 5.0 s. Applying the same 1.5x multiplier to speed and net
-// acceleration preserves their real transit times while raising the game's
-// energy scale. Falcon's Flight's 150 km/h cliff LSM uses the same speed scale.
-static constexpr float LAUNCH_SPEED_MUL = 1.50f;
-static constexpr float LAUNCH_ACCEL_MUL = 1.50f;
+// Launch pacing uses the fastest recorded coaster acceleration as its baseline:
+// Do-Dodonpa reached 180 km/h in 1.56 s. V1 doubles both that average net
+// acceleration and its launch speed, producing 0-360 km/h in the same 1.56 s.
+// Every powered launch type converges on that common target; grade and rolling
+// entry speed determine the time and distance each one needs.
+static constexpr float LAUNCH_ACCEL_MUL = 2.00f;
 
-static constexpr float HYDRAULIC_REF_V     = 240.0f / 3.6f;
-static constexpr float HYDRAULIC_REF_TIME  = 4.90f;
-static constexpr float HYDRAULIC_REF_ACCEL = HYDRAULIC_REF_V / HYDRAULIC_REF_TIME;
-static constexpr float LAUNCH_V             = HYDRAULIC_REF_V * LAUNCH_SPEED_MUL;
-static constexpr float LAUNCH_ACCEL         = HYDRAULIC_REF_ACCEL * LAUNCH_ACCEL_MUL;
+static constexpr float FASTEST_ACCEL_REF_V    = 180.0f / 3.6f;
+static constexpr float FASTEST_ACCEL_REF_TIME = 1.56f;
+static constexpr float FASTEST_ACCEL_REF      = FASTEST_ACCEL_REF_V / FASTEST_ACCEL_REF_TIME;
+static constexpr float LAUNCH_V             = 360.0f / 3.6f;
+static constexpr float LAUNCH_ACCEL         = FASTEST_ACCEL_REF * LAUNCH_ACCEL_MUL;
 
-static constexpr float LSM_REF_V       = 180.0f / 3.6f;
-static constexpr float LSM_REF_TIME    = 5.00f;
-static constexpr float LSM_REF_ACCEL   = LSM_REF_V / LSM_REF_TIME;
-static constexpr float BOOST_V         = LSM_REF_V * LAUNCH_SPEED_MUL;
-static constexpr float BOOST_ACCEL     = LSM_REF_ACCEL * LAUNCH_ACCEL_MUL;
-static constexpr float CLIFF_LSM_V     = (150.0f / 3.6f) * LAUNCH_SPEED_MUL;
+static constexpr float BOOST_V         = 360.0f / 3.6f;
+static constexpr float BOOST_ACCEL     = FASTEST_ACCEL_REF * LAUNCH_ACCEL_MUL;
+static constexpr float CLIFF_LSM_V     = 360.0f / 3.6f;
 static float           BOOST_TRIG      = 58.0f;

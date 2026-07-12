@@ -75,10 +75,9 @@ int main(int argc, char **argv) {
         };
         bool ok = true;
         printf("=== launch pacing audit ===\n");
-        printf("reference hydraulic: Formula Rossa 0-240 km/h in 4.90 s\n");
-        printf("reference LSM:       Red Force 0-180 km/h in 5.00 s\n");
-        printf("multipliers: speed=%.2fx net-acceleration=%.2fx\n",
-               LAUNCH_SPEED_MUL, LAUNCH_ACCEL_MUL);
+        printf("acceleration reference: Do-Dodonpa 0-180 km/h in 1.56 s\n");
+        printf("game target: all powered launches converge on 360 km/h\n");
+        printf("fastest-launch net-acceleration multiplier: %.2fx\n", LAUNCH_ACCEL_MUL);
         for (const LaunchProbe &p : probes) {
             const float dt = 1.0f / 600.0f;
             float v = p.startV, t = 0.0f, distance = 0.0f;
