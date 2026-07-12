@@ -614,6 +614,7 @@ int main(int argc, char **argv) {
     Track trk;
     trk.reset();
     float captureStartU = 0.5f;
+    float captureJointU = -1.0f;
     if (captureShot && getenv("MC_CAPTURE_FAST")) {
         trk.ensureFinalizedAhead(520.0f);
         if (elemShot) {
@@ -650,6 +651,7 @@ int main(int argc, char **argv) {
                     if (clearance > bestClearance) {
                         bestClearance = clearance;
                         captureStartU = fmaxf(0.5f, q - 1.0f);
+                        captureJointU = q + 0.125f;
                     }
                 }
             }
@@ -1192,7 +1194,10 @@ int main(int argc, char **argv) {
             if (elemArmed) cam = elemBestCam;
         }
         if (jointShot) {
-            for (float q = u - 1.0f; !jointArmed && q <= u + 8.0f; q += 0.25f) {
+            bool fastJoint = getenv("MC_CAPTURE_FAST") && captureJointU >= 0.0f;
+            float searchFirst = fastJoint ? captureJointU - 0.125f : u - 1.0f;
+            float searchLast  = fastJoint ? searchFirst : u + 8.0f;
+            for (float q = searchFirst; !jointArmed && q <= searchLast; q += 0.25f) {
                 unsigned char a = trk.tagAt(q), b = trk.tagAt(q + 0.25f);
                 bool fromMatch = jointFrom == -2 || a == (unsigned char)jointFrom;
                 bool toMatch   = jointTo   == -2 || b == (unsigned char)jointTo;
