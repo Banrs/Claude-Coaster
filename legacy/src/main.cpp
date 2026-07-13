@@ -2,18 +2,18 @@
 // in dependency order (this project has no headers besides ride_constants.h), then
 // defines main() itself. See each file for its own contents; this file only owns the
 // game loop (main()) which is too stateful (dozens of [&]-capturing lambdas) to split
-// further without a larger restructure -- see opengl/COASTER_REWRITE.md.
+// further without a larger restructure.
 #include "game_state.cpp"
 #include "environment.cpp"
 #include "render_fx.cpp"
 #include "voxel_render.cpp"
 #include "spline.cpp"
-#include "../legacy/coaster_track.cpp"
+#include "../v1/coaster_track.cpp"
 #include "track_render_cache.cpp"
 #include "coaster_car.cpp"
 #include "presentation.cpp"
 #include "pathtrace.cpp"
-#include "../legacy/audit_diagnostics.cpp"
+#include "../v1/audit_diagnostics.cpp"
 #include "v1_geometry_audit.cpp"
 
 int main(int argc, char **argv) {

@@ -1,15 +1,11 @@
 build/
-**/vendor/
 minecoaster
-minecoaster_orbit
-src/vk/minecoaster_vk
 .claude/
 *.png
 *.o
-track.txt
 .DS_Store
-opengl/profile_seed*.svg
-opengl/audit/
+legacy/profile_seed*.svg
+legacy/audit/
 
-# stray coaster build copies (e.g. minecoaster_cliff, minecoaster_dump)
-opengl/minecoaster_*
+# Stray local coaster binaries.
+legacy/minecoaster_*
