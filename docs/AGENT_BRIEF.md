@@ -44,6 +44,17 @@ max of either), each type within **0.5×–2×** of that average.
 
 ## What's wrong right now (observed symptoms — diagnose the causes yourself)
 
+**Flow (make it feel like a real roller-coaster)**
+- The single most important goal: the ride must *flow* like a genuine roller-coaster — one
+  continuously-shaped, energy-driven path, not a sequence of disjoint pieces bolted together.
+- Concrete tells of the broken flow: rare **random flat segments** appear where the track should be
+  continuously curving, and there's a **flat spot on top of the Immelmann** (and likely other
+  elements) where the real geometry is a continuous arc. Real coaster elements and the transitions
+  between them have specific, continuously-curved shapes with no dead-flat interruptions.
+- **Map each element's real geometry properly** — its true profile, radii, banking, and how it
+  enters and leaves — using web research (see the research rule below), so the flow reads as a real
+  ride.
+
 **Ride composition / realism**
 - Far too many banked turns, and they frequently chain back-to-back.
 - Airtime hills are far too rare.
@@ -84,6 +95,25 @@ max of either), each type within **0.5×–2×** of that average.
   frame rate at record speed with long sightlines.
 
 ---
+
+## Research discipline — don't guess
+
+**Do not blindly guess.** If you are not *almost fully confident* about an element's real geometry, a
+transition/flow shape, a real-world dimension, a force target, or how a real coaster is laid out,
+**look it up before you write code.** A web-grounded answer beats a plausible-sounding guess every
+time, and wrong geometry is the whole problem here.
+
+Use, as concepts and reference (not code to copy — honor the licenses noted in
+`docs/GEOMETRY_REFERENCES.md`; no GPL code copied):
+- **Manufacturer sources** — Intamin, Bolliger & Mabillard (B&M), Mack Rides, Vekoma, etc.: their
+  element geometry, dimensions, and design language.
+- **Enthusiast / factual sources** — RCDB, coaster forums and communities, POV analyses, teardown
+  write-ups: real radii, heights, banking, inversion shapes, and how elements actually flow.
+- **Coaster track-design tools and guidance** — openFVD / FVD++ and similar force-vector and
+  track-design references for how to build heartlined, energy- and gravity-aware geometry and
+  continuous transitions (clothoids, rotation-minimizing frames, authored roll/force profiles).
+
+When you make a geometry or flow decision, be able to point to the real-world basis for it.
 
 ## Reference facts you can rely on (not solutions — just true things)
 
