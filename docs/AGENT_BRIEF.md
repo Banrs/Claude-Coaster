@@ -143,7 +143,7 @@ When you make a geometry or flow decision, be able to point to the real-world ba
   the general grade cap is 65°; the recovery drop reaches 67°. For comparison, a real dive-coaster
   drop is ~95° (beyond vertical) — relevant only if a true dive element is wanted; a top hat at 65°
   is realistic.
-- Corkscrew reference geometry: one 360° revolution, ~60° helix pitch, ~6.6 m reference radius
+- Corkscrew reference geometry: one or two 360° revolution, ~60° helix pitch, ~6.6 m reference radius
   (details and citations in `docs/GEOMETRY_REFERENCES.md`).
 
 ---
