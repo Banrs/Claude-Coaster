@@ -34,6 +34,43 @@ few elements in** and never finishes the ride.
   to **360 km/h** at 1.5× Do-Dodonpa accel (`src/ride_constants.h:22-38`, `--launchaudit` PASSes),
   record dimensions capped at 1.0–1.5× (`RECORD_SCALE_CAP=1.50`, `v1/coaster_track.cpp:18`).
 
+## Progress log (2026-07-19 session)
+
+- **ROOT STALL FIXED.** The post-top-hat scheduler exhaustion is resolved (commit "Fix
+  post-top-hat scheduler exhaustion"). Two root causes fixed in `v1/coaster_track.cpp`:
+  (1) `pickElement` treated the energy-arc phase / family-variety / no-repeat filters as HARD gates
+  that could empty the successor pool — now they are relaxed in order when the strict pool is empty,
+  the hard entry-speed/terrain/geometry windows always apply; (2) `resolveBoundary` had no guaranteed
+  continuation — added `escapeForward` / `commitEscapeArc` (curvature-resetting, non-descending,
+  terrain-lifting connectors + curving escape arcs), hard-bounded per lap so a hostile corridor forces
+  a launch/lap-close instead of streaming forever. **Census 8-seed: 7/8 complete all 3 laps** (was
+  0/8); inversions LOOP/ROLL/IMMEL/STALL all generate; `--forceaudit` avg ~233 / peak 360 km/h,
+  generation-continuity failures=0.
+- **Inversions confirmed generating** (ROLL/LOOP/IMMEL/STALL in the census mix).
+- **Element count verified** (see the element-count section below): 13–17/lap ≈ ~310 m/feature is
+  realistic; "300 elements" was a control-point misreport. Done.
+- **Corkscrew (M_ROLL) 16.8 g "lateral" is an AUDIT ARTIFACT, not geometry.** Direct dump: the
+  authored corkscrew is a correct cylindrical barrel (y 22→37.6→22) whose rider frame rolls 360° and
+  inverts at the top. `--jointaudit` confirms the finalized rail is continuous (centre gaps ~0.004 m,
+  rolling frame, gauge 1.100). `--forceaudit` misreads the inverted frame as upright and projects the
+  ~10 g radial load onto lateral. Corkscrew geometry/render is fine — verify in-game. (Implication:
+  `--forceaudit` g figures for INVERTING elements are unreliable; non-inverting spikes like M_TURN
+  +12 g may still be real.)
+
+### Still open (this session did not get to these)
+- **seed4** (1/8) still stalls at ~356 km/h near-peak, post-launch, buried — escapes are force-limited
+  at near-peak speed. Investigate why the post-launch top hat doesn't fire there.
+- **M_HILLS frequency is 0.6 %** (2/314) — the straight airtime-hill chain barely appears; its entry
+  window [196–240 km/h] + 60 m clearance gate is too tight vs cruise. BANKAIR/WAVE fill the airtime
+  role instead. Widen so the signature decreasing-hill chain generates; add an explicit crest-g target.
+- **M_TURN / M_DIVE +12 g vertical** entry spikes (possibly real — non-inverting, so not the audit
+  artifact above).
+- **Top-hat drop** returns to entry level (`beginTopHat` sets endHeight=startHeight); make the drop
+  side dive ~200 m toward terrain.
+- **`--forceaudit` frame sampling** for inverting elements (rework to use authored per-sample
+  derivatives so the g-audit is trustworthy).
+- Visuals (voxel/futuristic).
+
 ## THE ROOT BUG (fix this first — everything else cascades from it)
 
 Generation **exhausts the scheduler 2–4 elements after the opening top hat**. Path: `reset()`
@@ -107,6 +144,26 @@ expected count from real data:
 
 The question to answer explicitly: **is 13–17 the same elements-per-unit-track as real life once
 the size multiplier is applied — or is the count (or the unit) wrong?**
+
+### ANSWERED (2026-07-19, measured on the live binary)
+
+Measured generated **launch-to-launch lap arc length = 4.0–5.7 km** (mean ~4.6 km) at
+**13–17 features/lap** ⇒ **~310 m of track per feature** (range 286–341 m; census `LAPARC` probe,
+8 seeds).
+
+- **Real-world density:** Steel Vengeance ~117 m/element (1.75 km, ~15 named), Millennium Force
+  ~170–200 m/element (2.01 km, ~10–12), Falcon's Flight ~215–290 m/element (4.33 km, ~15–20). Real
+  giga/speed layouts sit at **~170–290 m/element**; feature-dense woodies are denser (~120 m).
+- **Adjust for our multipliers:** a named element's *arc length* scales with SIZE not speed (a loop
+  at 1.25× radius has 1.25× arc), so element arcs are ~1.25× real. The INTER-element track
+  (transitions, launch decks, ground-hug runs) scales with SPEED — at ~2× speed transitions must be
+  markedly longer to hold the same g/jerk. Both push m/feature up.
+- **Verdict:** **~310 m/feature and 13–17 features/lap is realistic** for a 1.0–1.5×-size, ~2×-speed
+  giga — landing just above Falcon's Flight's ~215–290 m/element, as the size+speed scaling predicts.
+  It is arguably *slightly sparse* (a denser layout could justify ~18–20/lap), but not wrong.
+- **The "300 elements" WAS a unit misreport:** a 4.6 km lap at the 14 m control-point spacing is
+  ~330 control points. "300" counted control-points/samples, never elements. Real element count per
+  lap is 13–17. Confirmed.
 
 ## Goals, in order
 
