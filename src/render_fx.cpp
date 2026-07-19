@@ -291,9 +291,20 @@ static const char *DEPTH_FS =
     "#version 330\n"
     "void main(){}\n";
 
-static constexpr float SHADOW_RADIUS = 256.0f;
+// Raised from 256 -- the shadow volume was anchored tightly to the car/player
+// and went completely unshadowed past this radius (visible as flat-lit terrain
+// whenever the camera pulled back far enough to see past it, e.g. orbit/free-cam).
+// SHADOW_CULL_RADIUS is derived from this so the depth-pass draw-distance cull
+// stays in sync automatically. Bigger radius spreads the same texel budget over
+// more world space (softer shadow edges); SHADOW_MAP_SIZE below is raised to
+// compensate.
+static constexpr float SHADOW_RADIUS = 480.0f;
 static constexpr float SHADOW_CULL_RADIUS = SHADOW_RADIUS * 1.42f + 15.0f;
-static constexpr int SHADOW_MAP_SIZE = 2048;
+// Was 2048. Doubled to keep world-units-per-texel roughly where it was after
+// SHADOW_RADIUS grew (256->480, ~1.9x); ShadowSys::init() clamps this at runtime
+// against GL_MAX_TEXTURE_SIZE, so on any GPU that can't take a 4096 depth texture
+// this quietly falls back to the largest size it can, rather than failing.
+static constexpr int SHADOW_MAP_SIZE = 4096;
 
 struct ShadowSys {
     Shader lit{}, depth{};
@@ -333,12 +344,30 @@ struct ShadowSys {
         locRailUVRange = GetShaderLocation(lit, "railUVRange");
         locMetalUVRange = GetShaderLocation(lit, "metalUVRange");
         locLegacyTonemap = GetShaderLocation(lit, "legacyTonemap");
+        // Defensive clamp: SHADOW_MAP_SIZE (4096) is a safe size on effectively
+        // all desktop GL 3.3 hardware, but this can't be build/run-tested here,
+        // so ask the driver rather than assume. Falls back to whatever the GPU
+        // actually supports instead of creating an oversized/invalid texture.
+        GLint maxTex = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTex);
+        if (maxTex > 0 && SM > maxTex) SM = maxTex;
         fbo = rlLoadFramebuffer();
         rlEnableFramebuffer(fbo);
         depthTex = rlLoadTextureDepth(SM, SM, false);
         rlFramebufferAttach(fbo, depthTex, RL_ATTACHMENT_DEPTH, RL_ATTACHMENT_TEXTURE2D, 0);
+        // A depth-ONLY FBO (no colour attachment) is INCOMPLETE on strict GL
+        // drivers unless the colour draw/read buffers are explicitly disabled.
+        // Without this the shadow map silently never renders, so the terrain gets
+        // ambient-only light and reads as uniformly, slightly dim with no shadows
+        // at all.  raylib does not set these for us, so do it here.
+        glDrawBuffer(GL_NONE);
+        glReadBuffer(GL_NONE);
         if (!rlFramebufferComplete(fbo)) TraceLog(LOG_WARNING, "SHADOW: framebuffer is incomplete");
         rlDisableFramebuffer();
+        // Restore the default framebuffer's colour buffers so the main scene
+        // passes are unaffected by the NONE draw/read state set above.
+        glDrawBuffer(GL_BACK);
+        glReadBuffer(GL_BACK);
     }
 
     // Build the one ground-anchored light volume.

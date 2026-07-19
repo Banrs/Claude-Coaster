@@ -2851,10 +2851,19 @@ int main(int argc, char **argv) {
         };
 
         // Ground-anchor the single shadow volume so tall elements preserve terrain coverage.
+        // The 256->480 unit volume is still finite, so when the camera pulls far from the car
+        // (orbit / free-cam / photo modes) blend the shadow focus toward what the camera is
+        // actually looking at, otherwise distant terrain falls outside the map and reads unshadowed.
         {
             const float SHADOW_FOCUS_LIFT = 45.0f;
-            float groundY = groundTopAt(P.x, P.z);
-            Vector3 shadowAnchor = { P.x, fminf(P.y, groundY + SHADOW_FOCUS_LIFT), P.z };
+            const float CAM_BLEND_NEAR = 40.0f;
+            const float CAM_BLEND_FAR  = 160.0f;
+            float camDist = Vector3Distance(P, cam.target);
+            float camBlend = Clamp((camDist - CAM_BLEND_NEAR) /
+                                   (CAM_BLEND_FAR - CAM_BLEND_NEAR), 0.0f, 1.0f);
+            Vector3 focusPt = Vector3Lerp(P, cam.target, camBlend);
+            float groundY = groundTopAt(focusPt.x, focusPt.z);
+            Vector3 shadowAnchor = { focusPt.x, fminf(focusPt.y, groundY + SHADOW_FOCUS_LIFT), focusPt.z };
             gShadow.computeLightVP(shadowAnchor);
         }
         BeginDrawing();

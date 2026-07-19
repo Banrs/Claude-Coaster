@@ -5,6 +5,71 @@ Self-contained brief for continuing this work (incl. in a fresh / online session
 verified with `lldb` against the live binary (not just static reading) — trust it over the raw
 audit output, which misreports (see "audit caveat").
 
+## Ride spec — authoritative multipliers (do not re-derive)
+
+Arcade feel on a **real-world record-breaking** grounding. Every element is sized/paced from a real
+reference, then scaled by these multipliers, and the *relative* relations (radii, element durations,
+entry/exit speeds, spacing) should still roughly follow real-life proportions per element:
+
+- **Speed:** ~**240 km/h average**, **360 km/h peak** (~2× Falcon's Flight). So ~200 km/h is *below
+  average* cruising speed — NOT "very high speed". Elements must run cleanly across this whole band;
+  a stall at 190–230 km/h is a geometry/terrain bug, never a "too fast" symptom.
+- **Size:** **1.0–1.5× world-record** dimensions (`RECORD_SCALE_CAP = 1.50`).
+- **G-forces:** ~**2× the real element's** peak, per element (overall envelope ≈ **+12 / −6 g**).
+- **Proportions:** radius, duration, and repetition per element follow the real reference (e.g. a
+  corkscrew's real revolution count), then scale uniformly by the one 1.0–1.5× λ.
+
+## Terrain + organic-placement design direction (user, 2026-07-19)
+
+Terrain stays **dramatic** — the inspiration is **Falcon's Flight's cliff** (a big cliff drop and a lot
+of terrain variation), up to ~195 m+ with our scaling multipliers. Do NOT flatten it. Tunnels/cuts are
+fine but **shallow and occasional**, not deep or frequent.
+
+The organic fix therefore is NOT "reduce terrain" — it is "make the coaster **work with** the terrain
+like Falcon's Flight does": LAUNCH up rising ground (powered, rate-capped), DIVE where the ground falls
+away (the signature cliff drop), follow the variation — and **stop burying exits in deep cuts**. Root
+cause of the current stalls/fallbacks: descending elements are allowed to bury their exit up to
+`TERRAIN_CUT_TOLERANCE=18 m` into RISING terrain, from which nothing continues. The clean fix is
+terrain-aware placement: a descending element (drop/dive/desc-helix) may only commit where the terrain
+ahead falls away or stays level; where terrain rises, the scheduler climbs under power instead. Then
+cut tolerance can drop toward shallow (real) values, low F2291 clearance works, the airtime-hill
+frequency recovers (hills stop being terrain-blocked), and escapes/fallbacks fall toward zero — all
+from the one root fix. This needs in-game iteration (the terrain↔coaster fit is visual).
+
+## Real-life calibration targets (researched 2026-07-19; basis: Falcon's Flight + Tormenta)
+
+**Clearance — use ASTM F2291 (envelope-based, NOT a fixed floor).** F2291 has no fixed
+ground-clearance minimum: clearance is the patron reach envelope + 3 in (76 mm), which tapers to
+nearly nothing at foot height (legs are restraint-contained). Near grade, real coasters (RMC
+trenches/stalls) legitimately run **inches to ~1 ft (0.1–0.3 m)** above ground; practical
+structural/drainage margin in ordinary sections is **~1–2 m**, NOT a hard code value. Our old 4 m
+deck floor is 15–30× too conservative, and the track floats **mean 13–18 m, 15–26 % of points >30 m**
+above ground (measured) — that is the "weirdly high ground sections". Target: hug ground at ~1.5–2 m
+in ordinary/connector sections, rising only for authored elements.
+
+**Per-element frequency targets = the AVERAGE of the two references** (user directive: average, don't
+lean to either archetype; keep a FEW corkscrews and other fun modern-record-breaker elements). 0.5–2×
+tolerance:
+
+| Element | Falcon's Flight | Tormenta | **AVG target** | Our current |
+|---|---|---|---|---|
+| Airtime hills | 28–32 % | 0 % | **~15 %** | 3 % (terrain-blocked — the big gap) |
+| Banked turns | 35–40 % | 15–17 % | **~26 %** | 26 % ✓ |
+| Inversions total | 0 % | 33–38 % | **~18 %** (Immel-heavy) | ~14 % |
+| — Corkscrew | 0 % | 0 % | **~2–3 %** ("a few", occasionally doubled) | ~6 % |
+| — Immelmann / loop | 0 % | ~24 / ~8 % | **~12 % / ~4 %** | ~4 % / ~4 % |
+| Drops | 10–12 % | 15–17 % | **~13 %** | ~4 % (low) |
+| Launches | 16–18 % | 0 % | **~8 %** | (CLIMB 14%) |
+| DIP (splashdown) | — | — | **~2–5 %** | **17 % (way over — crowding out hills)** |
+
+Corkscrews are rare-but-present (keep a few, sometimes double). DIP is badly over-represented because
+hills can't fit the terrain, so the airtime/filler slots fall to DIP — fix hills organically and DIP
+drops. Element density AVG ~4.3–9.8/km (ours ~3.2/km, slightly sparse).
+
+**Fallbacks must be organic-rare.** Target total fallback rate (terminal escapes + single-element
+fallbacks + pool relaxations) **≤ ~1 per 10 seeds**. Fix the ROOT placement causes (clearance, element
+sizing) rather than papering over with escapes/relaxation.
+
 ## Mission
 
 Make the procedural generator produce a **complete, intense, record-breaking** ride every time.
@@ -19,6 +84,74 @@ few elements in** and never finishes the ride.
 - **The spec is already correct:** g envelope enforced at `+12 / −6.5 g` (`src/main.cpp:770`), launches
   to **360 km/h** at 1.5× Do-Dodonpa accel (`src/ride_constants.h:22-38`, `--launchaudit` PASSes),
   record dimensions capped at 1.0–1.5× (`RECORD_SCALE_CAP=1.50`, `v1/coaster_track.cpp:18`).
+
+## Progress log (2026-07-19 session)
+
+- **ROOT STALL FIXED.** The post-top-hat scheduler exhaustion is resolved (commit "Fix
+  post-top-hat scheduler exhaustion"). Two root causes fixed in `v1/coaster_track.cpp`:
+  (1) `pickElement` treated the energy-arc phase / family-variety / no-repeat filters as HARD gates
+  that could empty the successor pool — now they are relaxed in order when the strict pool is empty,
+  the hard entry-speed/terrain/geometry windows always apply; (2) `resolveBoundary` had no guaranteed
+  continuation — added `escapeForward` / `commitEscapeArc` (curvature-resetting, non-descending,
+  terrain-lifting connectors + curving escape arcs), hard-bounded per lap so a hostile corridor forces
+  a launch/lap-close instead of streaming forever. **Census 8-seed: 7/8 complete all 3 laps** (was
+  0/8); inversions LOOP/ROLL/IMMEL/STALL all generate; `--forceaudit` avg ~233 / peak 360 km/h,
+  generation-continuity failures=0.
+- **Inversions confirmed generating** (ROLL/LOOP/IMMEL/STALL in the census mix).
+- **Element count verified** (see the element-count section below): 13–17/lap ≈ ~310 m/feature is
+  realistic; "300 elements" was a control-point misreport. Done.
+- **Corkscrew (M_ROLL) 16.8 g "lateral" is an AUDIT ARTIFACT, not geometry.** Direct dump: the
+  authored corkscrew is a correct cylindrical barrel (y 22→37.6→22) whose rider frame rolls 360° and
+  inverts at the top. `--jointaudit` confirms the finalized rail is continuous (centre gaps ~0.004 m,
+  rolling frame, gauge 1.100). `--forceaudit` misreads the inverted frame as upright and projects the
+  ~10 g radial load onto lateral. Corkscrew geometry/render is fine — verify in-game. (Implication:
+  `--forceaudit` g figures for INVERTING elements are unreliable; non-inverting spikes like M_TURN
+  +12 g may still be real.)
+
+### Per-element geometry checks (2026-07-19)
+- **Corkscrew revolution count is correct.** A real corkscrew rotates 360° = ONE revolution per
+  element; "double corkscrews" are two *consecutive* corkscrew elements (Coasterpedia / Wikipedia),
+  not one element with two turns. V1's `initRoll` does exactly one revolution — real-life-accurate.
+  (Optional future set-piece: chain two M_ROLL for a signature double corkscrew, since they're
+  "often found in pairs".) Helix `HELIX_RECORD_REVS=1.625..1.725` and loop/Immelmann = 1 inversion
+  are all in the realistic range.
+- **Roll smoothing — where the roll-accel spikes are.** `--jointaudit` roll-ACCELERATION exceeds the
+  5.5 deg/m² limit on ~half of 8 seeds (up to 10.5). Located every spike (MC_ROLLACC tag dump): they
+  are all at **element-boundary joints**, worst HELIX→ROLL (10.5) and DROP→HELIX (9.5), never inside a
+  run. Roll-RATE is fine (~4 deg/m ≪ 24) and the joint roll GAP is <1° — so the frames are nearly
+  continuous and the finite-difference roll-accel is partly measurement sensitivity over the tiny
+  joint distance. BUT the shoulders that ease the bank (helix `helixShoulder` = 10%, corkscrew
+  `shoulderFraction` = 0.14) are **coupled to each element's centreline construction** (they distribute
+  the yaw/phase), so lengthening them for the gentler roll feel the brief wants changes the element
+  shape and its g — it must be tuned with in-game visual confirmation (no GL in the sandbox). The
+  helix already unwinds its bank to a neutral (0°) exit via its shoulder; the abrupt part is how fast
+  that unwind happens over the last 10%. Candidate: widen the unwind shoulder and re-verify g in-game.
+
+### Still open (this session did not get to these)
+- **seed4** (1/8) still stalls at ~356 km/h near-peak, post-launch, buried — escapes are force-limited
+  at near-peak speed. Investigate why the post-launch top hat doesn't fire there.
+- **M_HILLS raised 0.6 %→1.8 %** (this session) by removing two artificial blockers: `initHills` now
+  falls back from a 2-lobe chain to a single record-scale ejector hill (half the corridor), and the
+  lobe PLAN/RAIL band got a 1.25× upper allowance (the descending-chain builder makes flanks ~7.7×
+  crown vs the reference 6.2×; the crest/crown radius that sets ejector g is still held to strict
+  1.0–1.5×). **Remaining blocker is terrain deficiency**: a ~200–320 m clear, non-rising corridor is
+  rare on the undulating low terrain the ride hugs. Raising it further means lifting the hill baseline
+  to clear the forward corridor while making the exit descend back (no net accumulation) — deferred as
+  it risks the documented "layouts accumulate to 300–400 m" regression. Still want an explicit crest-g
+  target on the chain (brief item 5).
+- **M_TURN / M_DIVE +12 g vertical** entry spikes (possibly real — non-inverting, so not the audit
+  artifact above).
+- **Top-hat drop** — `makeTopHat` (`src/v1_profiles.h:549`) HARD-REQUIRES `startHeight == endHeight`
+  (symmetric): the drop returns to entry level, and since the launch enters at grade the crest→entry
+  drop is already ~200 m. The human's "stops at ~30 m" is the drop not continuing *past* entry toward
+  the terrain floor. Two routes, both needing in-game confirmation: (a) rework `makeTopHat` to allow
+  `endHeight < startHeight` (asymmetric deep dive) — delicate, it currently rejects that; or (b) make
+  the post-top-hat recovery-dive (`enterDrop`) always carry the track down to a low terrain clearance
+  when the exit sits elevated. NOTE this is also implicated in seed4's remaining stall (a top-hat exit
+  buried at clr=-14) — a terrain-aware top-hat exit height would help both.
+- **`--forceaudit` frame sampling** for inverting elements (rework to use authored per-sample
+  derivatives so the g-audit is trustworthy).
+- Visuals (voxel/futuristic).
 
 ## THE ROOT BUG (fix this first — everything else cascades from it)
 
@@ -93,6 +226,26 @@ expected count from real data:
 
 The question to answer explicitly: **is 13–17 the same elements-per-unit-track as real life once
 the size multiplier is applied — or is the count (or the unit) wrong?**
+
+### ANSWERED (2026-07-19, measured on the live binary)
+
+Measured generated **launch-to-launch lap arc length = 4.0–5.7 km** (mean ~4.6 km) at
+**13–17 features/lap** ⇒ **~310 m of track per feature** (range 286–341 m; census `LAPARC` probe,
+8 seeds).
+
+- **Real-world density:** Steel Vengeance ~117 m/element (1.75 km, ~15 named), Millennium Force
+  ~170–200 m/element (2.01 km, ~10–12), Falcon's Flight ~215–290 m/element (4.33 km, ~15–20). Real
+  giga/speed layouts sit at **~170–290 m/element**; feature-dense woodies are denser (~120 m).
+- **Adjust for our multipliers:** a named element's *arc length* scales with SIZE not speed (a loop
+  at 1.25× radius has 1.25× arc), so element arcs are ~1.25× real. The INTER-element track
+  (transitions, launch decks, ground-hug runs) scales with SPEED — at ~2× speed transitions must be
+  markedly longer to hold the same g/jerk. Both push m/feature up.
+- **Verdict:** **~310 m/feature and 13–17 features/lap is realistic** for a 1.0–1.5×-size, ~2×-speed
+  giga — landing just above Falcon's Flight's ~215–290 m/element, as the size+speed scaling predicts.
+  It is arguably *slightly sparse* (a denser layout could justify ~18–20/lap), but not wrong.
+- **The "300 elements" WAS a unit misreport:** a 4.6 km lap at the 14 m control-point spacing is
+  ~330 control points. "300" counted control-points/samples, never elements. Real element count per
+  lap is 13–17. Confirmed.
 
 ## Goals, in order
 
