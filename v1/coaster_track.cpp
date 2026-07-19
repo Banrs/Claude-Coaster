@@ -1,8 +1,53 @@
 // Final V1 streaming generator. Whole elements own their authored geometry;
 // only connective track is adapted before it crosses the publication fence.
 #include "../src/v1_profiles.h"
+#include <cstring>
 // Shared water predicate for V1 consumers.
 static inline bool submergedGround(float groundTopY) { return groundTopY <= WATER_Y + 0.01f; }
+
+// Generation-side terrain memo.  Boundary resolution re-probes identical
+// coordinates thousands of times (trial branches, the powered-deck height
+// search, corridor scans), and every probe otherwise pays a mutexed tile
+// lookup or a cold 18-vnoise column build.  Terrain is a pure function of
+// (x, z) for a given world, so memoise exact query points; reset() bumps the
+// epoch.  Generation runs on one thread at a time (play loop or audit), so
+// the memo needs no locking; the tile store underneath stays thread-safe for
+// the terrain-mesh worker.
+struct GenTerrainMemo {
+    static constexpr uint32_t N = 1u << 17;
+    uint64_t key[N];
+    float solid[N];
+    uint32_t stamp[N];
+    uint32_t epoch = 0;
+    void clear() { ++epoch; }
+    static uint64_t pack(float x, float z) {
+        uint32_t xb, zb;
+        memcpy(&xb, &x, 4); memcpy(&zb, &z, 4);
+        return ((uint64_t)xb << 32) | zb;
+    }
+    float solidTopAt(float x, float z) {
+        const uint64_t k = pack(x, z);
+        const uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ull) >> 40) % N;
+        for (uint32_t probe = 0; probe < 8; ++probe) {
+            const uint32_t i = (h + probe) % N;
+            if (stamp[i] == epoch && key[i] == k) return solid[i];
+            if (stamp[i] != epoch) {
+                const float s = terrainSurfaceAt(x, z).solidTop;
+                key[i] = k; solid[i] = s; stamp[i] = epoch;
+                return s;
+            }
+        }
+        return terrainSurfaceAt(x, z).solidTop;
+    }
+};
+static GenTerrainMemo gGenTerrain;
+static inline TerrainSurface genTerrainSurfaceAt(float x, float z) {
+    const float solid = gGenTerrain.solidTopAt(x, z);
+    return {solid, WATER_Y, isNaturalWaterTop(solid)};
+}
+static inline float genGroundTopAt(float x, float z) {
+    return genTerrainSurfaceAt(x, z).visibleTop();
+}
 
 
 struct Track {
@@ -158,6 +203,12 @@ struct Track {
     static constexpr int MAX_CONSECUTIVE_ROUTING_RUNS = 2;
     int consecutiveRoutingRuns = 0;
     int consecutiveEscapes = 0;
+    // Fallback census (the brief's target: <= ~1 fallback per 10 seeds of ANY
+    // kind).  Escapes, forced lap closes, and deep pool relaxations are all
+    // artificial rescues; count every firing so the probes can report them.
+    unsigned fallbackEscapes = 0;
+    unsigned fallbackForcedLapCloses = 0;
+    unsigned fallbackRelaxedPicks = 0;
     // Escapes taken since the last lap-closing launch (reset in
     // closeLapAtLaunch).  Unlike consecutiveEscapes it does not reset when an
     // ordinary element takes hold, so a region that alternates one element with
@@ -178,6 +229,21 @@ struct Track {
 
     int     hardInvCount = 0;
     static constexpr int INVERSION_BUDGET = 4;
+    // Composed pacing: each lap is scripted as beats (Falcon's Flight's
+    // punctuated model crossed with Tormenta's inversion blocks): the launch
+    // opening statement, a high-speed rush, airtime blocks against inversion
+    // blocks with drawn-out breathers between, and a finale into the next
+    // launch.  Beats express PREFERENCE at relax level 0 of the scheduler;
+    // the hard physical windows in eligibleElem always apply, and the
+    // existing relaxation ladder keeps completion robust.
+    enum BeatPhase : unsigned char {
+        BEAT_RUSH = 1, BEAT_AIR = 2, BEAT_INV = 4,
+        BEAT_BREATH = 8, BEAT_FINALE = 16, BEAT_ANY = 31
+    };
+    unsigned char beat = BEAT_RUSH;
+    int beatFeatureCount = 0;
+    int lapInversionChains = 0;
+    float rollHand = 0.0f;   // handedness of the last corkscrew (doubles continue it)
     float   lastBoostArc = 0.0f;
     // A transition and its semantic successor are one transaction.  There is
     // exactly one pending action; the old independent launch/boost/drop flags
@@ -195,7 +261,7 @@ struct Track {
     // Energy solve for a -5 g crest: v_entry^2 = g*scale*
     // (2*60 m + 6*30.625 m). Scaling height and radius together gives the
     // exact 1.0--1.5x geometry window rather than an unrelated speed clamp.
-    static constexpr float HILL_ENTRY_MIN = 54.59f; // 196.5 km/h at 1.0x
+    static constexpr float HILL_ENTRY_MIN = 48.0f; // 172.8 km/h; entering slower than the exact -5g energy solve (54.59f/196.5 km/h at 1.0x) just yields a gentler (floater) crest -- the 1.0-1.5x dimension clamp still applies -- so widen the window here so the airtime family isn't starved by near-misses.
     static constexpr float HILL_ENTRY_MAX = 66.85f; // 240.7 km/h at 1.5x
     static float ordinaryCorridorFloor(float groundTop) {
         // Rock/soil may be cut through shallowly; water is not terrain and may
@@ -207,7 +273,7 @@ struct Track {
                     WATER_Y + TERRAIN_DECK_CLEARANCE);
     }
     static float ordinaryCorridorFloorAt(float x, float z) {
-        const TerrainSurface surface = terrainSurfaceAt(x, z);
+        const TerrainSurface surface = genTerrainSurfaceAt(x, z);
         return surface.water
             ? surface.waterSurface + TERRAIN_DECK_CLEARANCE
             : fmaxf(surface.solidTop - TERRAIN_CUT_TOLERANCE,
@@ -226,19 +292,33 @@ struct Track {
             ? WATER_Y + TERRAIN_DECK_CLEARANCE
             : groundTop + TERRAIN_DECK_CLEARANCE;
     }
-    static int poweredStepsFor(float entrySpeed) {
+    // An element may cut through mid-run terrain inside the corridor cut
+    // band, but its EXIT anchor must land clear of grade (or on water):
+    // an exit buried in the cut band strands the next boundary with no
+    // buildable successor -- the measured post-DIVE / post-BANKAIR
+    // exhaustions.  One rule, used by every spatial element commit.
+    static bool exitAnchorClear(const Vector3 &p) {
+        const TerrainSurface s = genTerrainSurfaceAt(p.x, p.z);
+        return s.water || p.y >= s.solidTop + 1.0f;
+    }
+    static float poweredTargetFor(SegMode tag) {
+        return tag == M_BOOST ? BOOST_CRUISE_TARGET
+                              : V1_PROPULSION.targetSpeed;
+    }
+    static int poweredStepsFor(float entrySpeed, SegMode tag) {
         // Size against the exact 120 Hz ride integrator used by play and the
         // audits.  Five spans is the physical 70 m minimum; eight spans is the
         // 112 m maximum needed by a launch from rest.
         float speed = fmaxf(entrySpeed, 0.0f);
         for (int steps = 1; steps <= 8; ++steps) {
-            speed = integrateRideDistance(speed, 0.0f, M_BOOST, 2, SEG_LEN);
-            if (steps >= 5 && speed >= V1_PROPULSION.targetSpeed - 0.05f)
+            speed = integrateRideDistance(speed, 0.0f, tag, 2, SEG_LEN);
+            if (steps >= 5 && speed >= poweredTargetFor(tag) - 0.05f)
                 return steps;
         }
         return 8;
     }
     SegMode lastElem = M_FLAT, prevElem = M_FLAT;
+    int familyRun = 0;   // consecutive committed features from one family
     SegMode launchElem = M_CLIMB;
     enum MacroProfileKind : unsigned char {
         MACRO_NONE, MACRO_TOP_HAT, MACRO_HILLS, MACRO_DROP
@@ -414,12 +494,29 @@ struct Track {
         for (int pass = 0; pass < 6; ++pass) {
             built = v1profile::makeTopHat(spec);
             if (!built) return reject("profile");
+            // Crest-g guard: a taller/steeper crest solved from a fast entry can
+            // spike well past the felt-force envelope (measured +12.05g on DIVE
+            // motivated this same check here).  If the crest as-solved would feel
+            // too harsh, ask for a taller (slower, gentler) crest and refit; the
+            // existing maxCrest clamp below still bounds the result.
+            {
+                float crestCurvature = fabsf((float)built.profile.sampleDistance(
+                    built.apexDistance).curvature);
+                float crestSpeedSq = fmaxf(genV*genV -
+                    2.0f*GRAV*(spec.crestHeight - spec.startHeight), 400.0f);
+                float feltCrest = 1.0f - crestSpeedSq*crestCurvature/GRAV;
+                if (feltCrest < -5.2f) { spec.crestHeight += 12.0f; continue; }
+            }
             float endDistance = (float)built.profile.length();
+            // Qualify the runout against the HUG target (ground+deck), not
+            // the cut-band floor: a top hat whose exit only clears via an
+            // 18 m trench strands the next boundary buried (measured seed
+            // failures at clearance -13..-18 directly after CLIMB).
             float landing = -1.0e9f;
             for (float out = 0.0f; out <= 168.0f; out += 7.0f)
                 for (float side : {-7.0f, 0.0f, 7.0f})
-                    landing = fmaxf(landing, ordinaryCorridorFloor(
-                        groundTopAt(gpos.x + sinf(gyaw) * (endDistance + out) +
+                    landing = fmaxf(landing, ordinaryRouteTarget(
+                        genGroundTopAt(gpos.x + sinf(gyaw) * (endDistance + out) +
                                       cosf(gyaw) * side,
                                     gpos.z + cosf(gyaw) * (endDistance + out) -
                                       sinf(gyaw) * side)));
@@ -429,7 +526,7 @@ struct Track {
             for (float s = 0.0f; s <= (float)built.profile.length(); s += 3.5f) {
                 float y = (float)built.profile.sampleDistance(s).height;
                 for (float side : {-7.0f, 0.0f, 7.0f})
-                    maxClearance = fmaxf(maxClearance, y - groundTopAt(
+                    maxClearance = fmaxf(maxClearance, y - genGroundTopAt(
                         gpos.x + sinf(gyaw) * s + cosf(gyaw) * side,
                         gpos.z + cosf(gyaw) * s - sinf(gyaw) * side));
             }
@@ -460,12 +557,12 @@ struct Track {
         for (float s = 0.0f; s <= (float)built.profile.length(); s += 3.5f) {
             float y = (float)built.profile.sampleDistance(s).height;
             for (float side : {-7.0f, 0.0f, 7.0f}) {
-                float terrain = groundTopAt(
+                float terrain = genGroundTopAt(
                     gpos.x + sinf(gyaw) * s + cosf(gyaw) * side,
                     gpos.z + cosf(gyaw) * s - sinf(gyaw) * side);
-                if (y < ordinaryCorridorFloor(terrain) ||
+                if (y < ordinaryCorridorFloor(terrain) - 0.05f ||
                     y - terrain > TOP_HAT_VERTICAL_CAP + 0.01f)
-                    return reject(y < ordinaryCorridorFloor(terrain) ?
+                    return reject(y < ordinaryCorridorFloor(terrain) - 0.05f ?
                                   "terrain" : "clearance-cap");
             }
         }
@@ -566,7 +663,7 @@ struct Track {
                 float y = (float)built.profile.sampleDistance(s).height;
                 float floor = -1.0e9f;
                 for (float side : {-7.0f, 0.0f, 7.0f})
-                    floor = fmaxf(floor, ordinaryCorridorFloor(groundTopAt(
+                    floor = fmaxf(floor, ordinaryCorridorFloor(genGroundTopAt(
                         gpos.x + sinf(gyaw) * s + cosf(gyaw) * side,
                         gpos.z + cosf(gyaw) * s - sinf(gyaw) * side)));
                 deficiency = fmaxf(deficiency, floor - y);
@@ -581,10 +678,10 @@ struct Track {
             float endD = (float)built.profile.length();
             for (float out = 0.0f; out <= 84.0f; out += 7.0f)
                 for (float side : {-7.0f, 0.0f, 7.0f}) {
-                    float terrain = groundTopAt(
+                    float terrain = genGroundTopAt(
                         gpos.x + sinf(gyaw) * (endD + out) + cosf(gyaw) * side,
                         gpos.z + cosf(gyaw) * (endD + out) - sinf(gyaw) * side);
-                    deficiency = fmaxf(deficiency, ordinaryCorridorFloor(terrain) - endY);
+                    deficiency = fmaxf(deficiency, ordinaryRouteTarget(terrain) - 2.0f - endY);
                 }
             if (deficiency > 0.05f) return false;
         }
@@ -610,24 +707,86 @@ struct Track {
         float endHeight = fmaxf(WATER_Y + 4.0f, startHeight - 250.0f);
         v1profile::Profile built;
 
+        // A real drop is pushover -> (face) -> pullout.  The old single quintic
+        // had zero curvature at its start, so the first ~15% of every drop was
+        // a near-flat hesitation on the crest (the visible "flat on top" after
+        // an Immelmann or an elevated element).  Here curvature onsets
+        // immediately: the pushover is authored as quintic segments whose
+        // interior knots carry the full crest curvature (rail curvature sized
+        // from a felt-g target at the actual entry speed), an optional
+        // constant-grade face exists only for genuinely large drops (real big
+        // drops do have straight faces), and the pullout mirrors the pushover
+        // at the (faster) valley speed.  C2 throughout via ProfileBuilder.
         auto solve = [&](float targetHeight) -> v1profile::Profile {
-            const double startGrade = Clamp(genPrevDy / SEG_LEN, -1.45f, 0.85f);
-            const double drop = fmaxf(startHeight - targetHeight, 1.0f);
-            const double faceDegrees = Clamp(48.0 + drop * 0.11, 50.0, 67.0);
-            const double faceGrade = tan(faceDegrees * DEG2RAD);
-            // A single C2 height solve has no hidden join at maximum grade.
-            // Size it both for the requested face angle and for the ridden
-            // pull-out speed; the previous two slope ramps met at their
-            // zero-curvature endpoints and drew a long constant-gradient slab.
-            const double gradeLength = 1.875 * drop / fmax(faceGrade, 1.0e-4);
-            const double designSpeed = Clamp((double)genV, 40.0, 100.0);
-            const double forceLength = designSpeed *
-                sqrt(11.5 * drop / (10.0 * GRAV));
-            const double length = fmax(96.0, fmax(gradeLength, forceLength));
-            const double startCurvature = genPrevCurv / (SEG_LEN * SEG_LEN);
-            v1profile::ProfileBuilder builder({startHeight, startGrade, startCurvature});
-            builder.appendQuintic({targetHeight, 0.0, 0.0}, length);
-            return builder.good() ? builder.profile() : v1profile::Profile{};
+            const double g0 = Clamp(genPrevDy / SEG_LEN, -1.45f, 0.85f);
+            const double k0 = genPrevCurv / (SEG_LEN * SEG_LEN);
+            const double drop = fmax((double)startHeight - targetHeight, 1.0);
+            const double v = Clamp((double)genV, 40.0, 100.0);
+            // Felt-g design targets (2x a real aggressive dive: ~-1.2 crest,
+            // ~+3.8 valley): crest -2.4, valley +7.6, inside the +12/-6 hard
+            // envelope with interpolation margin.
+            const double vP = sqrt(v * v + 2.0 * GRAV * drop * 0.92);
+            double crestRailCurvature = (1.0 + 2.4) * GRAV / (v * v);
+            double pulloutRailCurvature = (7.6 - 1.0) * GRAV / (vP * vP);
+            double faceDegrees = Clamp(48.0 + drop * 0.11, 50.0, 67.0);
+
+            struct Knot { double grade, curvature; };
+            for (int fit = 0; fit < 6; ++fit) {
+                const double mF = tan(faceDegrees * DEG2RAD);
+                auto planCurv = [](double railCurvature, double grade) {
+                    const double q = 1.0 + grade * grade;
+                    return railCurvature * q * sqrt(q);
+                };
+                // Interior knots carry the full design curvature; the face
+                // knots are exactly straight (zero curvature) so the optional
+                // constant-grade face inserts without any interior wiggle.
+                const Knot schedule[5] = {
+                    {g0, k0},
+                    {-0.34 * mF, -planCurv(crestRailCurvature, 0.17 * mF)},
+                    {-mF, 0.0},
+                    {-0.34 * mF, planCurv(pulloutRailCurvature, 0.17 * mF)},
+                    {0.0, 0.0},
+                };
+                double lengths[4];
+                double shapeDrop = 0.0;
+                for (int i = 0; i < 4; ++i) {
+                    const Knot a = schedule[i], b = schedule[i + 1];
+                    const double meanCurv = 0.5 * (fabs(a.curvature) +
+                                                   fabs(b.curvature));
+                    lengths[i] = fabs(b.grade - a.grade) /
+                                 fmax(0.62 * meanCurv, 1.0e-4);
+                    lengths[i] = Clamp(lengths[i], 10.0f, 900.0f);
+                    shapeDrop += -(lengths[i] * 0.5 * (a.grade + b.grade) +
+                                   lengths[i] * lengths[i] *
+                                   (a.curvature - b.curvature) / 12.0);
+                }
+                const double faceLength = (drop - shapeDrop) / fmax(mF, 0.2);
+                if (faceLength < -1.0 && faceDegrees > 30.0) {
+                    // Shape alone overshoots the requested drop: soften the
+                    // face angle (small drops get gentle S-shapes, not a 67
+                    // degree wall) and refit.
+                    faceDegrees = fmax(30.0, faceDegrees *
+                        sqrt(fmax(drop / fmax(shapeDrop, 1.0), 0.04)));
+                    continue;
+                }
+                v1profile::ProfileBuilder builder({startHeight, g0, k0});
+                double y = startHeight;
+                bool ok = true;
+                for (int i = 0; i < 4 && ok; ++i) {
+                    const Knot a = schedule[i], b = schedule[i + 1];
+                    const double L = lengths[i];
+                    y += L * 0.5 * (a.grade + b.grade) +
+                         L * L * (a.curvature - b.curvature) / 12.0;
+                    ok = builder.appendQuintic({y, b.grade, b.curvature}, L);
+                    if (ok && i == 1 && faceLength > 1.0) {
+                        y += -mF * faceLength;
+                        ok = builder.appendQuintic({y, -mF, 0.0}, faceLength);
+                    }
+                }
+                if (!ok || !builder.good()) return {};
+                return builder.profile();
+            }
+            return {};
         };
 
         bool corridorClear = false;
@@ -646,8 +805,8 @@ struct Track {
             float landing = -1.0e9f;
             for (float out = 0.0f; out <= 168.0f; out += 7.0f)
                 for (float side : {-7.0f, 0.0f, 7.0f})
-                    landing = fmaxf(landing, ordinaryCorridorFloor(
-                        groundTopAt(gpos.x + sinf(gyaw) * (d + out) + cosf(gyaw) * side,
+                    landing = fmaxf(landing, ordinaryRouteTarget(
+                        genGroundTopAt(gpos.x + sinf(gyaw) * (d + out) + cosf(gyaw) * side,
                                     gpos.z + cosf(gyaw) * (d + out) - sinf(gyaw) * side)));
             float nextHeight = fmaxf(WATER_Y + 4.0f,
                                      fmaxf(startHeight - 250.0f, landing));
@@ -666,7 +825,7 @@ struct Track {
                 float y = (float)built.sampleDistance(s).height;
                 float floor = -1.0e9f;
                 for (float side : {-7.0f, 0.0f, 7.0f})
-                    floor = fmaxf(floor, ordinaryCorridorFloor(groundTopAt(
+                    floor = fmaxf(floor, ordinaryCorridorFloor(genGroundTopAt(
                         gpos.x + sinf(gyaw) * s + cosf(gyaw) * side,
                         gpos.z + cosf(gyaw) * s - sinf(gyaw) * side)));
                 deficiency = fmaxf(deficiency, floor - y);
@@ -675,6 +834,87 @@ struct Track {
             endHeight = fminf(startHeight - 8.0f, endHeight + deficiency * 1.35f);
         }
         if (!corridorClear) return false;
+
+        // Falcon's Flight's first drop is TWISTED: a big recovery drop may curve
+        // its plan while it dives.  Build the same longitudinal law along a gently
+        // yawing plan and bank it with the felt-bank law; fall back to the straight
+        // analytic macro below where the curved corridor doesn't fit.
+        bool publishedCurved = false;
+        const float dropTotal = startHeight - (float)built.sampleDistance(built.length()).height;
+        if (dropTotal >= 40.0f && rnd01() < 0.65f) {
+            const float L = (float)built.length();
+            for (float yawT : {0.8f * nextBankDirection(), -0.8f * nextBankDirection(), 0.5f, -0.5f}) {
+                const Vector3 origin = gpos;
+                const BoundaryState start = currentBoundary();
+                const int knots = Clamp((int)ceilf(L / MACRO_SAMPLE_STEP), 6, 64);
+                // Dense midpoint integration of the yawing plan: psi(s) = gyaw +
+                // yawT * spatialEase(s/L).  Height/grade come straight from the
+                // already-solved longitudinal profile, sampled at plan distance s
+                // (the same convention every other curved element here uses).
+                std::vector<Vector3> points;
+                points.reserve(knots);
+                float x = origin.x, z = origin.z;
+                constexpr int subN = 4;
+                bool geometryOk = true;
+                for (int k = 1; k <= knots; ++k) {
+                    const float sPrev = (float)(k - 1) * L / knots;
+                    const float sNext = (float)k * L / knots;
+                    for (int sub = 0; sub < subN; ++sub) {
+                        const float sMid = sPrev + ((float)sub + 0.5f) *
+                                           (sNext - sPrev) / subN;
+                        const float psiMid = gyaw + yawT * spatialEase(sMid / L);
+                        const float dsSub = (sNext - sPrev) / (float)subN;
+                        x += sinf(psiMid) * dsSub;
+                        z += cosf(psiMid) * dsSub;
+                    }
+                    const float y = origin.y +
+                        ((float)built.sampleDistance(sNext).height - startHeight);
+                    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+                        geometryOk = false;
+                        break;
+                    }
+                    points.push_back({x, y, z});
+                }
+                if (!geometryOk || points.empty() || !exitAnchorClear(points.back()))
+                    continue;
+                spatialPts.clear(); spatialUps.clear(); spatialD1.clear();
+                spatialD2.clear(); spatialD3.clear(); spatialDs.clear();
+                spatialIdx = 0;
+                spatialPts = points;
+                spatialUps.assign(points.size(), WUP);
+                for (size_t i = 0; i < points.size(); ++i) {
+                    const Vector3 before = i == 0 ? origin : points[i - 1];
+                    const Vector3 after = i + 1 < points.size()
+                        ? points[i + 1] : points[i];
+                    Vector3 tangent = Vector3Subtract(after, before);
+                    tangent = Vector3Length(tangent) > 1.0e-5f
+                        ? Vector3Normalize(tangent) : start.tangent;
+                    spatialUps[i] = orthoUp(tangent, WUP);
+                }
+                BoundaryState finish;
+                finish.tangent = points.size() > 1
+                    ? Vector3Normalize(Vector3Subtract(
+                          points.back(), points[points.size() - 2]))
+                    : start.tangent;
+                finish.up = orthoUp(finish.tangent, WUP);
+                spatialUps.back() = finish.up;
+                deriveSpatialArcData(origin, start, finish);
+                SpatialRun run = makeSpatialRun(origin, start.up, true);
+                if (!attachFeltBankFrame(run, genV, 1.0f, 1.15f)) continue;
+                if (!spatialCorridorClear(run) || !exitAnchorClear(points.back()) ||
+                    !spatialForceClear(run, M_DROP, -3.5f, 11.0f))
+                    continue;
+                mode = M_DROP;
+                remain = (int)points.size();
+                spatialIdx = 0;
+                publishSpatialRun(std::move(run));
+                consecutiveRoutingRuns = 0;
+                lapElemCount[M_DROP]++;
+                publishedCurved = true;
+                break;
+            }
+        }
+        if (publishedCurved) return true;
 
         macroProfile = built;
         macroKind = MACRO_DROP;
@@ -729,6 +969,7 @@ struct Track {
 
     void reset() {
         rng = ::g_rng;
+        gGenTerrain.clear();
         cp.clear(); up.clear(); kind.clear(); chainf.clear(); alignmentf.clear();
         spanRun.clear(); spanStart.clear(); spanEnd.clear(); analyticRuns.clear(); spatialRuns.clear();
         spatialPts.clear(); spatialUps.clear(); spatialIdx = 0; spatialRunId = 0;
@@ -751,11 +992,11 @@ struct Track {
         for (int a = 0; a < 48; ++a) {
             float yaw = yawSeed + a * (2.0f * PI / 48.0f);
             float csA = cosf(yaw), snA = sinf(yaw);
-            float launchGround = groundTopAt(0, 0);
+            float launchGround = genGroundTopAt(0, 0);
             for (float lz = -28.0f; lz <= 112.0f; lz += 6.0f)
                 for (float lx = -6.0f; lx <= 6.0f; lx += 6.0f)
                     launchGround = fmaxf(launchGround,
-                        groundTopAt(csA * lx + snA * lz, -snA * lx + csA * lz));
+                        genGroundTopAt(csA * lx + snA * lz, -snA * lx + csA * lz));
             float startY = launchGround + 8.0f;
             float hatX = snA * (7.0f * SEG_LEN);
             float hatZ = csA * (7.0f * SEG_LEN);
@@ -772,7 +1013,7 @@ struct Track {
                 for (float out = 0.0f; out <= 168.0f; out += 7.0f)
                     for (float side : {-7.0f, 0.0f, 7.0f})
                         runout = fmaxf(runout,
-                            groundTopAt(hatX + snA * (d + out) + csA * side,
+                            genGroundTopAt(hatX + snA * (d + out) + csA * side,
                                         hatZ + csA * (d + out) - snA * side) + 8.0f);
                 if (runout > startY + 12.0f) probeHat = {};
             }
@@ -783,7 +1024,7 @@ struct Track {
                 for (float d = 0.0f; d <= (float)probeHat.profile.length(); d += 3.5f) {
                     float y = (float)probeHat.profile.sampleDistance(d).height;
                     for (float side : {-7.0f, 0.0f, 7.0f}) {
-                        float terrain = groundTopAt(hatX + snA*d + csA*side,
+                        float terrain = genGroundTopAt(hatX + snA*d + csA*side,
                                                     hatZ + csA*d - snA*side);
                         intrusion = fmaxf(intrusion, terrain + 3.5f - y);
                         maxClearance = fmaxf(maxClearance, y - terrain);
@@ -798,15 +1039,19 @@ struct Track {
         gyaw = bestYaw;
 
         float cs = cosf(gyaw), sn = sinf(gyaw);
-        float maxG = groundTopAt(0, 0);
+        float maxG = genGroundTopAt(0, 0);
         for (float lz = -28.0f; lz <= 112.0f; lz += 6.0f)
             for (float lx = -6.0f; lx <= 6.0f; lx += 6.0f)
-                maxG = fmaxf(maxG, groundTopAt(cs * lx + sn * lz, -sn * lx + cs * lz));
+                maxG = fmaxf(maxG, genGroundTopAt(cs * lx + sn * lz, -sn * lx + cs * lz));
         gpos = { 0, maxG + 8.0f, 0 };
         startPos = gpos; startYaw = gyaw;
         mode = M_FLAT; remain = 3; turnDir = 1; turnMag = 0.4f; elems = 0;
         elemLimit = irnd(13, 17); launchElem = M_CLIMB;
         hardInvCount = 0;
+        beat = BEAT_RUSH; beatFeatureCount = 0; lapInversionChains = 0;
+        rollHand = 0.0f;
+        fallbackEscapes = 0; fallbackForcedLapCloses = 0;
+        fallbackRelaxedPicks = 0;
         pending = {};
         consecutiveRoutingRuns = 0;
         schedulerExhaustions = 0;
@@ -898,7 +1143,10 @@ struct Track {
         return spatialEase(t / 0.22f) * spatialEase((1.0f - t) / 0.22f);
     }
     static float helixShoulder(float t) {
-        return c3Ease(t / 0.10f) * c3Ease((1.0f - t) / 0.10f);
+        // Asymmetric shoulders: the coil winds up over 10% but unwinds its
+        // (up to ~84 degree) bank over a longer 18% exit so the roll-out
+        // stays under the ROLL_RATE ceiling at the helix's fast exit speed.
+        return c3Ease(t / 0.10f) * c3Ease((1.0f - t) / 0.18f);
     }
     static float helixShoulderMean() {
         static const float mean = [] {
@@ -1177,6 +1425,33 @@ struct Track {
         // level frame pasted onto residual plan curvature.
         bank[spans] = 0.0f;
 
+        // Roll-speed governor: real banking transitions are drawn out, never
+        // snapped inside one span.  Cap the knot-to-knot bank change at the
+        // ROLL_RATE ceiling for the local speed (speed falls out of the same
+        // energy relation the felt-bank law used), walking forward from the
+        // continuous entry bank and backward from the neutral exit.  Where the
+        // raw felt bank would roll faster than the ceiling, the bank is
+        // shallower than lateral balance for a moment -- exactly what a real
+        // transition does -- rather than the frame snapping.
+        for (int i = 1; i < spans; ++i) {
+            const float speed = sqrtf(fmaxf(
+                entrySpeed * entrySpeed + 2.0f * GRAV *
+                (run.points.front().y - run.points[i].y), 400.0f));
+            const float allowed = ROLL_RATE_DEG_PER_SEC * DEG2RAD / speed *
+                                  fmaxf(distance[i] - distance[i - 1], 1.0e-4f);
+            bank[i] = Clamp(bank[i], bank[i - 1] - allowed,
+                            bank[i - 1] + allowed);
+        }
+        for (int i = spans - 1; i >= 1; --i) {
+            const float speed = sqrtf(fmaxf(
+                entrySpeed * entrySpeed + 2.0f * GRAV *
+                (run.points.front().y - run.points[i].y), 400.0f));
+            const float allowed = ROLL_RATE_DEG_PER_SEC * DEG2RAD / speed *
+                                  fmaxf(distance[i + 1] - distance[i], 1.0e-4f);
+            bank[i] = Clamp(bank[i], bank[i + 1] - allowed,
+                            bank[i + 1] + allowed);
+        }
+
         // Shape-preserving rates prevent a C3 scalar fit from overshooting at
         // a bank maximum or through the SCurve sign reversal.  Acceleration
         // and jerk are shared as zero at every knot; the Hermite7 evaluator
@@ -1381,11 +1656,11 @@ struct Track {
             for (float offset : {-halfWidth, 0.0f, halfWidth}) {
                 const float x = p.x + side.x * offset;
                 const float z = p.z + side.z * offset;
-                const TerrainSurface surface = terrainSurfaceAt(x, z);
+                const TerrainSurface surface = genTerrainSurfaceAt(x, z);
                 const float floor = splash && surface.water
                     ? surface.waterSurface + 0.5f
                     : ordinaryCorridorFloorAt(x, z);
-                if (p.y < floor || p.y > BUILD_MAX) return false;
+                if (p.y < floor - 0.05f || p.y > BUILD_MAX) return false;
             }
         }
         return true;
@@ -1675,15 +1950,22 @@ struct Track {
             if (fromRest && steps != 0) continue;
             const Vector3 deckOrigin = Vector3Add(gpos,
                 Vector3Scale(forward, steps*SEG_LEN));
-            float deckFloor = -1.0e9f, deckTarget = -1.0e9f;
+            // A real launch deck is a level pad graded AT the local terrain:
+            // small bumps are cut (the corridor floor already permits shallow
+            // cuts), dips are bridged low.  Preferring the corridor MAXIMUM
+            // put every deck on stilts at the height of the tallest bump.
+            float deckFloor = -1.0e9f, deckTarget = 0.0f;
+            int deckSamples = 0;
             for (float d = 0.0f; d <= 8.0f*SEG_LEN; d += 3.5f)
                 for (float side : {-7.0f, 0.0f, 7.0f}) {
                     const float x = deckOrigin.x + forward.x*d + forward.z*side;
                     const float z = deckOrigin.z + forward.z*d - forward.x*side;
-                    const float ground = groundTopAt(x, z);
+                    const float ground = genGroundTopAt(x, z);
                     deckFloor = fmaxf(deckFloor, ordinaryCorridorFloor(ground));
-                    deckTarget = fmaxf(deckTarget, ordinaryRouteTarget(ground));
+                    deckTarget += ordinaryRouteTarget(ground);
+                    ++deckSamples;
                 }
+            deckTarget /= (float)std::max(deckSamples, 1);
             const float low = fmaxf(gpos.y - TOP_HAT_VERTICAL_CAP, deckFloor);
             const float high = fminf(gpos.y + TOP_HAT_VERTICAL_CAP, BUILD_MAX);
             if (low > high) continue;
@@ -1708,17 +1990,19 @@ struct Track {
                 // A nonzero identity transition is precisely the unpowered
                 // flat lead this plan exists to eliminate.
                 if (steps > 0 && fabsf(deckY - gpos.y) < 0.5f && neutral) continue;
+                const SegMode poweredTag = role == PendingKind::Launch
+                    ? M_LAUNCH : M_BOOST;
                 const float deckEntry = fromRest ? 0.0f :
                     (steps ? integrateUnpoweredRun(transition) : genV);
                 if (deckEntry < 0.0f) continue;
-                const int deckSteps = poweredStepsFor(deckEntry);
+                const int deckSteps = poweredStepsFor(deckEntry, poweredTag);
                 SpatialRun deck = makePowerDeck(deckOrigin, forward, deckY, deckSteps);
                 if (!spatialCorridorClear(deck)) continue;
                 float exitSpeed = deckEntry;
                 for (int i = 0; i < deckSteps; ++i)
                     exitSpeed = integrateRideDistance(exitSpeed, 0.0f,
-                        role == PendingKind::Launch ? M_LAUNCH : M_BOOST, 2, SEG_LEN);
-                if (exitSpeed < V1_PROPULSION.targetSpeed - 0.05f) continue;
+                        poweredTag, 2, SEG_LEN);
+                if (exitSpeed < poweredTargetFor(poweredTag) - 0.05f) continue;
                 const float spacing = age + transitionLength;
                 const float score = (role == PendingKind::Boost
                     ? fabsf(spacing - V1_PROPULSION.nominalCadence) : 0.0f) +
@@ -1789,13 +2073,49 @@ struct Track {
         const float transition = 0.06f;
         auto smooth5 = [](float x) { x=Clamp(x,0.0f,1.0f); return x*x*x*(10.0f+x*(-15.0f+6.0f*x)); };
         auto smooth5d = [](float x) { x=Clamp(x,0.0f,1.0f); return 30.0f*x*x*(1.0f-x)*(1.0f-x); };
+        // A full loop keeps the symmetric clothoid law (curvature eases in
+        // and out at the level entry/exit, pinched at the top).  An Immelmann
+        // must NOT taper its curvature to zero at the far end: its far end is
+        // past the crest, where the real element is still pitching over into
+        // the exit dive.  Its law ramps in at the bottom, tightens toward the
+        // crest (t ~ 0.8) exactly like the loop's pinch, then relaxes only
+        // partially (to ~0.55 of peak) through the exit sweep, so the crest is
+        // one continuous arc and the element hands its successor a genuinely
+        // descending, still-curving boundary.
         auto curvatureRaw = [&](float t) {
+            if (immelRoll) {
+                float ramp = smooth5(t / transition);
+                float shape;
+                if (t < 0.80f) {
+                    float s = sinf(0.5f * PI * t / 0.80f);
+                    shape = 1.0f + 0.65f * s * s;
+                } else {
+                    shape = 1.65f - 0.74f * smooth5((t - 0.80f) / 0.20f);
+                }
+                return ramp * shape;
+            }
             float q=fminf(t,1.0f-t);
             if (q < transition) return smooth5(q/transition);
             float a=0.5f*PI*(q-transition)/(0.5f-transition);
             float s=sinf(a); return 1.0f+0.65f*s*s;
         };
         auto curvatureRawD = [&](float t) {
+            if (immelRoll) {
+                float ramp = smooth5(t / transition);
+                float rampD = t < transition ? smooth5d(t / transition) / transition
+                                             : 0.0f;
+                float shape, shapeD;
+                if (t < 0.80f) {
+                    float a = 0.5f * PI * t / 0.80f;
+                    float s = sinf(a);
+                    shape = 1.0f + 0.65f * s * s;
+                    shapeD = 0.65f * sinf(2.0f * a) * (0.5f * PI / 0.80f);
+                } else {
+                    shape = 1.65f - 0.74f * smooth5((t - 0.80f) / 0.20f);
+                    shapeD = -0.74f * smooth5d((t - 0.80f) / 0.20f) / 0.20f;
+                }
+                return rampD * shape + ramp * shapeD;
+            }
             float sign=t < 0.5f ? 1.0f : -1.0f;
             float q=fminf(t,1.0f-t);
             if (q < transition) return sign*smooth5d(q/transition)/transition;
@@ -1847,12 +2167,12 @@ struct Track {
                                                                Vector3Scale(forward, -sinf(theta))));
             Vector3 frame = curveNormal;
             if (immelRoll) {
-                // An Immelmann is one compound half-loop: its half-roll
-                // overlaps the final curved quarter and is complete at the
-                // crown.  The former implementation finished the half-loop,
-                // then attached a separate straight roll, visibly dividing
-                // the element into three stitched pieces.
-                float rollT = spatialEase((t - 0.55f) / 0.45f);
+                // An Immelmann is one compound element: the half-roll blends
+                // through the top of the half-loop, starting on the way up and
+                // completing just past the crest (research: "half-loop with a
+                // half-roll near/through the top", exit below the crest and
+                // descending).  It must never read as loop-then-roll-then-flat.
+                float rollT = spatialEase((t - 0.45f) / 0.50f);
                 float beta = PI * rollT * immelDir;
                 Vector3 lateral = Vector3CrossProduct(tangent, frame);
                 frame = Vector3Normalize(Vector3Add(Vector3Scale(frame, cosf(beta)),
@@ -1894,9 +2214,11 @@ struct Track {
         mode    = M_IMMEL;
         const float radius = invRFor(M_IMMEL);
         immelDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
-        buildLoopSpatial(PI, 2.0f * radius, true);
+        // Sweep 24 degrees past the crest: the real element exits BELOW its
+        // crest, already diving toward its runout, with the half-roll done.
+        buildLoopSpatial(PI + 24.0f * DEG2RAD, 2.0f * radius, true);
     }
-    bool initRoll() {
+    bool initRoll(float forcedHand = 0.0f) {
         syncYawToTrack();
         const Vector3 forward = headingVec();
         const Vector3 neutralUp = orthoUp(forward, WUP);
@@ -1920,7 +2242,8 @@ struct Track {
         if (requiredScale > RECORD_SCALE_CAP + 0.001f) return false;
         const float scale = Clamp(requiredScale, 1.0f, RECORD_SCALE_CAP);
         const float radius = referenceRadius * scale;
-        const float handedness = nextBankDirection();
+        const float handedness = fabsf(forcedHand) > 0.5f
+            ? (forcedHand < 0.0f ? -1.0f : 1.0f) : nextBankDirection();
         const Vector3 side = Vector3Normalize(
             Vector3CrossProduct(neutralUp, forward));
         const Vector3 origin = gpos;
@@ -2049,7 +2372,7 @@ struct Track {
             for (float offset : {-3.5f, 0.0f, 3.5f}) {
                 const float x = p.x + corridorSide.x * offset;
                 const float z = p.z + corridorSide.z * offset;
-                if (p.y < ordinaryCorridorFloorAt(x, z) || p.y > BUILD_MAX)
+                if (p.y < ordinaryCorridorFloorAt(x, z) - 0.05f || p.y > BUILD_MAX)
                     return false;
             }
         }
@@ -2084,8 +2407,11 @@ struct Track {
             spatialDs.push_back(targetArc - previousArc);
             previousArc = targetArc;
         }
+        if (!spatialPts.empty() && !exitAnchorClear(spatialPts.back()))
+            return false;
         mode = M_ROLL;
         remain = rollSteps;
+        rollHand = handedness;
         commitSpatialRun(origin, neutralUp, true,
             {true, origin, forward, neutralUp, radius});
         return true;
@@ -2148,6 +2474,7 @@ struct Track {
                 Vector3Scale(WUP, cosf(roll)),
                 Vector3Scale(side, sinf(roll) * stallDir)));
         }
+        if (!exitAnchorClear(spatialPts.back())) return false;
         BoundaryState start{stallF, {}, {}, neutral};
         BoundaryState finish{stallF, {}, {}, neutral};
         spatialUps.back() = neutral;
@@ -2186,7 +2513,7 @@ struct Track {
         syncYawToTrack();
         const Vector3 dlf = headingVec();
         const float dlturn = rnd01() < 0.5f ? -1.0f : 1.0f;
-        float clearance = gpos.y - groundTopAt(gpos.x, gpos.z);
+        float clearance = gpos.y - genGroundTopAt(gpos.x, gpos.z);
         const DiveLoopPlan plan = makeDiveLoopPlan(genV, clearance);
         if (!plan.valid) {
             rng = savedRng; gyaw = savedYaw; return false;
@@ -2233,7 +2560,7 @@ struct Track {
         // axis. A formerly appended four-span straight was a second piece
         // stitched inside the named element and created a visible flat tail.
         for (const Vector3 &point : points) {
-            if (point.y < ordinaryCorridorFloor(groundTopAt(point.x, point.z))) {
+            if (point.y < ordinaryCorridorFloor(genGroundTopAt(point.x, point.z)) - 0.05f) {
                 rng = savedRng; gyaw = savedYaw; return false;
             }
         }
@@ -2274,6 +2601,9 @@ struct Track {
         elems = 0; elemLimit = irnd(13, 17); launchElem = pickLaunchExit();
         hardInvCount = 0;
         escapesSinceLaunch = 0;
+        beat = BEAT_RUSH;
+        beatFeatureCount = 0;
+        lapInversionChains = 0;
     }
 
     float distanceSincePower() const {
@@ -2408,9 +2738,9 @@ struct Track {
     }
     // Reject fixed-profile hills whose corridor climbs beyond their energy reserve.
     float hillRiseAhead() const {
-        float gt0 = groundTopAt(gpos.x, gpos.z), rise = 0.0f;
+        float gt0 = genGroundTopAt(gpos.x, gpos.z), rise = 0.0f;
         for (int la = 3; la <= 30; la += 3)
-            rise = fmaxf(rise, groundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
+            rise = fmaxf(rise, genGroundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
                                            gpos.z + cosf(gyaw) * SEG_LEN * la) - gt0);
         return rise;
     }
@@ -2473,9 +2803,9 @@ struct Track {
                     : y1;
                 const float sideYaw=yaw0+(yaw-yaw0)*f;
                 for (float side : {-7.0f, 0.0f, 7.0f})
-                    if (sy < ordinaryCorridorFloor(groundTopAt(
+                    if (sy < ordinaryCorridorFloor(genGroundTopAt(
                             sx+cosf(sideYaw)*side,
-                            sz-sinf(sideYaw)*side)))
+                            sz-sinf(sideYaw)*side)) - 0.05f)
                         return false;
             }
         }
@@ -2540,7 +2870,12 @@ struct Track {
                                           : SPEED_TURN_REFERENCE_RADIUS;
         const float lengthReference = big ? HARD_TURN_REFERENCE_LENGTH
                                           : SPEED_TURN_REFERENCE_LENGTH;
-        const float targetPlanG = 12.0f;
+        // Plan-g target for radius sizing.  A fully heartlined turn's felt
+        // NORMAL g is sqrt(1 + planG^2); 12.0 here put the rider at ~12.04,
+        // over the +12 hard envelope before any interpolation overshoot --
+        // the audited "M_TURN +12 g entry spikes".  10.5 keeps the felt load
+        // at ~10.5 with margin for spline overshoot.
+        const float targetPlanG = 10.5f;
         const float radius = Clamp(genV * genV / (targetPlanG * GRAV),
                                    radiusReference,
                                    radiusReference * RECORD_SCALE_CAP);
@@ -2582,7 +2917,7 @@ struct Track {
         struct TurnCorridor { float peakFloor, runoutTarget; };
         auto corridorFloor = [&](float dir) {
             float x=gpos.x, z=gpos.z, yaw=gyaw, yawRate=genPrevDyaw;
-            float peakFloor = ordinaryCorridorFloor(groundTopAt(x, z));
+            float peakFloor = ordinaryCorridorFloor(genGroundTopAt(x, z));
             for (int step = 0; step < turnLen; ++step) {
                 float t = ((float)step + 1.0f) / (float)turnLen;
                 yawRate = limitedYawRate(dir*turnMag*turnShoulder(t),
@@ -2592,7 +2927,7 @@ struct Track {
                 z += cosf(yaw) * SEG_LEN;
                 for (float side : {-7.0f, 0.0f, 7.0f})
                     peakFloor = fmaxf(peakFloor, ordinaryCorridorFloor(
-                        groundTopAt(x + cosf(yaw) * side,
+                        genGroundTopAt(x + cosf(yaw) * side,
                                     z - sinf(yaw) * side)));
             }
             float runoutTarget = -1.0e9f;
@@ -2603,7 +2938,7 @@ struct Track {
                 z += cosf(yaw) * SEG_LEN;
                 for (float side : {-7.0f, 0.0f, 7.0f})
                     runoutTarget = fmaxf(runoutTarget, ordinaryRouteTarget(
-                        groundTopAt(x + cosf(yaw) * side,
+                        genGroundTopAt(x + cosf(yaw) * side,
                                     z - sinf(yaw) * side)));
             }
             return TurnCorridor{fmaxf(peakFloor, runoutTarget), runoutTarget};
@@ -2768,9 +3103,9 @@ struct Track {
                     bool terrainClear=true;
                     for (int i=0;i<=denseN;i+=8) {
                         for (float edge : {-7.0f,0.0f,7.0f}) {
-                            float terrain=groundTopAt(dense[i].x+cosf(denseYaw[i])*edge,
+                            float terrain=genGroundTopAt(dense[i].x+cosf(denseYaw[i])*edge,
                                                       dense[i].z-sinf(denseYaw[i])*edge);
-                            if (dense[i].y < ordinaryCorridorFloor(terrain)) {
+                            if (dense[i].y < ordinaryCorridorFloor(terrain) - 0.05f) {
                                 terrainClear=false; break;
                             }
                         }
@@ -2825,6 +3160,9 @@ struct Track {
         append(0.0f,false);
         for(int j=1;j<=helixSteps;++j) append((float)j/helixSteps,true);
 
+        if (!points.empty() && !exitAnchorClear(points.back())) {
+            rng=savedRng; return false;
+        }
         mode=M_HELIX; turnDir=chosenDir; spatialIdx=0;
         spatialPts.swap(points); spatialUps.swap(frames); spatialD1.swap(d1s);
         spatialD2.swap(d2s); spatialD3.swap(d3s); spatialDs.swap(spans);
@@ -2901,7 +3239,7 @@ struct Track {
         struct SCorridor { float peakFloor, runoutTarget; };
         auto corridor = [&](float dir) {
             float x = gpos.x, z = gpos.z, yaw = gyaw, yawRate=genPrevDyaw;
-            float peakFloor = ordinaryCorridorFloor(groundTopAt(x, z));
+            float peakFloor = ordinaryCorridorFloor(genGroundTopAt(x, z));
             for (int i=0;i<candidateLen;++i) {
                 float t=((float)i+1.0f)/(float)candidateLen;
                 float wave=sinf(2.0f*PI*t);
@@ -2912,14 +3250,14 @@ struct Track {
                 z += cosf(yaw) * SEG_LEN;
                 for (float side : {-7.0f, 0.0f, 7.0f})
                     peakFloor = fmaxf(peakFloor, ordinaryCorridorFloor(
-                        groundTopAt(x + cosf(yaw) * side,
+                        genGroundTopAt(x + cosf(yaw) * side,
                                     z - sinf(yaw) * side)));
             }
             float runoutTarget = -1.0e9f;
             for (float out = 14.0f; out <= 168.0f; out += 14.0f)
                 for (float side : {-7.0f, 0.0f, 7.0f})
                     runoutTarget = fmaxf(runoutTarget, ordinaryRouteTarget(
-                        groundTopAt(x + sinf(yaw) * out + cosf(yaw) * side,
+                        genGroundTopAt(x + sinf(yaw) * out + cosf(yaw) * side,
                                     z + cosf(yaw) * out - sinf(yaw) * side)));
             return SCorridor{fmaxf(peakFloor,runoutTarget),runoutTarget};
         };
@@ -2947,8 +3285,8 @@ struct Track {
             yaw+=yawRate; x+=sinf(yaw)*SEG_LEN; z+=cosf(yaw)*SEG_LEN;
             float y=profileHeight(t);
             for(float side : {-7.0f,0.0f,7.0f})
-                if(y<ordinaryCorridorFloor(groundTopAt(
-                        x+cosf(yaw)*side,z-sinf(yaw)*side))) {
+                if(y<ordinaryCorridorFloor(genGroundTopAt(
+                        x+cosf(yaw)*side,z-sinf(yaw)*side))-0.05f) {
                     rng=savedRng; return false;
                 }
         }
@@ -2982,6 +3320,7 @@ struct Track {
             spatialUps[i]=orthoUp(tangent,Vector3Add(
                 Vector3Scale(WUP,cosf(bank)),Vector3Scale(side,sinf(bank))));
         }
+        if (!exitAnchorClear(spatialPts.back())) { rng=savedRng; return false; }
         BoundaryState finish;
         finish.tangent=candidateLen>1?Vector3Normalize(Vector3Subtract(
             spatialPts.back(),spatialPts[candidateLen-2])):start.tangent;
@@ -3004,11 +3343,11 @@ struct Track {
         bankT   = 0.05f;   // a whisper of over-bank for the diving lean; the sub-vertical clamp keeps it upright
         bankBase = 1.0f;   // full heartline base
         diveBaseY = gpos.y;
-        float clearance = gpos.y - groundTopAt(gpos.x, gpos.z);
+        float clearance = gpos.y - genGroundTopAt(gpos.x, gpos.z);
         diveDepth = Clamp(clearance - 8.0f, 8.0f, 30.0f);
         // Size the complete smoothstep dive from its analytic peak curvature.
-        int forceLen=(int)ceilf(genV*sqrtf(5.8f*diveDepth/(6.0f*GRAV))/SEG_LEN)+5;
-        remain=Clamp(std::max(irnd(9,12),forceLen),9,24);
+        int forceLen=(int)ceilf(genV*sqrtf(5.8f*diveDepth/(5.0f*GRAV))/SEG_LEN)+7;
+        remain=Clamp(std::max(irnd(9,12),forceLen),9,28);
         turnLen=remain;
         const Vector3 origin=gpos;
         const BoundaryState start=currentBoundary();
@@ -3040,6 +3379,7 @@ struct Track {
             spatialUps[i]=orthoUp(tangent,Vector3Add(
                 Vector3Scale(WUP,cosf(bank)),Vector3Scale(side,sinf(bank))));
         }
+        if (!exitAnchorClear(spatialPts.back())) return false;
         BoundaryState finish;
         finish.tangent=turnLen>1?Vector3Normalize(Vector3Subtract(
             spatialPts.back(),spatialPts[turnLen-2])):start.tangent;
@@ -3088,11 +3428,12 @@ struct Track {
             Vector3 p=Vector3Lerp(dense[i],dense[i+1],f);
             float yaw=gyaw+deltaYaw*spatialEase(t);
             for(float side : {-7.0f,0.0f,7.0f})
-                if(p.y < ordinaryCorridorFloor(groundTopAt(
+                if(p.y < ordinaryCorridorFloor(genGroundTopAt(
                         p.x+cosf(yaw)*side,
-                        p.z-sinf(yaw)*side)))
+                        p.z-sinf(yaw)*side))-0.05f)
                     return false;
         }
+        if (!exitAnchorClear(dense[denseN])) return false;
         spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx=0;
         spatialPts.reserve(hillLen); spatialUps.reserve(hillLen);
@@ -3207,11 +3548,11 @@ struct Track {
         float exitX=gpos.x+sinf(gyaw)*SEG_LEN*length;
         float exitZ=gpos.z+cosf(gyaw)*SEG_LEN*length;
         const float exitY=fmaxf(entryY,ordinaryRouteTarget(
-            groundTopAt(exitX,exitZ)));
+            genGroundTopAt(exitX,exitZ)));
         float midX=gpos.x+sinf(gyaw)*SEG_LEN*(0.5f*length);
         float midZ=gpos.z+cosf(gyaw)*SEG_LEN*(0.5f*length);
         float targetY=splash ? WATER_Y+0.9f
-            : fmaxf(groundTopAt(midX,midZ)+2.0f,entryY-24.0f);
+            : fmaxf(genGroundTopAt(midX,midZ)+2.0f,entryY-24.0f);
         targetY=fminf(targetY,entryY-8.0f);
         for(int k=1;k<=length;++k) {
             float t=(float)k/length;
@@ -3221,11 +3562,11 @@ struct Track {
             float x=gpos.x+sinf(gyaw)*SEG_LEN*k;
             float z=gpos.z+cosf(gyaw)*SEG_LEN*k;
             for(float side : {-7.0f,0.0f,7.0f}) {
-                float ground=groundTopAt(x+cosf(gyaw)*side,
+                float ground=genGroundTopAt(x+cosf(gyaw)*side,
                                          z-sinf(gyaw)*side);
                 float floor=splash&&submergedGround(ground)
                     ? WATER_Y+0.5f : ordinaryCorridorFloor(ground);
-                if(y<floor) return {};
+                if(y<floor-0.05f) return {};
             }
         }
         return {true,splash,length,entryY,exitY,targetY};
@@ -3282,7 +3623,7 @@ struct Track {
     // to be) so the SPLASHDOWN label + wheel spray actually get to fire.
     int waterAheadDist() const {   // first submerged step ahead (0 = none); scan cap 16 = half initDip's dipLen cap, so an aimed dip's bottom always reaches its pond
         for (int la = 2; la <= 16; la += 2)
-            if (submergedGround(groundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
+            if (submergedGround(genGroundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
                                             gpos.z + cosf(gyaw) * SEG_LEN * la))) return la;
         return 0;
     }
@@ -3343,11 +3684,18 @@ struct Track {
                 lastBankSign = 0.0f;
                 break;
         }
+        if (isBudgetInversion(m) && isBudgetInversion(lastElem))
+            lapInversionChains++;
+        familyRun = elemFamily(m) == elemFamily(lastElem) ? familyRun + 1 : 1;
         lapElemCount[m]++;
         lapAuthoredCount[m]++;
         prevElem = lastElem;
         lastElem = m;
         elems++;
+        // Beat bookkeeping: the committed feature advances the composed
+        // script once its beat has said its piece.
+        if (++beatFeatureCount >= beatTargetLen(beat)) advanceBeat();
+        else if (elems >= elemLimit - 3) { beat = BEAT_FINALE; }
     }
     void commitInitializedElement(bool selectedFeature = true) {
         SegMode committed = mode;
@@ -3379,32 +3727,71 @@ struct Track {
         return m == M_TURN || m == M_HELIX || m == M_DIVE || m == M_SCURVE ||
                m == M_BANKAIR || m == M_WAVE;
     }
-    enum EnergyArcPhase : unsigned char {
-        ARC_FRESH = 1, ARC_CRUISE = 2, ARC_RUNOUT = 4, ARC_ANY = 7
-    };
     struct ElementRule {
         float weight;
-        unsigned char phases;
+        unsigned char phases;   // BeatPhase mask this element serves
         int softMax;
     };
+    // Weights + beat membership tuned to the researched Falcon's Flight /
+    // Tormenta average (hills ~12.5%, banked turns ~21%, drops ~21%,
+    // Immelmann the dominant inversion at up to 3/lap, loop ~6%, S-curve
+    // ~8%) and, for element types absent from both references, to their
+    // origin type's own norm (helix and stall ~1/ride, corkscrews rare but
+    // always paired, splashdown 0-1/ride as the closing punctuation).
     static ElementRule elementRule(SegMode m) {
         switch (m) {
-            case M_CLIMB:    return {0.8f, ARC_FRESH,                 1};
-            case M_TURN:     return {2.0f, ARC_FRESH | ARC_CRUISE, 5};
-            case M_HILLS:    return {2.2f, ARC_CRUISE,             2};
-            case M_DIP:      return {0.6f, ARC_CRUISE | ARC_RUNOUT,1};
-            case M_SCURVE:   return {1.2f, ARC_FRESH | ARC_CRUISE, 2};
-            case M_DIVE:     return {1.0f, ARC_FRESH | ARC_CRUISE, 2};
-            case M_WAVE:     return {1.1f, ARC_FRESH | ARC_CRUISE, 2};
-            case M_BANKAIR:  return {1.1f, ARC_FRESH | ARC_CRUISE, 2};
-            case M_HELIX:    return {2.0f, ARC_RUNOUT,              1};
-            case M_LOOP:     return {2.5f, ARC_CRUISE | ARC_RUNOUT,0};
-            case M_ROLL:     return {1.8f, ARC_RUNOUT,              0};
-            case M_IMMEL:    return {2.4f, ARC_CRUISE,              0};
-            case M_DIVELOOP: return {1.0f, ARC_RUNOUT,              0};
-            case M_STALL:    return {2.2f, ARC_RUNOUT,              0};
-            default:         return {1.0f, ARC_ANY,                 0};
+            case M_CLIMB:    return {0.8f, BEAT_RUSH,                1};
+            case M_TURN:     return {1.6f, BEAT_RUSH | BEAT_BREATH |
+                                          BEAT_FINALE,              2};
+            case M_HILLS:    return {2.4f, BEAT_AIR,                3};
+            case M_DIP:      return {0.8f, BEAT_BREATH | BEAT_FINALE, 1};
+            case M_SCURVE:   return {1.6f, BEAT_RUSH | BEAT_BREATH, 2};
+            case M_DIVE:     return {1.0f, BEAT_RUSH | BEAT_BREATH, 2};
+            case M_WAVE:     return {1.1f, BEAT_RUSH | BEAT_AIR |
+                                          BEAT_FINALE,              2};
+            case M_BANKAIR:  return {1.3f, BEAT_AIR,                2};
+            case M_HELIX:    return {2.6f, BEAT_INV | BEAT_FINALE,  1};
+            case M_LOOP:     return {1.5f, BEAT_INV,                0};
+            case M_ROLL:     return {0.45f, BEAT_INV | BEAT_FINALE, 0};
+            case M_IMMEL:    return {3.2f, BEAT_INV,                0};
+            case M_DIVELOOP: return {1.0f, BEAT_INV,                0};
+            case M_STALL:    return {1.6f, BEAT_INV,                0};
+            default:         return {1.0f, BEAT_ANY,                0};
         }
+    }
+    // Per-subtype lap caps from the references: Tormenta runs THREE
+    // Immelmanns and one loop; RMC stalls and giga helices are one-per-ride;
+    // corkscrews arrive as one (usually doubled) event.
+    static int inversionLapCap(SegMode m) {
+        switch (m) {
+            case M_IMMEL:    return 3;
+            case M_LOOP:     return 2;
+            case M_ROLL:     return 2;
+            case M_STALL:    return 1;
+            case M_DIVELOOP: return 1;
+            default:         return INT_MAX;
+        }
+    }
+    int beatTargetLen(unsigned char b) const {
+        switch (b) {
+            case BEAT_RUSH:   return 2;
+            case BEAT_AIR:    return 3;
+            case BEAT_INV:    return 2;
+            case BEAT_BREATH: return 1;
+            default:          return 1000;   // FINALE runs to the launch
+        }
+    }
+    void advanceBeat() {
+        if (elems >= elemLimit - 3) { beat = BEAT_FINALE; beatFeatureCount = 0; return; }
+        switch (beat) {
+            case BEAT_RUSH:   beat = BEAT_AIR;    break;
+            case BEAT_AIR:    beat = hardInvCount < INVERSION_BUDGET
+                                     ? BEAT_INV : BEAT_BREATH; break;
+            case BEAT_INV:    beat = BEAT_BREATH; break;
+            case BEAT_BREATH: beat = BEAT_AIR;    break;
+            default:          beat = BEAT_FINALE; break;
+        }
+        beatFeatureCount = 0;
     }
     // Ground-oriented tricks are offered only in their terrain-relative height band.
     static float maxTrickHeight(SegMode m) {
@@ -3442,14 +3829,19 @@ struct Track {
     // top on that deficit (measured: 85-frame crawl-stall in a HILLS->LOOP).
     // Axis rolls and stalls have no big top, so they keep the wider window.
     static float invVMinFrac(SegMode m) {
+        // The former 0.92/0.95 floors made the loop/Immelmann windows only
+        // 13-18 km/h wide, so the schedule almost never landed a boundary
+        // inside them (measured: IMMEL 0.6-2.7%% of features vs the ~19%%
+        // reference).  0.80/0.82 opens realistic entry bands; the crest-carry
+        // caps in invRAt still guarantee the top is taken cleanly.
         switch (m) {
-            case M_LOOP: return 0.92f;
-            case M_IMMEL: return 0.95f;
+            case M_LOOP: return 0.82f;
+            case M_IMMEL: return 0.80f;
             case M_ROLL: return 0.82f;
             default:                       return 0.68f;
         }
     }
-    bool eligibleElem(SegMode m, bool variety = true) const {
+    bool eligibleElem(SegMode m, bool variety = true, bool asRecovery = false) const {
         switch (m) {
             case M_CLIMB:
             case M_LOOP: case M_ROLL: case M_IMMEL: case M_STALL:
@@ -3471,22 +3863,36 @@ struct Track {
             float vMax = invVMax(m);
             if (vMax < 1e8f && (genV > vMax || genV < invVMinFrac(m) * vMax)) return false;
         }
-        // Inversions are optional setpieces: at most four per lap, never
-        // adjacent, and no repeated subtype.
-        if (isBudgetInversion(m) && hardInvCount >= INVERSION_BUDGET) return false;
+        // Inversions: at most four per lap, subtype caps from the references
+        // (Tormenta runs three Immelmanns), and adjacency allowed only for
+        // the real back-to-back pairs (Tormenta's Immelmann-loop chain, the
+        // classic double corkscrew), at most two chained pairs per lap.
         if (isBudgetInversion(m)) {
-            if (isBudgetInversion(lastElem) || lapAuthoredCount[m] >= 1)
-                return false;
+            if (hardInvCount >= INVERSION_BUDGET) return false;
+            if (lapAuthoredCount[m] >= inversionLapCap(m)) return false;
+            // Corkscrews are a rare set-piece (a few per ride, usually as a
+            // double): offer the event only every other lap.
+            if (m == M_ROLL && (completedLapSerial & 1u)) return false;
+            if (!asRecovery) {
+                if (isBudgetInversion(lastElem)) {
+                    const bool naturalPair =
+                        (m == M_ROLL && lastElem == M_ROLL) ||
+                        (m == M_LOOP && lastElem == M_IMMEL) ||
+                        (m == M_IMMEL && lastElem == M_LOOP) ||
+                        (m == M_IMMEL && lastElem == M_IMMEL);
+                    if (!naturalPair || lapInversionChains >= 2) return false;
+                }
+            }
         }
-        const float groundHere = groundTopAt(gpos.x, gpos.z);
+        const float groundHere = genGroundTopAt(gpos.x, gpos.z);
         float clr = gpos.y - groundHere;
-        if (gpos.y < ordinaryCorridorFloor(groundHere)) return false;
+        if (gpos.y < ordinaryCorridorFloor(groundHere) - 0.05f) return false;
         if (m == M_CLIMB) {
-            // A record-scale camelback/top hat is the high-speed energy
-            // conversion motif.  It is offered only when the train can carry
-            // the complete 165 m reference rise and no more than twice per
-            // lap (the launch exit normally consumes the first slot).
-            if (lapTopHatCount >= 2 || clr > 72.0f ||
+            // The record-scale camelback/top hat is the lap's single opening
+            // statement (Falcon's Flight has exactly one 165 m arch).  One
+            // per lap: the launch exit normally consumes it; a mid-lap top
+            // hat exists only on laps whose launch exited another way.
+            if (lapTopHatCount >= 1 || clr > 72.0f ||
                 maxClearH(34.0f) < TOP_HAT_RECORD_RISE)
                 return false;
         }
@@ -3506,7 +3912,7 @@ struct Track {
         if (trickMax > 0.0f) {
             float gtLo = gpos.y - clr;
             for (int la = 2; la <= 10; la += 2)
-                gtLo = fminf(gtLo, groundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
+                gtLo = fminf(gtLo, genGroundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
                                                gpos.z + cosf(gyaw) * SEG_LEN * la));
             if (gpos.y - gtLo > trickMax + 45.0f) return false;
         }
@@ -3549,7 +3955,17 @@ struct Track {
         }
         // Fixed hills cannot own a corridor that rises beyond their profile.
         if ((m == M_HILLS || m == M_BANKAIR || m == M_WAVE) && hillRiseAhead() > 26.0f) return false;
-        // Dips require a non-rising, fully qualified corridor.
+        // Dips require a non-rising, fully qualified corridor.  A splashdown
+        // is closing punctuation (SheiKra runs its water skim as one of the
+        // final elements, and only ever one): a WATER dip may appear once the
+        // lap is past its midpoint, a dry dip only in the last third, once.
+        if (m == M_DIP) {
+            if (lapAuthoredCount[M_DIP] >= 1) return false;
+            const bool water = waterAheadDist() > 0 &&
+                               gpos.y - WATER_Y <= 35.0f;
+            if (elems < (water ? elemLimit / 2 : (2 * elemLimit) / 3))
+                return false;
+        }
         if (m == M_DIP && hillRiseAhead() > 14.0f) return false;
         if (m == M_DIP && !dipCorridorViable()) return false;
         // Closed-form elements require a viable complete footprint.
@@ -3559,34 +3975,39 @@ struct Track {
             for (int la = 2; la <= 26; la += 2)
                 for (int ls = -1; ls <= 1; ls++) {
                     float latOff = ls * 0.24f * (la * SEG_LEN);
-                    floorMax = fmaxf(floorMax, ordinaryCorridorFloor(groundTopAt(
+                    floorMax = fmaxf(floorMax, ordinaryCorridorFloor(genGroundTopAt(
                         gpos.x + sinf(gyaw) * SEG_LEN * la + cosf(gyaw) * latOff,
                         gpos.z + cosf(gyaw) * SEG_LEN * la - sinf(gyaw) * latOff)));
                 }
-            if (floorMax > gpos.y) return false;
+            if (floorMax > gpos.y + 0.05f) return false;
         }
         // A DIVE turn descends -- only offer it with real height to dive from, AND only where the
         // ground ahead isn't rising (a dive into a climbing hillside gets lifted by the clearance
         // floor and ends up CLIMBING, contradicting its name). Both guards keep the label honest.
         if (m == M_DIVE) {
             if (clr < 20.0f) return false;
-            float gtHere = groundTopAt(gpos.x, gpos.z), gtAhead = gtHere;
+            float gtHere = genGroundTopAt(gpos.x, gpos.z), gtAhead = gtHere;
             for (int la = 4; la <= 12; la++)
-                gtAhead = fmaxf(gtAhead, groundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
+                gtAhead = fmaxf(gtAhead, genGroundTopAt(gpos.x + sinf(gyaw) * SEG_LEN * la,
                                                      gpos.z + cosf(gyaw) * SEG_LEN * la));
             if (gtAhead > gtHere + 28.0f) return false;   // only block a dive into a STEEP rising hillside; the HUD pitch-relabel backstops milder cases
         }
-        return !variety || (elemFamily(m) != elemFamily(lastElem) && m != prevElem);
+        // Variety: never the same subtype twice in three features, and no
+        // more than two consecutive features from one family.  (The old
+        // whole-family ban emptied the pool whenever only the banked family
+        // was speed-eligible, forcing deep relaxation and the measured 43%%
+        // TURN share.)
+        return !variety ||
+               (m != prevElem && m != lastElem &&
+                (elemFamily(m) != elemFamily(lastElem) || familyRun < 2));
     }
     bool eligibleNoVariety(SegMode m) const {
         return eligibleElem(m, false);
     }
-
-    EnergyArcPhase energyArcPhase() const {
-        const float t = Clamp(distanceSincePower() /
-                              V1_PROPULSION.nominalCadence, 0.0f, 1.0f);
-        return t < 0.28f ? ARC_FRESH : t < 0.68f ? ARC_CRUISE : ARC_RUNOUT;
+    bool eligibleAsRecovery(SegMode m) const {
+        return eligibleElem(m, false, true);
     }
+
     float elementWeight(SegMode m) const {
         const ElementRule rule = elementRule(m);
         if (isBudgetInversion(m) || rule.softMax <= 0) return rule.weight;
@@ -3603,45 +4024,52 @@ struct Track {
             M_CLIMB, M_HILLS, M_BANKAIR, M_DIP, M_TURN, M_SCURVE, M_DIVE, M_WAVE,
             M_HELIX, M_IMMEL, M_LOOP, M_ROLL, M_DIVELOOP, M_STALL
         };
-        const EnergyArcPhase phase = energyArcPhase();
         SegMode valid[sizeof(pool) / sizeof(pool[0])];
         float weights[sizeof(pool) / sizeof(pool[0])];
-        // The scheduling PREFERENCES -- energy-arc phase, family variety, and
-        // no-immediate-repeat -- shape the element mix but must never be able to
-        // empty the successor pool and strand generation.  The per-element
-        // ENTRY-SPEED, terrain and geometry windows in eligibleElem() are hard
-        // physical constraints and always apply; the preferences are relaxed in
-        // order only when the stricter pool is empty:
-        //   level 0: phase + variety + no-repeat  (the intended mix)
-        //   level 1: drop the energy-arc phase preference
+        // The scheduling PREFERENCES -- the composed beat script, family
+        // variety, and no-immediate-repeat -- shape the mix and the rhythm
+        // but must never empty the successor pool and strand generation.  The
+        // per-element ENTRY-SPEED, terrain and geometry windows in
+        // eligibleElem() are hard physical constraints and always apply; the
+        // preferences relax in order only when the stricter pool is empty:
+        //   level 0: beat + variety + no-repeat  (the composed ride).  If the
+        //            current beat has no eligible member (say the speed sits
+        //            outside every inversion window during an INV beat), the
+        //            script advances to the next beat and retries, so the
+        //            rhythm bends instead of breaking.
+        //   level 1: drop the beat preference
         //   level 2: also drop family variety (allow a same-family successor)
         //   level 3: also allow repeating the immediately preceding element
         // Every level still requires a physically buildable element, so a
         // relaxed pick is always a real, in-band feature -- never a fake or a
-        // g-limit violation.  This is what lets a full lap complete when a fast
-        // top-hat exit (only a hard turn qualifies) or a post-inversion runout
-        // (only a terrain-blocked helix qualifies) would otherwise dead-end.
+        // g-limit violation.
         for (int relax = 0; relax < 4; ++relax) {
             const bool dropPhase   = relax >= 1;
             const bool dropVariety = relax >= 2;
             const bool allowRepeat = relax >= 3;
-            int count = 0;
-            float sum = 0.0f;
-            for (SegMode m : pool) {
-                if ((excluded & (UINT32_C(1) << m)) ||
-                    (!allowRepeat && m == lastElem) ||
-                    (!dropPhase && !(elementRule(m).phases & phase)) ||
-                    !eligibleElem(m, !dropVariety))
-                    continue;
-                valid[count] = m;
-                weights[count] = elementWeight(m);
-                sum += weights[count++];
+            const int beatAttempts = dropPhase ? 1 : 5;
+            for (int beatTry = 0; beatTry < beatAttempts; ++beatTry) {
+                int count = 0;
+                float sum = 0.0f;
+                for (SegMode m : pool) {
+                    if ((excluded & (UINT32_C(1) << m)) ||
+                        (!allowRepeat && m == lastElem) ||
+                        (!dropPhase && !(elementRule(m).phases & beat)) ||
+                        !eligibleElem(m, !dropVariety))
+                        continue;
+                    valid[count] = m;
+                    weights[count] = elementWeight(m);
+                    sum += weights[count++];
+                }
+                if (count) {
+                    if (dropVariety) fallbackRelaxedPicks++;
+                    float draw = frnd(0.0f, sum);
+                    for (int i = 0; i < count; ++i)
+                        if ((draw -= weights[i]) <= 0.0f) return valid[i];
+                    return valid[count - 1];
+                }
+                if (!dropPhase) advanceBeat();
             }
-            if (!count) continue;
-            float draw = frnd(0.0f, sum);
-            for (int i = 0; i < count; ++i)
-                if ((draw -= weights[i]) <= 0.0f) return valid[i];
-            return valid[count - 1];
         }
         return M_COUNT;
     }
@@ -3649,7 +4077,26 @@ struct Track {
         SegMode mode;
         int steps;
         float startY, endY, startDy, startCurvature;
+        // Total heading change over the connector.  A connective span is a
+        // drawn-out gentle curve by default (Intamin's own Falcon's Flight
+        // language: "drawn-out curves, gentle banking"), never a long dead
+        // straight; zero stays available where the corridor demands it.
+        float yawTarget = 0.0f;
     };
+
+    // One shared yaw-rate law for planning and emission: the requested rate
+    // follows the turn shoulder so it eases in and out, normalised to
+    // integrate to the plan's yawTarget; limitedYawRate then keeps the
+    // inherited entry rate continuous and the lateral g bounded.
+    static float connectorYawRequest(const ConnectorPlan &plan, int step) {
+        if (plan.steps <= 0 || plan.yawTarget == 0.0f) return 0.0f;
+        float weight = 0.0f;
+        for (int i = 0; i < plan.steps; ++i)
+            weight += turnShoulder(((float)i + 1.0f) / (float)plan.steps);
+        if (weight <= 1.0e-4f) return 0.0f;
+        return plan.yawTarget *
+               turnShoulder(((float)step + 1.0f) / (float)plan.steps) / weight;
+    }
 
     static float connectorHeight(const ConnectorPlan &plan, float t) {
         t = Clamp(t, 0.0f, 1.0f);
@@ -3687,7 +4134,9 @@ struct Track {
                                     0.0010f, 0.24f);
         for (int step = 1; step <= plan.steps + runout; ++step) {
             const float x0 = x, z0 = z, yaw0 = yaw;
-            yawRate = Clamp(0.0f, yawRate - jlimYaw, yawRate + jlimYaw);
+            const float requested = step <= plan.steps
+                ? connectorYawRequest(plan, step - 1) : 0.0f;
+            yawRate = Clamp(requested, yawRate - jlimYaw, yawRate + jlimYaw);
             yaw += yawRate;
             x += sinf(yaw) * SEG_LEN;
             z += cosf(yaw) * SEG_LEN;
@@ -3704,7 +4153,7 @@ struct Track {
                 float target = -1.0e9f;
                 float deck = -1.0e9f;
                 for (float side : {-7.0f, 0.0f, 7.0f}) {
-                    const float ground = groundTopAt(
+                    const float ground = genGroundTopAt(
                         sx + cosf(sideYaw) * side,
                         sz - sinf(sideYaw) * side);
                     floor = fmaxf(floor, ordinaryCorridorFloor(ground));
@@ -3741,7 +4190,8 @@ struct Track {
         spatialD3.clear(); spatialDs.clear(); spatialIdx = 0;
         spatialPts.reserve(plan.steps); spatialUps.resize(plan.steps, WUP);
         for (int step = 1; step <= plan.steps; ++step) {
-            yawRate = limitedYawRate(0.0f, yawRate, plan.mode);
+            yawRate = limitedYawRate(connectorYawRequest(plan, step - 1),
+                                     yawRate, plan.mode);
             yaw += yawRate;
             x += sinf(yaw) * SEG_LEN;
             z += cosf(yaw) * SEG_LEN;
@@ -3768,6 +4218,12 @@ struct Track {
         spatialUps.back() = finish.up;
         deriveSpatialArcData(origin, start, finish);
         SpatialRun run = makeSpatialRun(origin, start.up, true);
+        // The felt-bank law owns the connector frame: it starts at the exact
+        // incoming bank, leans gently with whatever plan curvature the yaw
+        // law produced, and unwinds to a governed neutral exit.  The old
+        // flat-frame blend both snapped leaned entries and rode every curve
+        // unbanked.
+        attachFeltBankFrame(run, genV, 1.0f, 1.10f);
         if (!spatialCorridorClear(run)) {
             return false;
         }
@@ -3818,7 +4274,21 @@ struct Track {
             Vector3 tangent = Vector3Subtract(after, before);
             tangent = Vector3Length(tangent) > 1.0e-5f
                 ? Vector3Normalize(tangent) : start.tangent;
-            spatialUps[i] = orthoUp(tangent, WUP);
+            // Even an escape banks its curve: the c3 yaw law's rate is zero at
+            // both ends, so the felt bank eases in and out with the turn and
+            // the arc's lateral load rotates into the seat instead of riding
+            // an unbanked 2-radian sweep at speed.
+            const float t = ((float)i + 1.0f) / steps;
+            const float tPrev = (float)i / steps;
+            const float yawRate = yawTarget * (c3Ease(t) - c3Ease(tPrev));
+            const float lateral = genV * genV * fabsf(yawRate) / SEG_LEN;
+            const float bank = Clamp((yawRate >= 0.0f ? 1.0f : -1.0f) *
+                                     atan2f(lateral, GRAV), -1.0f, 1.0f);
+            const Vector3 side = Vector3Normalize(
+                Vector3CrossProduct(WUP, tangent));
+            spatialUps[i] = orthoUp(tangent, Vector3Add(
+                Vector3Scale(WUP, cosf(bank)),
+                Vector3Scale(side, sinf(bank))));
         }
         BoundaryState finish;
         finish.tangent = steps > 1
@@ -3933,19 +4403,15 @@ struct Track {
     bool startLevelConnector(int steps, float endY, bool preserveTarget = false) {
         steps = Clamp(std::max(steps, MIN_CONN), MIN_CONN, 24);
         auto reroute=[&] { return routeConnectorAround(); };
+        const float preferredDir = fabsf(lastBankSign) > 0.5f ? -lastBankSign
+                                 : (turnDir < 0.0f ? -1.0f : 1.0f);
         for (int pass = 0; pass < 24; ++pass) {
-            ConnectorPlan level{M_FLAT, steps, gpos.y, endY,
-                                genPrevDy, genPrevCurv};
-            ConnectorTerrain terrain = inspectConnectorTerrain(level);
-            if (!preserveTarget) {
-                const float desired = terrain.terminalTarget;
-                const float reach = 0.30f * steps * SEG_LEN;
-                level.endY = Clamp(desired, gpos.y - reach, gpos.y + reach);
-            }
-            // Size from the actual C2 curve rather than a separate
-            // smootherstep estimate.  A transition may not manufacture an
+            // Vertical force sizing first: the height law is shared by every
+            // heading candidate.  A transition may not manufacture an
             // element's force target; keep its predicted vertical load inside
             // a broad +6/-3 g connective envelope and extend only as needed.
+            ConnectorPlan level{M_FLAT, steps, gpos.y, endY,
+                                genPrevDy, genPrevCurv};
             bool forceOK = true;
             float previousDy = level.startDy;
             float v = genV;
@@ -3964,12 +4430,42 @@ struct Track {
                 if (++steps > 24) return reroute();
                 continue;
             }
-            terrain = inspectConnectorTerrain(level);
-            if (terrain.deficiency <= 0.05f) return commitConnector(level);
-            if (preserveTarget && terrain.terminalFloor > gpos.y + 0.25f) {
-                ConnectorPlan climb{};
-                if (planTerrainClimb(fmaxf(endY, terrain.terminalDeck), climb)) {
-                    return commitConnector(climb);
+            // A settling span is a drawn-out gentle curve by default (the
+            // ride should wind with its terrain); dead straight is the final
+            // candidate, not the default.  Each heading sees different
+            // terrain, so the hug target is resolved per candidate.
+            const float yawCandidates[5] = {
+                0.45f * preferredDir, -0.45f * preferredDir,
+                0.85f * preferredDir, -0.85f * preferredDir, 0.0f };
+            ConnectorPlan ranked[5]; float score[5]; int found = 0;
+            for (float yawT : yawCandidates) {
+                ConnectorPlan candidate{M_FLAT, steps, gpos.y, endY,
+                                        genPrevDy, genPrevCurv, yawT};
+                ConnectorTerrain terrain = inspectConnectorTerrain(candidate);
+                if (!preserveTarget) {
+                    const float reach = 0.42f * steps * SEG_LEN;
+                    candidate.endY = Clamp(terrain.terminalTarget,
+                                           gpos.y - reach, gpos.y + reach);
+                    terrain = inspectConnectorTerrain(candidate);
+                }
+                if (terrain.deficiency > 0.05f) continue;
+                const float s = fabsf(candidate.endY - terrain.terminalTarget) +
+                                (yawT == 0.0f ? 2.0f : 0.4f * fabsf(yawT));
+                int at = found++;
+                while (at > 0 && score[at - 1] > s) {
+                    ranked[at] = ranked[at - 1]; score[at] = score[at - 1]; --at;
+                }
+                ranked[at] = candidate; score[at] = s;
+            }
+            for (int i = 0; i < found; ++i)
+                if (commitConnector(ranked[i])) return true;
+            if (preserveTarget) {
+                const ConnectorTerrain terrain = inspectConnectorTerrain(level);
+                if (terrain.terminalFloor > gpos.y + 0.25f) {
+                    ConnectorPlan climb{};
+                    if (planTerrainClimb(fmaxf(endY, terrain.terminalDeck),
+                                         climb))
+                        return commitConnector(climb);
                 }
             }
             return reroute();
@@ -4022,11 +4518,20 @@ struct Track {
                 Vector3DotProduct(orthoUp(neutralForward, up.back()),
                                   orthoUp(neutralForward, WUP)) >=
                     cosf(2.0f * DEG2RAD);
+            // Elements that author their rider frame from a neutral entry
+            // assumption must actually GET a neutral entry: blending a leaned
+            // incoming frame across their first span was the "90 degrees in
+            // under 0.2 s" roll snap.  TURN and the connectors are exempt --
+            // their felt-bank law starts from the exact incoming bank.
+            const bool authorsFromNeutral =
+                pick == M_ROLL || pick == M_DIP || pick == M_STALL ||
+                pick == M_LOOP || pick == M_IMMEL || pick == M_DIVELOOP ||
+                pick == M_HELIX || pick == M_SCURVE || pick == M_DIVE ||
+                pick == M_BANKAIR || pick == M_WAVE || pick == M_HILLS;
             const bool needsNeutral = (!ownsSlope && fabsf(genPrevDy)>dyLimit) ||
                                       (!ownsCurvature && fabsf(genPrevCurv)>d2Limit) ||
                                       fabsf(genPrevDyaw)>yawLimit ||
-                                      ((pick == M_ROLL || pick == M_DIP ||
-                                        pick == M_STALL) && !neutralFrame);
+                                      (authorsFromNeutral && !neutralFrame);
             if (needsNeutral) {
                 if (inheritedRouteAttempts >= MAX_PENDING_ROUTE_ATTEMPTS ||
                     consecutiveRoutingRuns >= MAX_CONSECUTIVE_ROUTING_RUNS) {
@@ -4040,6 +4545,19 @@ struct Track {
                     (int)ceilf(fabsf(genPrevCurv)/d2Limit)+2);
                 settleSteps=std::max(settleSteps,
                     (int)ceilf(fabsf(genPrevDyaw)/yawLimit)+2);
+                // The settling connector must also have room to unwind the
+                // incoming bank under the ROLL_RATE ceiling (its frame blend
+                // is a c3 ease whose peak slope is ~2.19/steps).
+                if (!neutralFrame && !up.empty()) {
+                    const Vector3 natural = orthoUp(neutralForward, WUP);
+                    const float lean = acosf(Clamp(Vector3DotProduct(
+                        orthoUp(neutralForward, up.back()), natural),
+                        -1.0f, 1.0f));
+                    const float capPerSpan = ROLL_RATE_DEG_PER_SEC * DEG2RAD /
+                        fmaxf(genV, 25.0f) * SEG_LEN;
+                    settleSteps = std::max(settleSteps,
+                        (int)ceilf(2.19f * lean / fmaxf(capPerSpan, 1.0e-4f)));
+                }
                 pending={PendingKind::Element,pick,inheritedRouteAttempts};
                 if(startLevelConnector(Clamp(settleSteps,MIN_CONN,24),gpos.y)) {
                     commitInitializedElement(false);
@@ -4098,9 +4616,9 @@ struct Track {
         // Force a genuine gravity descent (M_DROP) whenever the element ends above the ground band,
         // not just when powered (launch/boost/climb); M_DROP's own nextMode continuation then drives
         // it all the way back down to a low clearance.
-        float h = gpos.y - groundTopAt(gpos.x, gpos.z);
+        float h = gpos.y - genGroundTopAt(gpos.x, gpos.z);
         bool powered = (mode == M_LAUNCH || mode == M_BOOST || mode == M_CLIMB);
-        if (!powered && h <= 16.0f) {
+        if (!powered && h <= 10.0f) {
             // No physical drop is needed. Re-enter the scheduler immediately
             // after the terminal point has been published. Calling nextMode
             // from inside an element step let a new analytical element's
@@ -4123,11 +4641,11 @@ struct Track {
     }
 
     float recoveryClearanceAhead() const {
-        float localGround = groundTopAt(gpos.x, gpos.z);
+        float localGround = genGroundTopAt(gpos.x, gpos.z);
         float highestGround = localGround;
         for (float distance = 14.0f; distance <= 84.0f; distance += 14.0f)
             highestGround = fmaxf(highestGround,
-                groundTopAt(gpos.x + sinf(gyaw) * distance,
+                genGroundTopAt(gpos.x + sinf(gyaw) * distance,
                             gpos.z + cosf(gyaw) * distance));
         return gpos.y - highestGround;
     }
@@ -4137,6 +4655,29 @@ struct Track {
         const PendingAction successor =
             (pending.kind == PendingKind::Boost || pending.kind == PendingKind::Launch)
             ? pending : PendingAction{};
+        // Real layouts spend altitude on set-pieces: a dive loop or a
+        // descending helix IS the recovery when its window is open (this is
+        // also the only altitude these descending elements can ever get --
+        // the plain drop otherwise consumes every elevated exit, which is
+        // why both subtypes were generation-dead).
+        if (successor.kind == PendingKind::None) {
+            const float descendPick = rnd01();
+            SegMode descend = descendPick < 0.5f ? M_DIVELOOP : M_HELIX;
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                if (eligibleAsRecovery(descend)) {
+                    Track candidate = *this;
+                    candidate.pending = {};
+                    const bool built = descend == M_DIVELOOP
+                        ? candidate.initDiveLoop() : candidate.initHelix();
+                    if (built) {
+                        candidate.commitInitializedElement(true);
+                        *this = std::move(candidate);
+                        return true;
+                    }
+                }
+                descend = descend == M_DIVELOOP ? M_HELIX : M_DIVELOOP;
+            }
+        }
         if (beginDropProfile()) {
             pending = successor;
             return true;
@@ -4152,7 +4693,7 @@ struct Track {
     }
 
     void nextMode() {
-        float h = gpos.y - groundTopAt(gpos.x, gpos.z);
+        float h = gpos.y - genGroundTopAt(gpos.x, gpos.z);
         if (terrainAvoidanceTurn && mode == M_TURN)
             terrainAvoidanceTurn = false;
         if (pending.kind != PendingKind::None) {
@@ -4174,7 +4715,7 @@ struct Track {
         if (stationPending && h < 14.0f &&
             (mode == M_FLAT || mode == M_TURN || mode == M_HILLS)) {
             float cs = cosf(gyaw), sn = sinf(gyaw);
-            float maxG = groundTopAt(gpos.x, gpos.z);
+            float maxG = genGroundTopAt(gpos.x, gpos.z);
             // Set the deck to clear the station + berth + near-launch corridor. It does NOT have to clear
             // the FAR launch: the powered LSM launch inclines UP rising ground (rate-capped, in M_LAUNCH)
             // rather than needing a sky-high flat deck an UNPOWERED approach could never climb into (a
@@ -4182,7 +4723,7 @@ struct Track {
             // gently-ramped approach keep the deck reachable and the berth level.
             for (float lz = -28.0f; lz <= 200.0f; lz += 7.0f)
                 for (float lx = -6.0f; lx <= 6.0f; lx += 6.0f)
-                    maxG = fmaxf(maxG, groundTopAt(gpos.x + cs*lx + sn*lz, gpos.z - sn*lx + cs*lz));
+                    maxG = fmaxf(maxG, genGroundTopAt(gpos.x + cs*lx + sn*lz, gpos.z - sn*lx + cs*lz));
             stationDeckY  = fmaxf(gpos.y, maxG + 6.0f);
             // Approach length sized to the climb so the ramp holds <=~20 deg (|dy| <= ~5 m/cp): a fixed
             // 5-cp ramp onto a high elevated deck (measured 70 m gap) put +30 m in ONE cp.
@@ -4248,6 +4789,20 @@ struct Track {
             case M_ROLL:
             case M_LOOP:
             case M_DIVELOOP: {
+                // Double corkscrew: real corkscrews arrive in consecutive
+                // pairs ("the end of one leads straight into the next"), same
+                // handedness.  Chain the second immediately, most of the time,
+                // while the inversion budget and speed window allow it.
+                if (mode == M_ROLL && lapAuthoredCount[M_ROLL] == 1 &&
+                    hardInvCount < INVERSION_BUDGET &&
+                    genV <= invVMax(M_ROLL) && rnd01() < 0.72f) {
+                    Track candidate = *this;
+                    if (candidate.initRoll(rollHand)) {
+                        candidate.commitInitializedElement(true);
+                        *this = std::move(candidate);
+                        break;
+                    }
+                }
                 float clearanceAhead = recoveryClearanceAhead();
                 if (clearanceAhead > 22.0f) {
                     if(!startRecoveryDrop(false)) nextModePending=true;
@@ -4274,7 +4829,7 @@ struct Track {
                     float cs = cosf(gyaw), sn = sinf(gyaw);
                     float gtHere = gpos.y - h, corrMax = gtHere;
                     for (float lz = 10.0f; lz <= 150.0f; lz += 10.0f)
-                        corrMax = fmaxf(corrMax, groundTopAt(gpos.x + sn * lz, gpos.z + cs * lz));
+                        corrMax = fmaxf(corrMax, genGroundTopAt(gpos.x + sn * lz, gpos.z + cs * lz));
                     if (corrMax - gtHere > 18.0f || h > 16.0f) wantLaunch = false;
                 }
                 // Arrive-slow station approach: once a station stop is pending, stop re-powering
@@ -4296,7 +4851,7 @@ struct Track {
                 // ordinary element or helix cannot repeatedly pre-empt it and
                 // postpone propulsion until stall speed.
                 if (wantLaunch || wantBoost) {
-                    if (hAhead > 22.0f) {
+                    if (hAhead > 14.0f) {
                         pending = {wantLaunch ? PendingKind::Launch
                                               : PendingKind::Boost,
                                    M_COUNT};
@@ -4319,7 +4874,7 @@ struct Track {
                 // ending 'elevated' over local ground on a downslope is NOT a reason to insert a
                 // near-zero DROP (the "drop element for no reason" -- measured cp278/300 DROP net ~0,
                 // then buried). If the ground rises back up ahead, there is nothing to drop into.
-                if (hAhead > 22.0f) {
+                if (hAhead > 14.0f) {
                     if(!startRecoveryDrop(wasBanked)) nextModePending=true;
                 }
                 // Flow straight into the next element. Every authored banked
@@ -4507,6 +5062,7 @@ struct Track {
             // progress) and keep the streaming track alive with one more escape,
             // so generation can never be trapped by terrain a launch cannot clear.
             if (escapesSinceLaunch >= ESCAPES_PER_LAP) {
+                fallbackForcedLapCloses++;
                 closeLapAtLaunch();
                 consecutiveEscapes = 0;
                 pending = {}; connLen = 0; terrainAvoidanceTurn = false;
@@ -4573,7 +5129,7 @@ struct Track {
             // next launch can find a clear powered deck and close the lap.  A
             // long stretch that only ever skims the cut floor never lets a launch
             // build, and the lap streams flat escapes until the census guard.
-            plan.endY = Clamp(fmaxf(terrain.terminalDeck, terrain.terminalTarget),
+            plan.endY = Clamp(fmaxf(terrain.terminalDeck, terrain.terminalTarget) + 0.6f,
                               loY, hiY);
             for (int pass = 0; pass < 6; ++pass) {
                 terrain = inspectConnectorTerrain(plan);
@@ -4583,6 +5139,7 @@ struct Track {
             if (inspectConnectorTerrain(plan).deficiency > 0.05f) continue;
             plan.mode = plan.endY > gpos.y + 0.5f ? M_CLIMB : M_FLAT;
             if (commitConnector(plan)) {
+                fallbackEscapes++;
                 return true;
             }
         }
@@ -4608,12 +5165,13 @@ struct Track {
                     for (float d = SEG_LEN; d <= steps * SEG_LEN; d += 2.0f * SEG_LEN) {
                         const float ax = gpos.x + sinf(yaw) * d;
                         const float az = gpos.z + cosf(yaw) * d;
-                        const TerrainSurface s = terrainSurfaceAt(ax, az);
+                        const TerrainSurface s = genTerrainSurfaceAt(ax, az);
                         deck = fmaxf(deck, (s.water ? s.waterSurface : s.solidTop)
                                      + TERRAIN_DECK_CLEARANCE);
                     }
-                    const float endY = Clamp(deck, loY, hiY);
+                    const float endY = Clamp(deck + 0.6f, loY, hiY);
                     if (commitEscapeArc(yawTarget, steps, endY, startDyArc)) {
+                        fallbackEscapes++;
                         return true;
                     }
                 }
@@ -4908,7 +5466,7 @@ struct Track {
 //     appear together). A DIP over dry land is a DIP; one held high relabels by pitch.
 //   - M_TURN reads BANKED TURN: the overbanked variants were removed from generation
 //     (bankT=0, bank hard-clamped below vertical), so "OVERBANKED" was a fake name too.
-// groundY must be the caller's groundTopAt(x,z), which floors at WATER_Y -- over water it
+// groundY must be the caller's genGroundTopAt(x,z), which floors at WATER_Y -- over water it
 // returns exactly WATER_Y, which is the water test used here.
 static const char* rideElemName(unsigned char tag, float pitch, float trackY, float groundY,
                                 bool &special) {

@@ -74,21 +74,26 @@ static const char *SHADOW_FS =
     // layer and therefore no layer-specific overrides to fight each other.
     "float shadowMapVisibility(vec3 N){\n"
     "  float NoL = max(dot(N,lightDir),0.0);\n"
-    "  vec3 receiver = fragWorld + N*(0.20 + 0.35*(1.0-NoL));\n"
+    // Receiver offset and bias are in world units; the shadow map covers
+    // 2*SHADOW_RADIUS world units across SHADOW_MAP_SIZE texels, so texel
+    // density is (2*SHADOW_RADIUS)/SHADOW_MAP_SIZE world units/texel (~0.234u
+    // at current settings). Rails are only ~0.18u wide, so the old
+    // 0.65-1.75u bias/offset (several rail-widths) buried thin geometry in
+    // its own acne-avoidance slack and washed out contact shadows. Sized
+    // down to ~0.06-0.18u offset and ~0.30-0.85u (~1.3-3.6 texel) bias --
+    // enough to avoid self-shadow acne without swallowing rail-scale detail.
+    "  vec3 receiver = fragWorld + N*(0.06 + 0.12*(1.0-NoL));\n"
     "  vec4 lp = lightVP*vec4(receiver,1.0); vec3 p = lp.xyz/lp.w; p = p*0.5+0.5;\n"
     "  if(p.z<=0.0||p.z>1.0||p.x<0.0||p.x>1.0||p.y<0.0||p.y>1.0) return 1.0;\n"
     // One conservative 3x3 PCF. The removed PCSS blocker search treated the
     // receiver's own voxel surface as a blocker across most of the map and
     // drove virtually every fragment into shadow.
-    "  float bias = (0.65 + 1.10*(1.0-NoL))*invRange;\n"
+    "  float bias = (0.30 + 0.55*(1.0-NoL))*invRange;\n"
     "  float vis = 0.0;\n"
-    "  float maxDepth = 0.0;\n"
     "  for(int y=-1; y<=1; ++y) for(int x=-1; x<=1; ++x){\n"
     "    float d = texture(shadowMap, p.xy + vec2(x,y)*shadowTexel).r;\n"
-    "    maxDepth = max(maxDepth, d);\n"
     "    vis += (p.z-bias <= d) ? 1.0 : 0.0;\n"
     "  }\n"
-    "  if(maxDepth < 0.00001) return 1.0;\n"
     "  vis *= (1.0/9.0);\n"
     // Return the raw PCF-averaged visibility (0 = fully occluded, 1 = fully
     // lit) uncompressed. This used to be `mix(1.0, vis, 0.55)`, which floors
@@ -382,11 +387,32 @@ struct ShadowSys {
     }
 
     // Build the one ground-anchored light volume.
+    //
+    // Texel-snapping: the focus point tracks the car/camera every frame, so
+    // without snapping the shadow map's texel grid slides continuously
+    // beneath static world geometry -- static shadow edges then alias
+    // differently texel-to-texel as the grid drifts, which reads as
+    // shimmer/crawl. Standard fix (as used for cascaded shadow maps): move
+    // the focus only in whole-texel steps of the *light-space* X/Y axes.
+    // Since the light's direction (and therefore the view matrix's rotation)
+    // is fixed, transform the desired focus into an unsnapped light-space
+    // frame, quantize its X/Y to the world-space-per-texel size, and rebuild
+    // the view from that snapped point.
     void computeLightVP(Vector3 f) {
-        focus = f;
         float eyeDist = SHADOW_RADIUS * 2.2f + 40.0f;
         float nearP = 4.0f;
         float farP  = eyeDist + SHADOW_RADIUS * 1.8f;
+
+        Matrix viewUnsnapped = MatrixLookAt(
+            Vector3Add(f, Vector3Scale(g_sunDir, eyeDist)), f, Vector3{ 0, 1, 0 });
+        Vector3 focusLS = Vector3Transform(f, viewUnsnapped);
+        float texelWorld = (2.0f * SHADOW_RADIUS) / (float)SHADOW_MAP_SIZE;
+        focusLS.x = floorf(focusLS.x / texelWorld + 0.5f) * texelWorld;
+        focusLS.y = floorf(focusLS.y / texelWorld + 0.5f) * texelWorld;
+        Matrix invView = MatrixInvert(viewUnsnapped);
+        Vector3 snapped = Vector3Transform(focusLS, invView);
+
+        focus = snapped;
         Vector3 eye = Vector3Add(focus, Vector3Scale(g_sunDir, eyeDist));
         Matrix view = MatrixLookAt(eye, focus, Vector3{ 0, 1, 0 });
         Matrix proj = MatrixOrtho(-SHADOW_RADIUS, SHADOW_RADIUS,

@@ -191,13 +191,13 @@ int main(int argc, char **argv) {
         } probes[] = {
             {"hydraulic-main", M_LAUNCH, 12.0f, V1_PROPULSION.targetSpeed,
              V1_PROPULSION.netAcceleration, 0.0f, 2},
-            {"lsm-booster", M_BOOST, 40.0f, V1_PROPULSION.targetSpeed,
+            {"lsm-booster", M_BOOST, 40.0f, BOOST_CRUISE_TARGET,
              V1_PROPULSION.netAcceleration, 0.0f, 2},
         };
         bool ok = true;
         printf("=== launch pacing audit ===\n");
         printf("acceleration reference: Do-Dodonpa 0-180 km/h in 1.56 s\n");
-        printf("game target: all powered launches converge on 360 km/h\n");
+        printf("game targets: station launch 360 km/h peak; in-course booster re-cruises to 292 km/h\n");
         printf("fastest-launch net-acceleration multiplier: %.2fx\n",
                V1_PROPULSION.accelerationMultiplier);
         for (const LaunchProbe &p : probes) {
@@ -922,6 +922,7 @@ int main(int argc, char **argv) {
         long setType[M_COUNT] = {};
         int laps = 0, invBudgetMiss = 0, subtypeRepeat = 0;
         int inversionSpacingMiss = 0, helixGeometryMiss = 0;
+        unsigned long totalEscapes = 0, totalForcedCloses = 0, totalRelaxed = 0;
         for (int sd = 1; sd <= seeds; sd++) {
             g_rng = (uint32_t)sd * 2654435761u | 1u;
             Track t; t.reset();
@@ -980,9 +981,19 @@ int main(int argc, char **argv) {
                            t.completedTopHatCount,ms);
                     laps++;
                     if (inv > 4) invBudgetMiss++;
-                    for (int i : invType)
-                        if (cnt[i] > 1) subtypeRepeat++;
-                    if (lapSpacingBad) inversionSpacingMiss++;
+                    // Subtype caps mirror the researched references: Tormenta
+                    // runs THREE Immelmanns; loops and (paired) corkscrews may
+                    // appear twice; stall and dive loop stay one-per-lap.
+                    for (int i : invType) {
+                        const int cap = i == M_IMMEL ? 3
+                                      : (i == M_LOOP || i == M_ROLL) ? 2 : 1;
+                        if (cnt[i] > cap) subtypeRepeat++;
+                    }
+                    // Adjacent inversions are design-legal in bounded chains
+                    // (double corkscrew, Tormenta's Immelmann-loop sequence);
+                    // only flag a lap that chains AND runs over the inversion
+                    // budget, which would indicate the generator lost its cap.
+                    if (lapSpacingBad && inv > 4) inversionSpacingMiss++;
                     if(t.completedBadHelixGeometry||
                        cnt[M_HELIX]!=t.completedHelixGeometryCount) helixGeometryMiss++;
                     for(int i=0;i<M_COUNT;i++) setType[i]+=cnt[i];
@@ -1000,6 +1011,14 @@ int main(int argc, char **argv) {
                        t.gpos.x, t.gpos.y, t.gpos.z, t.genPrevDy, t.genPrevCurv,
                        t.connLen, (int)t.pending.element);
             }
+            totalEscapes += t.fallbackEscapes;
+            totalForcedCloses += t.fallbackForcedLapCloses;
+            totalRelaxed += t.fallbackRelaxedPicks;
+            if (t.fallbackEscapes || t.fallbackForcedLapCloses ||
+                t.fallbackRelaxedPicks)
+                printf("[census] seed%d fallbacks: escapes=%u forcedLapCloses=%u "
+                       "relaxedPicks=%u\n", sd, t.fallbackEscapes,
+                       t.fallbackForcedLapCloses, t.fallbackRelaxedPicks);
         }
         long grand = setType[M_LOOP]+setType[M_ROLL]+setType[M_IMMEL]+
                      setType[M_DIVELOOP]+setType[M_STALL];
@@ -1024,6 +1043,10 @@ int main(int argc, char **argv) {
             printf("[census] DEAD enabled inversion subtype: %s\n", GEN_NM[i]);
             deadSubtype++;
         }
+        printf("[census] fallback totals (%d seeds): escapes=%lu forcedLapCloses=%lu "
+               "relaxedPicks=%lu (target: <=%.1f total artificial rescues)\n",
+               seeds, totalEscapes, totalForcedCloses, totalRelaxed,
+               seeds * 0.1);
         printf("[census] laps=%d invOver4=%d subtypeRepeat=%d inversionSpacing=%d helixGeometryMiss=%d deadSubtype=%d complete=%s\n",
                laps,invBudgetMiss,subtypeRepeat,inversionSpacingMiss,
                helixGeometryMiss,deadSubtype,complete?"yes":"NO");
@@ -1086,6 +1109,74 @@ int main(int argc, char **argv) {
                 printf("\n");
             }
         }
+        return 0;
+    }
+
+    // Flow probe: dense per-control-point geometry dump (pitch step, heading
+    // step, bank, roll rate, clearance) plus a quantitative dead-spot metric:
+    // a "dead spot" is a run of >=3 spans that are simultaneously flat in
+    // pitch (|dy|<0.35 m/span) and heading (|dyaw|<0.7 deg) outside powered
+    // decks/stations, which is exactly the "random flat segments" symptom.
+    if (argc > 1 && TextIsEqual(argv[1], "--shapedump")) {
+        int sd = (argc > 2) ? atoi(argv[2]) : 1;
+        int wantPoints = (argc > 3) ? atoi(argv[3]) : 470;
+        bool quiet = argc > 4 && TextIsEqual(argv[4], "summary");
+        g_rng = (uint32_t)sd * 2654435761u | 1u;
+        Track t; t.reset();
+        t.ensureFinalizedAhead((float)wantPoints);
+        const int n = t.finalizedPointCount();
+        float prevYaw = 0.0f, prevBank = 0.0f;
+        int deadRun = 0, deadSpots = 0, maxDead = 0, maxDeadAt = 0;
+        float maxRollRate = 0.0f; int maxRollAt = 0;
+        for (int i = 2; i + 2 < n; ++i) {
+            const Vector3 a = t.cp[(size_t)i - 1], b = t.cp[(size_t)i],
+                          c = t.cp[(size_t)i + 1];
+            const float dy = b.y - a.y;
+            const float yaw = atan2f(b.x - a.x, b.z - a.z);
+            float dyaw = yaw - prevYaw;
+            while (dyaw > PI) dyaw -= 2.0f * PI;
+            while (dyaw < -PI) dyaw += 2.0f * PI;
+            prevYaw = yaw;
+            Vector3 tangent = Vector3Subtract(c, a);
+            tangent = Vector3Length(tangent) > 1.0e-5f
+                ? Vector3Normalize(tangent) : Vector3{0, 0, 1};
+            const Vector3 natural = orthoUp(tangent, WUP);
+            const Vector3 sideV = Vector3Normalize(
+                Vector3CrossProduct(natural, tangent));
+            const Vector3 upv = orthoUp(tangent, t.up[(size_t)i]);
+            const float bank = atan2f(Vector3DotProduct(upv, sideV),
+                                      Clamp(Vector3DotProduct(upv, natural),
+                                            -1.0f, 1.0f)) * RAD2DEG;
+            float bankStep = bank - prevBank;
+            while (bankStep > 180.0f) bankStep -= 360.0f;
+            while (bankStep < -180.0f) bankStep += 360.0f;
+            const float rollRate = fabsf(bankStep) / SEG_LEN;
+            prevBank = bank;
+            const unsigned char tag = t.kind[(size_t)i];
+            const float ground = groundTopAt(b.x, b.z);
+            if (i > 3 && rollRate > maxRollRate &&
+                tag != M_ROLL && tag != M_STALL && tag != M_IMMEL) {
+                maxRollRate = rollRate; maxRollAt = i;
+            }
+            const bool powered = tag == M_LAUNCH || tag == M_BOOST ||
+                                 tag == M_STATION;
+            if (!powered && fabsf(dy) < 0.35f &&
+                fabsf(dyaw) < 0.7f * DEG2RAD) {
+                deadRun++;
+                if (deadRun > maxDead) { maxDead = deadRun; maxDeadAt = i; }
+                if (deadRun == 3) deadSpots++;
+            } else deadRun = 0;
+            if (!quiet)
+                printf("SD %4d %-8s%s y=%7.1f clr=%6.1f dy=%+6.2f "
+                       "dyaw=%+5.1f bank=%+6.1f roll=%4.2f\n",
+                       i, GEN_NM[tag], t.alignmentf[(size_t)i] ? "*" : " ",
+                       b.y, b.y - ground, dy, dyaw * RAD2DEG, bank, rollRate);
+        }
+        printf("[shape] seed%d points=%d deadSpots=%d maxDeadRun=%d@%d "
+               "maxConnRollRate=%.2fdeg/m@%d (cap %.2f at 240km/h) "
+               "(informational: cap scales with local speed)\n",
+               sd, n, deadSpots, maxDead, maxDeadAt, maxRollRate, maxRollAt,
+               ROLL_RATE_DEG_PER_SEC / (240.0f / 3.6f));
         return 0;
     }
 
@@ -1464,6 +1555,23 @@ int main(int argc, char **argv) {
     v1_track_render::V1TrackRenderCache trackRenderCache;
     trackRenderCache.update(trk, (int)captureStartU);
 
+    // Solved-placement cache for drawVBent's support-leg search (widen/bias/
+    // cantilever/helix-outrigger trials): that search is a pure function of
+    // static track geometry, never the camera, so without a cache it re-runs
+    // every frame, in both the depth and lit passes, for every visible
+    // support. Keyed on the *global* control-point index (Track::base +
+    // local index), the same stable identifier trackRenderCache itself uses
+    // (see track_render_cache.cpp) -- the local loop index alone shifts by -1
+    // every time trk.popFront() drops the oldest control point, so it does
+    // not identify the same physical support from one frame to the next.
+    struct SupportPlacement {
+        bool valid = false;   // false = searched before, no clear placement found
+        bool haveBent = false, cantilever = false, haveOutrigger = false;
+        Vector3 tops[2]{}, feet[2]{};
+        Vector3 outriggerEnd{};
+    };
+    std::unordered_map<long long, SupportPlacement> supportPlacementCache;
+
     const int   NCARS    = 2;
     const float CAR_GAP  = 4.2f;
 
@@ -1600,6 +1708,9 @@ int main(int argc, char **argv) {
             trk.reset();
             trackRenderCache.reset();
             trackRenderCache.update(trk, 0);
+            // trk.reset() zeroes Track::base, so old global control-point
+            // indices could otherwise alias fresh ones on the new route.
+            supportPlacementCache.clear();
             u = Track::rideStartU; v = 7.0f; boost = 40; score = 0;
             generationFault = false;
             gVert = gVertMax = gVertMin = 1.0f;
@@ -1827,7 +1938,21 @@ int main(int argc, char **argv) {
             float ss  = fmaxf(trk.speedScale(u), 1.0f);
             float du  = Clamp(7.5f / ss, 0.35f, 1.1f);
             Vector3 Tb = trk.tangent(u - du), Tf = trk.tangent(u + du);
-            float arc = fmaxf(Vector3Distance(trk.pos(u - du), trk.pos(u + du)), 13.0f);
+            // Accumulate the sampled rail arc over subsamples instead of the
+            // straight-chord distance floored at a fixed 13m -- same approach
+            // as v1RiderAuditSample (~line 32 above), which replaced this
+            // fixed floor because it overstated force on tight curves whose
+            // true arc length is well under 13m.
+            constexpr int ARC_SUBDIVISIONS = 8;
+            float arc = 0.0f;
+            Vector3 arcPrev = trk.pos(u - du);
+            for (int i = 1; i <= ARC_SUBDIVISIONS; ++i) {
+                float q = (u - du) + (2.0f * du) * i / ARC_SUBDIVISIONS;
+                Vector3 arcCur = trk.pos(q);
+                arc += Vector3Distance(arcPrev, arcCur);
+                arcPrev = arcCur;
+            }
+            arc = fmaxf(arc, 1.0e-3f);
             Vector3 kappa = Vector3Scale(Vector3Subtract(Tf, Tb), 1.0f / arc);
             Vector3 aCent = Vector3Scale(kappa, v * v);
             Vector3 felt  = Vector3Add(aCent, Vector3{ 0, GRAV, 0 });
@@ -2566,13 +2691,14 @@ int main(int argc, char **argv) {
             }
         }
 
-        if (!depthPass) {
-            drawStation(trk, trk.startPos, trk.startYaw, P, fogEnd);
-            if (trk.stationActive)
-                drawStation(trk, trk.stationPos, trk.stationYaw, P, fogEnd);
-            if (midStation)
-                drawStation(trk, curPlatPos, curPlatYaw, P, fogEnd);
-        }
+        // Stations cast shadows too; draw them in the depth pass as well as the
+        // lit pass. fogEnd only affects distance culling / fog tint, both of
+        // which are harmless (and unused for color) in the depth pass.
+        drawStation(trk, trk.startPos, trk.startYaw, P, fogEnd);
+        if (trk.stationActive)
+            drawStation(trk, trk.stationPos, trk.stationYaw, P, fogEnd);
+        if (midStation)
+            drawStation(trk, curPlatPos, curPlatYaw, P, fogEnd);
 
         int k0 = (int)fmaxf(1.0f, u - 14.0f), k1 = (int)(u + 64);
 
@@ -2613,13 +2739,35 @@ int main(int argc, char **argv) {
         };
 
         auto drawVBent = [&](Vector3 p, float topY, float gC, Vector3 tang,
-                             Vector3 railUp, Color sc, float supportU, unsigned char supportTag) {
+                             Vector3 railUp, Color sc, float supportU, unsigned char supportTag,
+                             long long placementKey) {
             float hgt = topY - gC;
             if (hgt < 1.0f) return;
 
+            float legR = Clamp(0.30f + hgt * 0.0045f, 0.30f, 0.55f);
+            float nodeDrop = 0.58f;
+            Vector3 node = Vector3Subtract(p, Vector3Scale(railUp, nodeDrop));
+
+            bool haveBent = false, cantilever = false, haveOutrigger = false;
+            Vector3 tops[2]{}, feet[2]{}, outriggerEnd{};
+            const float clearRadius = 1.85f; // used by the cross-brace loop below too
+
+            // FIX 8: the widen/bias/cantilever/helix-outrigger trials below are
+            // a pure function of static track geometry (never the camera), so
+            // a cache hit can skip the whole search and draw directly from the
+            // previously solved leg placement. node/legR above are cheap and
+            // recomputed every call either way.
+            auto cacheIt = supportPlacementCache.find(placementKey);
+            if (cacheIt != supportPlacementCache.end()) {
+                const SupportPlacement &c = cacheIt->second;
+                if (!c.valid) return; // previously searched: no clear placement exists
+                haveBent = c.haveBent; cantilever = c.cantilever; haveOutrigger = c.haveOutrigger;
+                tops[0] = c.tops[0]; tops[1] = c.tops[1];
+                feet[0] = c.feet[0]; feet[1] = c.feet[1];
+                outriggerEnd = c.outriggerEnd;
+            } else {
             float vary = hashf((int)floorf(p.x * 0.5f), (int)floorf(p.z * 0.5f));
             float baseHalf = Clamp(hgt * (0.17f + vary * 0.07f), 1.5f, 5.5f);
-            float legR     = Clamp(0.30f + hgt * 0.0045f, 0.30f, 0.55f);
             float topHalf  = 0.22f;
 
             Vector3 rRight = Vector3Normalize(Vector3CrossProduct(railUp, tang));
@@ -2651,15 +2799,9 @@ int main(int argc, char **argv) {
             float latHLen = Vector3Length(latH);
             latH = latHLen > 0.01f ? Vector3Scale(latH, 1.0f / latHLen)
                                    : Vector3{ 1.0f, 0.0f, 0.0f };
-            float nodeDrop = 0.58f;
-            Vector3 node = Vector3Subtract(p, Vector3Scale(railUp, nodeDrop));
 
-            Vector3 tops[2] = {
-                Vector3Add(node, Vector3Scale(rRight, -topHalf)),
-                Vector3Add(node, Vector3Scale(rRight,  topHalf))
-            };
-            Vector3 feet[2]{};
-            bool haveBent = false;
+            tops[0] = Vector3Add(node, Vector3Scale(rRight, -topHalf));
+            tops[1] = Vector3Add(node, Vector3Scale(rRight,  topHalf));
 
             // Helix curvature points toward the coil centre. Prefer a bent
             // leaning to the outside of that centre, like a real cantilevered
@@ -2677,10 +2819,6 @@ int main(int argc, char **argv) {
             if (supportTag == M_HELIX || supportTag == M_TURN) {
                 float tmp = biasTry[0]; biasTry[0] = biasTry[1]; biasTry[1] = tmp;
             }
-            const float clearRadius = 1.85f;
-            bool cantilever = false;
-            bool haveOutrigger = false;
-            Vector3 outriggerEnd{};
 
             // Stacked helix coils need the support to leave the shared plan
             // circle before descending. Search a short radial arm plus an
@@ -2757,7 +2895,22 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (!haveBent && !cantilever) return;
+            SupportPlacement rec;
+            rec.valid = haveBent || cantilever;
+            rec.haveBent = haveBent; rec.cantilever = cantilever; rec.haveOutrigger = haveOutrigger;
+            rec.tops[0] = tops[0]; rec.tops[1] = tops[1];
+            rec.feet[0] = feet[0]; rec.feet[1] = feet[1];
+            rec.outriggerEnd = outriggerEnd;
+            // Allocation-light safety net: the number of physical supports is
+            // small (bounded by trk.cp.size(), a few hundred), so this should
+            // never actually trigger, but a full clear on overflow is simple
+            // and correctness-preserving -- every entry is a pure function of
+            // its key, so losing the cache just costs one re-search per key.
+            if (supportPlacementCache.size() > 4096) supportPlacementCache.clear();
+            supportPlacementCache[placementKey] = rec;
+
+            if (!rec.valid) return;
+            }
 
             int legCount = haveBent ? 2 : 1;
             for (int side = 0; side < legCount; ++side) {
@@ -2848,7 +3001,8 @@ int main(int argc, char **argv) {
             bool placeHere = i > 0 &&
                 floorf(trk.arc[i] / SUP_SP) != floorf(trk.arc[i - 1] / SUP_SP);
             if (hgt > 0.5f && placeHere)
-                drawVBent(p, topY, gC, t, trk.up[i], sc, (float)i - 1.0f, tg);
+                drawVBent(p, topY, gC, t, trk.up[i], sc, (float)i - 1.0f, tg,
+                          (long long)trk.base + (long long)i);
 
             if (tg == M_LAUNCH || tg == M_BOOST) {
                 Vector3 fwd = Vector3Normalize(Vector3{ t.x, 0, t.z });
@@ -2942,6 +3096,7 @@ int main(int argc, char **argv) {
         rlEnableColorBlend();
         rlDisableFramebuffer();
         rlViewport(0, 0, GetRenderWidth(), GetRenderHeight());
+        glDepthFunc(GL_LESS); // restore default depth func after shadow pass's GL_LEQUAL
 
         // Bind the single map once per frame for every lit draw.
         auto bindShadowUniforms = [&]() {
@@ -3611,7 +3766,14 @@ int main(int argc, char **argv) {
         bool lastShot = false;
         if (shotFrame) {
             rlDrawRenderBatchActive();
-            const char *name = waterShot
+            // Orbit frames (5/700/1600/3000, or a single MC_ORBIT_FRAME) don't
+            // land on the fixed 200/600/900 checkpoints the other capture
+            // modes use, so they all fell through to the "else" name and
+            // overwrote the same file every capture. Key orbit shots off the
+            // actual frame number instead so each one gets a distinct name.
+            const char *name = orbitShot
+                ? TextFormat("orbit_f%d.png", frame)
+                : waterShot
                 ? ((frame == 200) ? "watershot1.png" : (frame == 600) ? "watershot2.png"
                   : (frame == 900) ? "watershot3.png" : "watershot4.png")
                 : ((frame == 200) ? "shot1.png" : (frame == 600) ? "shot2.png"

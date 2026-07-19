@@ -111,16 +111,20 @@ static float coastAcceleration(float speed, float tangentY) {
 
 static float applyTrackDrive(float speed, unsigned char tag, unsigned char drive,
                              float tangentY, float dt) {
-    if (drive == 2 && (tag == M_LAUNCH || tag == M_BOOST) &&
-        speed < V1_PROPULSION.targetSpeed) {
+    if (drive == 2 && (tag == M_LAUNCH || tag == M_BOOST)) {
         // Propulsion belongs to the owned powered span, not to its display
-        // name.  LAUNCH and BOOST share the same physical 360 km/h / 1.5x
-        // reference contract; the tag only describes where the block sits in
-        // the ride.  The propulsion contract remains the requested measured
-        // net acceleration, independent of the local grade or drag loss.
-        float thrust = V1_PROPULSION.netAcceleration -
-                       coastAcceleration(speed, tangentY);
-        speed = fminf(speed + thrust * dt, V1_PROPULSION.targetSpeed);
+        // name.  Both powered kinds share the 1.5x Do-Dodonpa acceleration
+        // contract, but their SPEED targets differ: the station LAUNCH is the
+        // once-per-lap 360 km/h record peak, while in-course BOOSTers
+        // re-cruise to 292 km/h so the following coast arc still passes
+        // through the airtime and inversion entry windows.
+        const float cap = tag == M_BOOST ? BOOST_CRUISE_TARGET
+                                         : V1_PROPULSION.targetSpeed;
+        if (speed < cap) {
+            float thrust = V1_PROPULSION.netAcceleration -
+                           coastAcceleration(speed, tangentY);
+            speed = fminf(speed + thrust * dt, cap);
+        }
     }
     if (drive == 1 && tangentY > 0.05f) {
         float liftV = tangentY > 0.55f ? 27.0f : CHAIN_V;

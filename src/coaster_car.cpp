@@ -7,11 +7,10 @@ static void drawCoasterCar(Color body, Color accent, bool lead, int seed) {
     // Rail top is local y=+0.09. Keep the chassis physically above it;
     // the former -0.02 bottom cut through both running rails on every loop and
     // made the train appear fused to the track when inverted.
-    // Bottom held at 0.23 (not 0.15) so the road wheels below still clear the
-    // skirt by ~0.14 -- matching the pre-refactor exposed height. At 0.15 the
-    // skirt swallowed all but a 0.06-tall sliver of each wheel, making them
-    // read as missing.
-    drawCubeTex(T_IRON,  Vector3{ 0, 0.31f, 0 }, 1.62f, 0.16f, 3.1f, Color{ 60, 62, 70, 255 });
+    // Raised to 0.34 and thinned to 0.10 (bottom edge 0.23 -> 0.29) so the
+    // full running-gear stack below -- road, side-friction and upstop wheels
+    // -- reads clearly instead of the skirt swallowing all but a thin sliver.
+    drawCubeTex(T_IRON,  Vector3{ 0, 0.34f, 0 }, 1.62f, 0.10f, 3.1f, Color{ 60, 62, 70, 255 });
 
     drawCubeTex(T_WHITE, Vector3{ 0, 0.34f, 0.0f }, 1.56f, 0.36f, 3.06f, bodyD);
     drawCubeTex(T_WHITE, Vector3{ 0, 0.60f, 0.0f }, 1.40f, 0.40f, 2.92f, body);
@@ -55,11 +54,23 @@ static void drawCoasterCar(Color body, Color accent, bool lead, int seed) {
         }
     }
 
-    // Road wheels touch the top of each rail instead of occupying the same
-    // voxel volume. Their lower face sits at y=0.09, exactly on the rail top.
+    // Running gear: a real coaster bogie carries three wheel sets per rail --
+    // road wheels roll on top, side-friction wheels ride just inboard of the
+    // rail to take lateral load, and upstop wheels hook under the rail's
+    // underside so the train can't leave the track through an inversion.
+    // Road wheel enlarged slightly (height 0.28->0.30) and recentered
+    // (0.23->0.21) to straddle the rail-top plane (y=0.09) now that the
+    // skirt above is thinner and raised, so the wheel reads as a real disc
+    // instead of a sliver poking out from under the chassis.
+    Color guideC  = Color{ 40, 40, 46, 255 };  // side-friction wheel, slightly lighter than tyre
+    Color upstopC = Color{ 18, 18, 22, 255 };  // upstop wheel, slightly darker than tyre
     for (float sx : { -0.55f, 0.55f })
-        for (float sz : { -0.95f, 0.95f })
-            drawCubeTex(T_IRON, Vector3{ sx, 0.23f, sz }, 0.22f, 0.28f, 0.5f, tyre);
+        for (float sz : { -0.95f, 0.95f }) {
+            drawCubeTex(T_IRON, Vector3{ sx, 0.21f, sz }, 0.22f, 0.30f, 0.5f, tyre);
+            float gx = (sx > 0.0f) ? sx - 0.11f : sx + 0.11f; // inboard, x = +-0.44
+            drawCubeTex(T_IRON, Vector3{ gx, 0.12f, sz }, 0.10f, 0.16f, 0.28f, guideC);
+            drawCubeTex(T_IRON, Vector3{ sx, 0.00f, sz }, 0.16f, 0.10f, 0.28f, upstopC);
+        }
 }
 
 static void drawStation(const Track &trk, Vector3 pos, float yaw, Vector3 camP, float fogEnd) {
