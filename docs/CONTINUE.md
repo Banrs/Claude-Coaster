@@ -285,3 +285,39 @@ cmake -B build -S . && cmake --build build -j    # -> ./minecoaster
 
 Every "does a full ride generate?" gate fails for the **same** reason (the stall); every "is the
 top hat correct?" gate already passes. So: fix the stall first, then re-read everything.
+
+## Session update (2026-07-19): ground-hug + render fixes, and what's architectural
+
+Landed and verified (headless-safe):
+- **Ground-hug route target** (`ordinaryRouteTarget`): now hugs `ground + DECK_CLEARANCE`
+  (2 m above grade) instead of preferring `ground - 11 m` (buried). The buried preference was
+  the source of the "random terrain digs on flat-ish sections" — every level connector's desired
+  endY sat metres underground. Corridor floor (`ground - CUT_TOLERANCE`, 18 m) still permits real
+  cuttings where terrain rises. `--census 3` still completes all laps (no regression). New
+  `--clearance N` probe reports deck-vs-terrain per sample + buried-by-mode.
+- **Shadows** (`render_fx.cpp shadowMapVisibility`): removed redundant inner floor
+  `mix(1.0, vis, 0.55)`; it compounded with the caller's `mix(0.18, 1.0, rawSh)` into a
+  ~[0.55,1.0] band → uniform slight dimming, not cast shadows. The pasted `RT LOCS ...` log was
+  from the path-trace preview shader (`pathtrace.cpp`, off by default), not this pipeline — which
+  is why prior FBO fixes had no effect. **Needs GPU verification (headless llvmpipe blows the sky
+  to white — cannot judge lighting).**
+- **Wheels** (`coaster_car.cpp`): raised iron underframe bottom 0.15 → 0.23 so road wheels clear
+  the skirt by ~0.14 again (a prior refactor swallowed them to a 0.06 sliver).
+
+Diagnosed as ARCHITECTURAL (do NOT weight-poke — proven to regress completion):
+- **Banked-turn dominance (TURN ~28-38%)** is a GATING problem, not a weight problem. TURN's
+  eligibility window (speed/height/phase) is the widest, so it wins wherever gated elements
+  (hills, inversions) can't qualify, AND it is the scheduler's escape valve. Lowering its weight
+  made TURN share *rise* and broke seed1 (exhaustion). Fix = widen the qualifiers (esp. hills
+  gating) and/or a repeat-aware placement pass, not weights.
+- **Hills ~1%** (want ~15%): gated out by the 36 m height band + entry-speed window, not weight
+  (weight already high at 2.2). Needs the placement pass to descend into the hill band first.
+- **Roll recovery too fast (~4°/m ≈ 265°/s @cruise, ~475°/s @peak; user "90° in <0.2s")**: audit
+  ceiling `V1_AUDIT_ROLL_RATE_MAX = 24°/m` never flags it. Connectors DO unwind bank smoothly over
+  their steps; the spike is within elements / at direct element→element joints with no rate-limited
+  bank blend. Needs a roll-rate limiter in the transition/frame layer.
+- **Top-hat "returns to ~20 m"**: the top-hat is symmetric (`endHeight = gpos.y`) so it returns to
+  the *cruise baseline*, which floats 25-50 m up (see clearance probe: 30-52% of flat samples are
+  >25 m over grade). Root = terrain-decoupled element placement; connectors are reach-limited and
+  can't pull the baseline to grade before the next element launches it back up. The route-target
+  change lowers the *preference*, but the full fix is terrain-coupled placement (launch up, dive off).

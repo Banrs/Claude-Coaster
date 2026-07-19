@@ -7,7 +7,11 @@ static void drawCoasterCar(Color body, Color accent, bool lead, int seed) {
     // Rail top is local y=+0.09. Keep the chassis physically above it;
     // the former -0.02 bottom cut through both running rails on every loop and
     // made the train appear fused to the track when inverted.
-    drawCubeTex(T_IRON,  Vector3{ 0, 0.27f, 0 }, 1.62f, 0.24f, 3.1f, Color{ 60, 62, 70, 255 });
+    // Bottom held at 0.23 (not 0.15) so the road wheels below still clear the
+    // skirt by ~0.14 -- matching the pre-refactor exposed height. At 0.15 the
+    // skirt swallowed all but a 0.06-tall sliver of each wheel, making them
+    // read as missing.
+    drawCubeTex(T_IRON,  Vector3{ 0, 0.31f, 0 }, 1.62f, 0.16f, 3.1f, Color{ 60, 62, 70, 255 });
 
     drawCubeTex(T_WHITE, Vector3{ 0, 0.34f, 0.0f }, 1.56f, 0.36f, 3.06f, bodyD);
     drawCubeTex(T_WHITE, Vector3{ 0, 0.60f, 0.0f }, 1.40f, 0.40f, 2.92f, body);

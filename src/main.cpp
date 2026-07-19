@@ -1031,6 +1031,64 @@ int main(int argc, char **argv) {
                 deadSubtype||!complete)?1:0;
     }
 
+    if (argc > 1 && TextIsEqual(argv[1], "--clearance")) {
+        // Pure-geometry ground-hug probe: track deck Y minus terrain top at
+        // every finalized sample.  Faithful headless (no lighting involved).
+        // Reports the clearance distribution and flags "floating" flat sections
+        // (deck far above local grade on gentle terrain) and buried samples.
+        int seeds = (argc > 2) ? atoi(argv[2]) : 4;
+        for (int sd = 1; sd <= seeds; ++sd) {
+            g_rng = (uint32_t)sd * 2654435761u | 1u;
+            Track t; t.reset();
+            t.ensureFinalizedAhead(470.0f);
+            const int N = (int)t.maxFinalU() - 2;
+            if (t.schedulerExhaustions != 0 || N < 400) {
+                printf("[clear] seed%d GEN FAIL maxU=%.1f exh=%u\n",
+                       sd, t.maxFinalU(), t.schedulerExhaustions);
+                continue;
+            }
+            double sum = 0.0; int cnt = 0;
+            float mn = 1e9f, mx = -1e9f; int mnAt = 0, mxAt = 0;
+            int buried = 0, floating = 0, lowGround = 0;
+            long buriedByMode[M_COUNT] = {};
+            // "floating" = deck > 25 m over grade where the local terrain is
+            // gentle (max ground within +/-40 m of sample < grade + 12 m).
+            for (int q = 2; q < N; ++q) {
+                Vector3 p = t.pos((float)q);
+                float g = groundTopAt(p.x, p.z);
+                float c = p.y - g;
+                sum += c; ++cnt;
+                if (c < mn) { mn = c; mnAt = q; }
+                if (c > mx) { mx = c; mxAt = q; }
+                if (c < -0.5f && g > WATER_Y + 0.5f) {
+                    ++buried;
+                    unsigned char tg = t.tagAt((float)q);
+                    if (tg < M_COUNT) ++buriedByMode[tg];
+                }
+                bool gentle = true;
+                for (float dx = -40.0f; dx <= 40.0f && gentle; dx += 10.0f)
+                    for (float dz = -40.0f; dz <= 40.0f && gentle; dz += 10.0f)
+                        if (groundTopAt(p.x + dx, p.z + dz) > g + 12.0f) gentle = false;
+                if (gentle && g > WATER_Y + 0.5f) {
+                    ++lowGround;
+                    if (c > 25.0f) ++floating;
+                }
+            }
+            printf("[clear] seed%d N=%d clearance avg=%.1fm min=%.1f@%d max=%.1f@%d "
+                   "buried=%d(%.1f%%) flat-samples=%d floating>25m=%d(%.1f%%)\n",
+                   sd, cnt, sum / cnt, mn, mnAt, mx, mxAt,
+                   buried, 100.0 * buried / cnt, lowGround, floating,
+                   lowGround ? 100.0 * floating / lowGround : 0.0);
+            if (buried) {
+                printf("        buried-by-mode:");
+                for (int i = 0; i < M_COUNT; ++i)
+                    if (buriedByMode[i]) printf(" %s=%ld", GEN_NM[i], buriedByMode[i]);
+                printf("\n");
+            }
+        }
+        return 0;
+    }
+
     if (argc > 1 && TextIsEqual(argv[1], "--audit")) {
         int seeds = (argc > 2) ? atoi(argv[2]) : 8;
         return audit_mode::run(seeds);

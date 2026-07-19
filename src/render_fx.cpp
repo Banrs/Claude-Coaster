@@ -90,7 +90,18 @@ static const char *SHADOW_FS =
     "  }\n"
     "  if(maxDepth < 0.00001) return 1.0;\n"
     "  vis *= (1.0/9.0);\n"
-    "  return mix(1.0, vis, 0.55);\n"
+    // Return the raw PCF-averaged visibility (0 = fully occluded, 1 = fully
+    // lit) uncompressed. This used to be `mix(1.0, vis, 0.55)`, which floors
+    // even a fully-shadowed fragment at 0.45 -- and every caller then floors
+    // it AGAIN (see `sh = mix(0.18, 1.0, rawSh)` in main() below and the
+    // other mix(x, 1.0, rawSh) soft-shadow terms), so the two floors
+    // compounded to squeeze all real per-fragment contrast into a narrow
+    // ~[0.55, 1.0] band -- reading as uniformly, slightly dim ambient light
+    // rather than crisp cast shadows, with no framebuffer-incomplete warning
+    // to hint at it because the depth pass/sampling were never broken. The
+    // callers' own mix() floors already provide the "shadows aren't pure
+    // black" softening, so this function should just report the truth.
+    "  return vis;\n"
     "}\n"
     "float shadow(vec3 N){ return shadowMapVisibility(N); }\n"
 

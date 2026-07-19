@@ -192,7 +192,6 @@ struct Track {
     // Terrain is a whole-corridor constraint; ordinary routes target a shallow cutting.
     static constexpr float TERRAIN_CUT_TOLERANCE = 18.0f;
     static constexpr float TERRAIN_DECK_CLEARANCE = 2.0f;
-    static constexpr float TERRAIN_ROUTE_DEPTH = 11.0f;
     // Energy solve for a -5 g crest: v_entry^2 = g*scale*
     // (2*60 m + 6*30.625 m). Scaling height and radius together gives the
     // exact 1.0--1.5x geometry window rather than an unrelated speed clamp.
@@ -215,10 +214,17 @@ struct Track {
                     surface.waterSurface + TERRAIN_DECK_CLEARANCE);
     }
     static float ordinaryRouteTarget(float groundTop) {
+        // The ordinary route HUGS the surface from above -- it rides a shallow
+        // deck clearance over local grade, exactly like a real steel coaster on
+        // support columns.  It must NOT prefer a buried target: cutting is a
+        // fallback the corridor floor (ground - CUT_TOLERANCE) still permits
+        // where terrain genuinely rises into the path, but the resting
+        // preference on flat-ish ground is a low hover, never a dig.  Preferring
+        // a buried target was the source of the "random terrain digs on flat
+        // sections": every level connector's desired endY sat metres underground.
         return submergedGround(groundTop)
             ? WATER_Y + TERRAIN_DECK_CLEARANCE
-            : fmaxf(groundTop - TERRAIN_ROUTE_DEPTH,
-                    WATER_Y + TERRAIN_DECK_CLEARANCE);
+            : groundTop + TERRAIN_DECK_CLEARANCE;
     }
     static int poweredStepsFor(float entrySpeed) {
         // Size against the exact 120 Hz ride integrator used by play and the
