@@ -44,7 +44,10 @@ Design constants (these are firm; source them from one place, not scattered lite
 
 Real-world anchors and the geometry philosophy are in `docs/GEOMETRY_REFERENCES.md`. Element
 **frequencies** should match the **average of Falcon's Flight and Tormenta Rampaging Run** (not the
-max of either), each type within **0.5×–2×** of that average.
+max of either), each type within **0.75×–1.75×** of that average. However, do not inflate elements you
+did not find the frequency of because you couldn't find it in research to fill in the remaning gaps - 
+still look to keep frequency realistic for that element in the type of coaster they originate from (this 
+requires more web research).
 
 ---
 
