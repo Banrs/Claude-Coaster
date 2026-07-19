@@ -57,6 +57,25 @@ few elements in** and never finishes the ride.
   `--forceaudit` g figures for INVERTING elements are unreliable; non-inverting spikes like M_TURN
   +12 g may still be real.)
 
+### Per-element geometry checks (2026-07-19)
+- **Corkscrew revolution count is correct.** A real corkscrew rotates 360° = ONE revolution per
+  element; "double corkscrews" are two *consecutive* corkscrew elements (Coasterpedia / Wikipedia),
+  not one element with two turns. V1's `initRoll` does exactly one revolution — real-life-accurate.
+  (Optional future set-piece: chain two M_ROLL for a signature double corkscrew, since they're
+  "often found in pairs".) Helix `HELIX_RECORD_REVS=1.625..1.725` and loop/Immelmann = 1 inversion
+  are all in the realistic range.
+- **Roll smoothing — where the roll-accel spikes are.** `--jointaudit` roll-ACCELERATION exceeds the
+  5.5 deg/m² limit on ~half of 8 seeds (up to 10.5). Located every spike (MC_ROLLACC tag dump): they
+  are all at **element-boundary joints**, worst HELIX→ROLL (10.5) and DROP→HELIX (9.5), never inside a
+  run. Roll-RATE is fine (~4 deg/m ≪ 24) and the joint roll GAP is <1° — so the frames are nearly
+  continuous and the finite-difference roll-accel is partly measurement sensitivity over the tiny
+  joint distance. BUT the shoulders that ease the bank (helix `helixShoulder` = 10%, corkscrew
+  `shoulderFraction` = 0.14) are **coupled to each element's centreline construction** (they distribute
+  the yaw/phase), so lengthening them for the gentler roll feel the brief wants changes the element
+  shape and its g — it must be tuned with in-game visual confirmation (no GL in the sandbox). The
+  helix already unwinds its bank to a neutral (0°) exit via its shoulder; the abrupt part is how fast
+  that unwind happens over the last 10%. Candidate: widen the unwind shoulder and re-verify g in-game.
+
 ### Still open (this session did not get to these)
 - **seed4** (1/8) still stalls at ~356 km/h near-peak, post-launch, buried — escapes are force-limited
   at near-peak speed. Investigate why the post-launch top hat doesn't fire there.
