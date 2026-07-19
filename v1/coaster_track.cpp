@@ -191,7 +191,7 @@ struct Track {
     static constexpr int MIN_CONN = 4;   // 4 cps ~= 56 m; longer only when the actual incoming curvature requires it
     // Terrain is a whole-corridor constraint; ordinary routes target a shallow cutting.
     static constexpr float TERRAIN_CUT_TOLERANCE = 18.0f;
-    static constexpr float TERRAIN_DECK_CLEARANCE = 4.0f;
+    static constexpr float TERRAIN_DECK_CLEARANCE = 2.0f;
     static constexpr float TERRAIN_ROUTE_DEPTH = 11.0f;
     // Energy solve for a -5 g crest: v_entry^2 = g*scale*
     // (2*60 m + 6*30.625 m). Scaling height and radius together gives the
@@ -4094,7 +4094,7 @@ struct Track {
         // it all the way back down to a low clearance.
         float h = gpos.y - groundTopAt(gpos.x, gpos.z);
         bool powered = (mode == M_LAUNCH || mode == M_BOOST || mode == M_CLIMB);
-        if (!powered && h <= 42.0f) {
+        if (!powered && h <= 16.0f) {
             // No physical drop is needed. Re-enter the scheduler immediately
             // after the terminal point has been published. Calling nextMode
             // from inside an element step let a new analytical element's
@@ -4243,7 +4243,7 @@ struct Track {
             case M_LOOP:
             case M_DIVELOOP: {
                 float clearanceAhead = recoveryClearanceAhead();
-                if (clearanceAhead > 45.0f) {
+                if (clearanceAhead > 22.0f) {
                     if(!startRecoveryDrop(false)) nextModePending=true;
                 } else if(!chooseElement()) nextModePending=true;
                 break;
@@ -4290,7 +4290,7 @@ struct Track {
                 // ordinary element or helix cannot repeatedly pre-empt it and
                 // postpone propulsion until stall speed.
                 if (wantLaunch || wantBoost) {
-                    if (hAhead > 45.0f) {
+                    if (hAhead > 22.0f) {
                         pending = {wantLaunch ? PendingKind::Launch
                                               : PendingKind::Boost,
                                    M_COUNT};
@@ -4313,7 +4313,7 @@ struct Track {
                 // ending 'elevated' over local ground on a downslope is NOT a reason to insert a
                 // near-zero DROP (the "drop element for no reason" -- measured cp278/300 DROP net ~0,
                 // then buried). If the ground rises back up ahead, there is nothing to drop into.
-                if (hAhead > 45.0f) {
+                if (hAhead > 22.0f) {
                     if(!startRecoveryDrop(wasBanked)) nextModePending=true;
                 }
                 // Flow straight into the next element. Every authored banked
