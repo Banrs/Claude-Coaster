@@ -1,0 +1,79 @@
+=== HEAD 90d6645 2026-07-20 ===
+--- census 8 ---
+[census] seed1 lap1 features=13 inv{ROLL=1 LOOP=0 IMMEL=0 DIVELOOP=0 STALL=1 total=2 spacing=ok} helix=0/0@0.0m/rev tophat=1 ms/lap=464.2
+[census] seed1 lap2 features=15 inv{ROLL=0 LOOP=1 IMMEL=2 DIVELOOP=1 STALL=0 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=527.2
+[census] seed1 lap3 features=13 inv{ROLL=2 LOOP=0 IMMEL=1 DIVELOOP=1 STALL=0 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=2838.7
+[census] seed1 fallbacks: escapes=0 forcedLapCloses=0 relaxedPicks=9
+[census] seed2 lap1 features=12 inv{ROLL=1 LOOP=0 IMMEL=1 DIVELOOP=1 STALL=0 total=3 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=5834.7
+[census] seed2 lap2 features=13 inv{ROLL=0 LOOP=0 IMMEL=1 DIVELOOP=1 STALL=1 total=3 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=5685.9
+[census] seed2 lap3 features=17 inv{ROLL=0 LOOP=1 IMMEL=1 DIVELOOP=0 STALL=1 total=3 spacing=ok} helix=0/0@0.0m/rev tophat=1 ms/lap=13341.9
+[census] seed2 fallbacks: escapes=6 forcedLapCloses=0 relaxedPicks=8
+[census] seed3 lap1 features=13 inv{ROLL=0 LOOP=1 IMMEL=2 DIVELOOP=1 STALL=0 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=6519.3
+[census] seed3 lap2 features=15 inv{ROLL=0 LOOP=1 IMMEL=1 DIVELOOP=1 STALL=1 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=9346.7
+[census] seed3 lap3 features=14 inv{ROLL=0 LOOP=1 IMMEL=0 DIVELOOP=0 STALL=1 total=2 spacing=ok} helix=0/0@0.0m/rev tophat=1 ms/lap=17337.1
+[census] seed3 fallbacks: escapes=4 forcedLapCloses=0 relaxedPicks=10
+[census] seed4 lap1 features=13 inv{ROLL=0 LOOP=0 IMMEL=2 DIVELOOP=0 STALL=1 total=3 spacing=ok} helix=0/0@0.0m/rev tophat=1 ms/lap=15216.8
+[census] seed4 lap2 features=16 inv{ROLL=0 LOOP=1 IMMEL=2 DIVELOOP=0 STALL=1 total=4 spacing=ok} helix=0/0@0.0m/rev tophat=1 ms/lap=17562.7
+[census] seed4 lap3 features=19 inv{ROLL=0 LOOP=1 IMMEL=2 DIVELOOP=0 STALL=1 total=4 spacing=ok} helix=0/0@0.0m/rev tophat=1 ms/lap=13875.7
+[census] seed4 fallbacks: escapes=4 forcedLapCloses=0 relaxedPicks=13
+[census] seed5 lap1 features=17 inv{ROLL=1 LOOP=0 IMMEL=1 DIVELOOP=1 STALL=1 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=9975.8
+[census] seed5 lap2 features=14 inv{ROLL=0 LOOP=1 IMMEL=0 DIVELOOP=0 STALL=1 total=2 spacing=ok} helix=0/0@0.0m/rev tophat=1 ms/lap=17610.3
+[census] seed5 lap3 features=16 inv{ROLL=2 LOOP=0 IMMEL=1 DIVELOOP=1 STALL=0 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=15213.0
+[census] seed5 fallbacks: escapes=0 forcedLapCloses=0 relaxedPicks=6
+[census] seed6 lap1 features=18 inv{ROLL=0 LOOP=1 IMMEL=1 DIVELOOP=1 STALL=1 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=17454.2
+[census] seed6 lap2 features=12 inv{ROLL=0 LOOP=0 IMMEL=0 DIVELOOP=0 STALL=1 total=1 spacing=ok} helix=0/0@0.0m/rev tophat=1 ms/lap=6893.1
+[census] seed6 lap3 features=17 inv{ROLL=0 LOOP=0 IMMEL=1 DIVELOOP=1 STALL=1 total=3 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=18821.1
+[census] seed6 fallbacks: escapes=6 forcedLapCloses=0 relaxedPicks=11
+[census] seed7 lap1 features=17 inv{ROLL=2 LOOP=0 IMMEL=0 DIVELOOP=0 STALL=1 total=3 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=8141.6
+[census] seed7 lap2 features=16 inv{ROLL=0 LOOP=1 IMMEL=0 DIVELOOP=0 STALL=1 total=2 spacing=ok} helix=0/0@0.0m/rev tophat=1 ms/lap=13852.5
+[census] seed7 lap3 features=15 inv{ROLL=2 LOOP=1 IMMEL=0 DIVELOOP=0 STALL=1 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=12395.0
+[census] seed7 fallbacks: escapes=8 forcedLapCloses=0 relaxedPicks=9
+[census] seed8 lap1 features=17 inv{ROLL=0 LOOP=0 IMMEL=2 DIVELOOP=1 STALL=1 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=14808.4
+[census] seed8 lap2 features=12 inv{ROLL=0 LOOP=0 IMMEL=1 DIVELOOP=1 STALL=1 total=3 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=14372.9
+[census] seed8 lap3 features=18 inv{ROLL=0 LOOP=0 IMMEL=2 DIVELOOP=1 STALL=1 total=4 spacing=FAIL} helix=0/0@0.0m/rev tophat=1 ms/lap=20225.6
+[census] seed8 fallbacks: escapes=2 forcedLapCloses=0 relaxedPicks=6
+[census] set inversion totals: ROLL=11 LOOP=11 IMMEL=24 DIVELOOP=13 STALL=19 grand=78
+[census] family share: banked=59.4% airtime=25.4% features=362
+[census] observed mix (report only): CLIMB=24(6.6%) DROP=11(3.0%) HILLS=23(6.4%) TURN=110(30.4%) LOOP=11(3.0%) ROLL=11(3.0%) DIP=11(3.0%) IMMEL=24(6.6%) SCURVE=26(7.2%) DIVE=10(2.8%) BANKAIR=37(10.2%) WAVE=32(8.8%) STALL=19(5.2%) DIVELOOP=13(3.6%)
+[census] fallback totals (8 seeds): escapes=30 forcedLapCloses=0 relaxedPicks=72 (target: <=0.8 total artificial rescues)
+[census] laps=24 invOver4=0 subtypeRepeat=0 inversionSpacing=0 helixGeometryMiss=0 deadSubtype=0 complete=yes
+--- clearance 4 ---
+[clear] seed1 N=466 clearance avg=42.3m min=0.9@279 max=245.1@48 buried=0(0.0%) flat-samples=107 floating>25m=66(61.7%)
+[clear] seed2 N=466 clearance avg=55.2m min=-4.0@269 max=239.2@48 buried=2(0.4%) flat-samples=119 floating>25m=92(77.3%)
+        buried-by-mode: TURN=2
+[clear] seed3 N=466 clearance avg=59.7m min=-5.3@272 max=231.6@48 buried=10(2.1%) flat-samples=252 floating>25m=153(60.7%)
+        buried-by-mode: CLIMB=1 DROP=4 DIP=5
+[clear] seed4 N=476 clearance avg=55.9m min=-7.0@456 max=240.1@48 buried=29(6.1%) flat-samples=267 floating>25m=123(46.1%)
+        buried-by-mode: DROP=8 TURN=21
+--- jointaudit 8 ---
+=== V1 rendered-rail joint audit (8 seeds, +/-0.0001 control units, gauge 1.10m) ===
+seed 1 joints=22 centre=0.003m@142(15>15) raw=0.003m@142 rail=0.003m@142 gauge=1.100..1.100 tangent=0.0deg@20(1>1) roll=1.6deg@402(13>17) curvature-jerk=0.0201/m2@379 roll-rate=3.47deg/m@410 roll-accel=2.65deg/m2@114 PASS
+seed 2 joints=21 centre=0.003m@137(15>15) raw=0.003m@137 rail=0.003m@137 gauge=1.100..1.100 tangent=0.0deg@225(3>4) roll=2.4deg@368(0>0) curvature-jerk=0.0345/m2@296 roll-rate=3.70deg/m@361 roll-accel=2.65deg/m2@108 PASS
+seed 3 joints=21 centre=0.003m@179(16>16) raw=0.003m@179 rail=0.003m@179 gauge=1.100..1.100 tangent=0.0deg@67(2>2) roll=1.2deg@331(0>0) curvature-jerk=0.0371/m2@136 roll-rate=3.44deg/m@129 roll-accel=3.07deg/m2@104 PASS
+seed 4 joints=21 centre=0.003m@455(2>4) raw=0.003m@455 rail=0.003m@455 gauge=1.100..1.100 tangent=0.0deg@50(2>2) roll=0.9deg@133(1>12) curvature-jerk=0.0121/m2@133 roll-rate=3.47deg/m@339 roll-accel=2.62deg/m2@89 PASS
+seed 5 joints=24 centre=0.003m@223(15>15) raw=0.003m@223 rail=0.003m@223 gauge=1.100..1.100 tangent=0.0deg@268(3>3) roll=0.1deg@361(12>18) curvature-jerk=0.0347/m2@362 roll-rate=3.47deg/m@298 roll-accel=3.42deg/m2@422 PASS
+seed 6 joints=21 centre=0.003m@135(15>15) raw=0.003m@135 rail=0.003m@135 gauge=1.100..1.100 tangent=0.0deg@21(1>1) roll=1.6deg@353(13>17) curvature-jerk=0.0375/m2@427 roll-rate=3.47deg/m@361 roll-accel=2.68deg/m2@343 PASS
+seed 7 joints=23 centre=0.003m@218(15>15) raw=0.003m@218 rail=0.003m@218 gauge=1.100..1.100 tangent=0.0deg@147(16>16) roll=1.6deg@443(13>0) curvature-jerk=0.0210/m2@431 roll-rate=3.47deg/m@296 roll-accel=3.29deg/m2@433 PASS
+seed 8 joints=19 centre=0.003m@134(15>15) raw=0.003m@134 rail=0.003m@134 gauge=1.100..1.100 tangent=0.0deg@376(3>3) roll=0.1deg@300(12>18) curvature-jerk=0.0363/m2@301 roll-rate=3.47deg/m@417 roll-accel=3.07deg/m2@106 PASS
+--- forceaudit 4 ---
+=== V1 live-path force audit (4 seeds, 120 Hz, hard vertical +12/-6.5g) ===
+seed 1  vert [ -4.68 @u571/tag18, +10.55 @u562/tag12]  sustained[+9.66/-4.10]  |lat|max=12.75 @u359/tag6  speed[avg217 plan217 peak360 min101 hill-entry>=180 kmh low= 1.4s]  FAIL
+         continuity tangent=7.46deg@u562 curvature-jerk=0.2471/m2@u562 roll-rate=3.63deg/m@u382 roll-accel=4.51deg/m2@u400  FAIL
+seed 2  vert [ -4.66 @u511/tag18, +10.54 @u470/tag4]  sustained[+9.65/-4.10]  |lat|max=11.07 @u348/tag6  speed[avg213 plan213 peak360 min134 hill-entry>=217 kmh low= 0.0s]  FAIL
+         continuity tangent=7.31deg@u502 curvature-jerk=0.2448/m2@u502 roll-rate=4.25deg/m@u871 roll-accel=3.93deg/m2@u1047  FAIL
+seed 3  vert [ -4.67 @u480/tag18, +11.47 @u282/tag5]  sustained[+10.42/-4.11]  |lat|max= 9.26 @u485/tag18  speed[avg217 plan217 peak360 min122 hill-entry>=199 kmh low= 0.0s]  FAIL
+         continuity tangent=7.55deg@u135 curvature-jerk=0.2642/m2@u472 roll-rate=3.85deg/m@u571 roll-accel=4.20deg/m2@u1028  FAIL
+seed 4  vert [ -4.65 @u961/tag3, +10.49 @u459/tag4]  sustained[+9.65/-4.06]  |lat|max= 5.39 @u108/tag4  speed[avg220 plan220 peak360 min132 hill-entry>=213 kmh low= 0.0s]  PASS
+         continuity tangent=0.85deg@u696 curvature-jerk=0.0441/m2@u717 roll-rate=4.24deg/m@u997 roll-accel=4.59deg/m2@u1000  PASS
+middle-50% sustained intense-lobe mean: +8.86g positive (71 runs), -3.30g negative (19 runs)
+middle-50% proportional tame-lobe mean: +5.88g positive (33 runs), +0.00g negative (0 runs)
+sustained by tag: -3=-3.01/14 +4=9.57/50 +5=7.81/6 +12=7.62/19 +13=3.51/14 +14=7.79/5 +18=6.45/10 -18=-4.10/5
+sustained target: approximately +10/-5g (acceptance band +9.4/-4.5g)
+pacing aggregate: avg 217 km/h, seed p95 220 km/h; normal boost cadence 2.15 km (11 gaps), emergency=6
+generation continuity: failures=0  PASS
+--- exporttrack seed1 ---
+EXPORTTRACK: wrote 483 finalized points to /tmp/claude-0/-home-user-Vibe-Coaster/6133a740-2d6c-536a-ae69-bf585476bdc3/scratchpad/baseline_track_seed1.txt; mode=1 remain=2147483647 elems=2/14 pending=0/19 conn=0 pos=(-395.9,169.8,-455.5) dy=-9.225 curv=-1.639 next=0
+--- exporttrack seed4 ---
+EXPORTTRACK: wrote 484 finalized points to /tmp/claude-0/-home-user-Vibe-Coaster/6133a740-2d6c-536a-ae69-bf585476bdc3/scratchpad/baseline_track_seed4.txt; mode=3 remain=2147483647 elems=4/14 pending=0/19 conn=0 pos=(-137.1,30.0,479.8) dy=0.019 curv=0.000 next=0
+[waterfrac] seed1 water=46.8%
+[waterfrac] seeds=1 min=46.8% max=46.8% mean=46.8% (target 10-15%)

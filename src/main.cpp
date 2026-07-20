@@ -1038,6 +1038,39 @@ int main(int argc, char **argv) {
             printf(" %s=%ld(%.1f%%)",GEN_NM[i],setType[i],
                    totalFeatures?100.0*setType[i]/totalFeatures:0.0);
         printf("\n");
+        // Share-vs-target-band report (Phase 0 probe extension,
+        // docs/REFACTOR_PLAN.md U3/U4 targets). Bands are 0.75x-1.75x of the
+        // researched target share; denominator reuses the exact
+        // setType/totalFeatures counts already tallied above for the
+        // "observed mix" line. Report-only: does not read or write
+        // invBudgetMiss/subtypeRepeat/etc. or affect the complete=yes gate.
+        {
+            auto shareOf = [&](long count) {
+                return totalFeatures ? 100.0 * count / totalFeatures : 0.0;
+            };
+            auto flagOf = [](double share, double lo, double hi) {
+                return share < lo ? "LOW" : share > hi ? "HIGH" : "IN";
+            };
+            auto printBand = [&](const char *name, long count, double target) {
+                double share = shareOf(count), lo = target * 0.75, hi = target * 1.75;
+                printf("[census] share %s %.1f%% target %.1f%% band [%.1f,%.1f] %s\n",
+                       name, share, target, lo, hi, flagOf(share, lo, hi));
+            };
+            long turnFamily = setType[M_TURN] + setType[M_SCURVE] +
+                              setType[M_DIVE] + setType[M_WAVE];
+            printBand("TURN(family=TURN+SCURVE+DIVE+WAVE)", turnFamily, 26.0);
+            printf("[census] share TURN-family subtypes (raw, no band):");
+            for (int i : {M_TURN, M_SCURVE, M_DIVE, M_WAVE})
+                printf(" %s=%.1f%%", GEN_NM[i], shareOf(setType[i]));
+            printf("\n");
+            printBand("HILLS", setType[M_HILLS], 15.0);
+            printBand("DROP", setType[M_DROP], 13.0);
+            printBand("IMMEL", setType[M_IMMEL], 12.0);
+            printBand("LOOP", setType[M_LOOP], 4.0);
+            printBand("ROLL", setType[M_ROLL], 2.5);
+            printBand("SCURVE", setType[M_SCURVE], 8.0);
+            printBand("HELIX", setType[M_HELIX], 4.0);
+        }
         int deadSubtype = 0;
         if (seeds > 1) for (int i : invType) if (setType[i] == 0) {
             printf("[census] DEAD enabled inversion subtype: %s\n", GEN_NM[i]);
@@ -1109,6 +1142,149 @@ int main(int argc, char **argv) {
                 printf("\n");
             }
         }
+        return 0;
+    }
+
+    if (argc > 1 && TextIsEqual(argv[1], "--waterfrac")) {
+        // Finding (docs/REFACTOR_PLAN.md Phase 0 probe task): terrainH/vnoise/
+        // hashf (environment.cpp) take only (x,z) plus FIXED literal offsets
+        // (17.5, 91.0, 211.0, ...) -- nothing in that chain reads g_rng or any
+        // seed value, and gTerrainColumns caches purely on (x,z) tile
+        // coordinates. The overworld height/water field is therefore a SINGLE
+        // FIXED WORLD across every run: only track *layout* (via g_rng)
+        // varies per seed, never the terrain it's laid over. Per the task's
+        // own rule ("sample per-seed if seeded, once if fixed"), the grid
+        // below is sampled exactly once and its result reused for every
+        // "seed" line -- confirmed by every line reporting the identical
+        // fraction (min==max==mean below).
+        int seeds = (argc > 2) ? atoi(argv[2]) : 4;
+        if (seeds < 1) seeds = 1;
+        const float LO = -1600.0f, HI = 1600.0f, STEP = 8.0f;
+        long total = 0, wet = 0;
+        for (float x = LO; x <= HI; x += STEP)
+            for (float z = LO; z <= HI; z += STEP) {
+                ++total;
+                if (terrainSurfaceAt(x, z).water) ++wet;
+            }
+        double frac = total ? 100.0 * (double)wet / (double)total : 0.0;
+        printf("[waterfrac] terrain is NOT seeded by g_rng (fixed hash-noise "
+               "world; see environment.cpp vnoise/hashf/terrainH) -- sampled "
+               "once (%ld pts, x,z in [%.0f,%.0f] step %.0fm) and reused for "
+               "all %d seed labels below\n", total, LO, HI, STEP, seeds);
+        for (int sd = 1; sd <= seeds; ++sd)
+            printf("[waterfrac] seed%d water=%.1f%%\n", sd, frac);
+        printf("[waterfrac] seeds=%d min=%.1f%% max=%.1f%% mean=%.1f%% "
+               "(target 10-15%%)\n", seeds, frac, frac, frac);
+        return 0;
+    }
+
+    if (argc > 1 && TextIsEqual(argv[1], "--overlap")) {
+        // Minimum 3D clearance between NON-ADJACENT committed track spans
+        // (docs/REFACTOR_PLAN.md Phase 0; gates Phase 2's U1 occupancy work).
+        // Drives Track exactly like --census (same seed law) for up to 3
+        // laps, but deliberately never calls popFront: the whole cp/arc/kind
+        // history is kept so later spans can be tested against earlier ones.
+        // Adjacency is excluded by arc-length gap (>120 m), not index gap,
+        // since a tight helix packs many close-in-index points far apart in
+        // space and a long straight does the opposite.
+        int seeds = (argc > 2) ? atoi(argv[2]) : 4;
+        if (seeds < 1) seeds = 1;
+        const float CLEARANCE_SOFT = 6.0f;   // project overlap envelope (U1)
+        const float CLEARANCE_HARD = 2.0f;   // ~= definite geometry clip
+        const float ADJACENCY_ARC_GATE = 120.0f;
+        const float CELL = 24.0f;
+        const int LAP_TARGET = 3;
+        long grandPairsUnder6 = 0, grandPairsUnder2 = 0;
+        float grandMin = 1.0e9f; int grandMinSeed = 0;
+        for (int sd = 1; sd <= seeds; ++sd) {
+            g_rng = (uint32_t)sd * 2654435761u | 1u;
+            Track t; t.reset();
+            unsigned seenSerial = 0; long guard = 0;
+            clock_t genClk = clock();
+            while (seenSerial < (unsigned)LAP_TARGET && guard < 400000) {
+                guard++;
+                if (!t.genPoint()) {
+                    printGenerationFailure("[overlap] GENERATION FAIL", sd,
+                                           seenSerial + 1, t);
+                    break;
+                }
+                if (t.completedLapSerial > seenSerial)
+                    seenSerial = t.completedLapSerial;
+            }
+            double genMs = (double)(clock() - genClk) * 1000.0 / CLOCKS_PER_SEC;
+
+            const int N = t.finalizedPointCount();
+            if (N < 4) {
+                printf("[overlap] seed%d too few finalized points (%d) after "
+                       "lap%u, skipping\n", sd, N, seenSerial);
+                continue;
+            }
+            const int segCount = N - 1;
+
+            // Uniform hash grid over segment midpoints keeps the pair scan
+            // O(n): only segments whose cell is within one 24 m cell of each
+            // other are ever tested against each other.
+            std::unordered_map<int64_t, std::vector<int>> grid;
+            grid.reserve((size_t)segCount * 2);
+            auto cellOf = [&](float v) { return (int)floorf(v / CELL); };
+            auto cellKey = [](int ix, int iy, int iz) -> int64_t {
+                return (int64_t)(ix + 200000) |
+                       ((int64_t)(iy + 200000) << 21) |
+                       ((int64_t)(iz + 200000) << 42);
+            };
+            std::vector<int> cx(segCount), cy(segCount), cz(segCount);
+            for (int i = 0; i < segCount; ++i) {
+                Vector3 m = Vector3Scale(Vector3Add(t.cp[i], t.cp[i + 1]), 0.5f);
+                cx[i] = cellOf(m.x); cy[i] = cellOf(m.y); cz[i] = cellOf(m.z);
+                grid[cellKey(cx[i], cy[i], cz[i])].push_back(i);
+            }
+
+            float seedMin = 1.0e9f;
+            int worstI = -1, worstJ = -1;
+            long pairsUnder6 = 0, pairsUnder2 = 0;
+            for (int i = 0; i < segCount; ++i) {
+                const float arcI = 0.5f * (t.arc[i] + t.arc[i + 1]);
+                for (int dx = -1; dx <= 1; ++dx)
+                for (int dy = -1; dy <= 1; ++dy)
+                for (int dz = -1; dz <= 1; ++dz) {
+                    auto found = grid.find(cellKey(cx[i] + dx, cy[i] + dy,
+                                                   cz[i] + dz));
+                    if (found == grid.end()) continue;
+                    for (int j : found->second) {
+                        if (j <= i) continue; // count each unordered pair once
+                        const float arcJ = 0.5f * (t.arc[j] + t.arc[j + 1]);
+                        if (fabsf(arcJ - arcI) <= ADJACENCY_ARC_GATE) continue;
+                        const float d = v1_geometry_audit::segmentDistance(
+                            t.cp[i], t.cp[i + 1], t.cp[j], t.cp[j + 1]);
+                        if (d < CLEARANCE_SOFT) ++pairsUnder6;
+                        if (d < CLEARANCE_HARD) ++pairsUnder2;
+                        if (d < seedMin) { seedMin = d; worstI = i; worstJ = j; }
+                    }
+                }
+            }
+            grandPairsUnder6 += pairsUnder6;
+            grandPairsUnder2 += pairsUnder2;
+            if (worstI >= 0 && seedMin < grandMin) {
+                grandMin = seedMin; grandMinSeed = sd;
+            }
+
+            if (worstI >= 0) {
+                const unsigned char tagI = t.kind[worstI + 1];
+                const unsigned char tagJ = t.kind[worstJ + 1];
+                printf("[overlap] seed%d laps=%u segs=%d minClearance=%.2fm "
+                       "pairs<6m=%ld pairs<2m=%ld worst arcI=%.1f(%s) "
+                       "arcJ=%.1f(%s) genMs=%.1f\n", sd, seenSerial, segCount,
+                       seedMin, pairsUnder6, pairsUnder2, t.arc[worstI],
+                       GEN_NM[tagI], t.arc[worstJ], GEN_NM[tagJ], genMs);
+            } else {
+                printf("[overlap] seed%d laps=%u segs=%d no non-adjacent "
+                       "pairs found genMs=%.1f\n", sd, seenSerial, segCount,
+                       genMs);
+            }
+        }
+        printf("[overlap] seeds=%d minClearance=%.2fm(seed%d) pairs<6m=%ld "
+               "pairs<2m=%ld\n", seeds, grandMin < 1.0e9f ? grandMin : 0.0f,
+               grandMinSeed, grandPairsUnder6, grandPairsUnder2);
         return 0;
     }
 
