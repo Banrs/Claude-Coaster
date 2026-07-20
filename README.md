@@ -25,7 +25,7 @@ The executable is produced at the repo root as `./minecoaster`. On macOS, double
 |---|---|
 | `src/` | Host: game loop, rendering (`render_fx.cpp`, `voxel_render.cpp`, `pathtrace.cpp`), sim, world, and the geometry audit (`v1_geometry_audit.cpp`, `v1_profiles.h`). Entry point `src/main.cpp`. |
 | `v1/` | The procedural **generator** (`coaster_track.cpp`) and its diagnostics (`audit_diagnostics.cpp`). |
-| `docs/` | `GEOMETRY_REFERENCES.md` (real-coaster geometry sources), `V1_HANDOFF.md`. |
+| `docs/` | `AGENT_BRIEF.md` (source of truth) and `REFACTOR_PLAN.md` (current plan of record) are the docs to read first; `GEOMETRY_REFERENCES.md` (real-coaster geometry sources); `CONTINUE.md`, `HANDOFF_NEXT.md`, `V1_HANDOFF.md` are superseded historical handoffs. |
 
 ## Design intent
 
@@ -45,8 +45,9 @@ coaster is **size and speed**:
 ## Status (honest)
 
 The generator is a **work in progress under active repair**. It already encodes the record-breaker
-targets above, but generation currently stalls before completing a full intense ride (the opening
-top hat and the inversions in particular need to be restored). The headless diagnostics below are
+targets above and completes generation end-to-end (`--census` reports `complete=yes`); a full
+re-architecture is in progress per `docs/REFACTOR_PLAN.md` to fix element overlap, water balance,
+element mix, and shadows. The headless diagnostics below are
 **noisy, sometimes buggy signals — not ground truth** (e.g. element counts can be misreported).
 Verify changes by reading the actual geometry and by running the game.
 

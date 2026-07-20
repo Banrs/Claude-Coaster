@@ -1,5 +1,9 @@
 # Continue here — Vibe-Coaster generator repair
 
+> **Superseded as working guidance by `docs/REFACTOR_PLAN.md`** (2026-07-20, full redesign in
+> progress on this branch). Kept as historical reference only — do not follow this file's plan of
+> record; use REFACTOR_PLAN.md instead.
+
 Self-contained brief for continuing this work (incl. in a fresh / online session). Read this, then
 `README.md`, `docs/GEOMETRY_REFERENCES.md`, and `docs/V1_HANDOFF.md`. The diagnosis below was
 verified with `lldb` against the live binary (not just static reading) — trust it over the raw
@@ -110,7 +114,8 @@ This session's overhaul made every seed complete generation end-to-end: `--censu
   at ~40 call sites, avoiding repeated terrain re-probing.
 - **Fallback counters**: `--census` now prints per-seed and aggregate `escapes/forcedLapCloses/
   relaxedPicks` (`src/main.cpp:1019,1046`) so fallback rate is directly measurable (see gate table).
-- **Render fixes**: shadow bias/snap + station shadow casting (`main.cpp:2694`), wheel/guide-wheel/
+- **Render fixes**: shadow bias/snap + station shadow casting (`main.cpp:2694`)
+  [superseded by ShadowSys refactor — see REFACTOR_PLAN.md Phase 6], wheel/guide-wheel/
   upstop running-gear stack restored (`coaster_car.cpp:57-66`), a capped `supportPlacementCache`
   (`main.cpp:1573,2760-2762,2909-2910`), orbit-frame filenames `orbit_f%d.png` (`main.cpp:3775`), and
   a `--gtrace` debug g-force overlay (`main.cpp:3927`; no persistent in-ride HUD g-meter exists).

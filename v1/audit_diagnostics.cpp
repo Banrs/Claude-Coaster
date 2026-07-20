@@ -11,7 +11,8 @@ namespace audit_mode {
 
 static const char* NM[M_COUNT] = {"FLAT","CLIMB","DROP","HILLS","TURN","LOOP","ROLL","STN","DIP","LAUNCH","HELIX","BOOST","IMMEL","SCURVE","DIVE","BANKAIR","WAVE","STALL","DIVELOOP"};
 
-// gate index -> letter (A..I). E and G are WARN-only (never fail the process).
+// gate index -> letter (A..I). Only E is WARN-only (never fails the process); every other
+// gate, including G, is HARD per GATE_HARD below.
 static const char GATE[8] = {'A','B','C','D','E','F','G','I'};
 static const bool GATE_HARD[8] = { true,true,true,true,false,true,true,true };
 
@@ -507,9 +508,10 @@ static SeedRes auditSeed(int seed) {
     bool ifail=!censusGenerationOK;
     if (!censusGenerationOK)
         printf("  I FAIL  generator exhausted before three complete census laps\n");
-    // PER-LAP quota (integration directive): HARD for tophat/HILLS/TURN in EVERY census lap; WARN
-    // (never fails) for the terrain-gated families HELIX/DIP/bankedair, which can be genuinely
-    // never-eligible on a pathological seed.
+    // PER-LAP quota: despite the HARDQ/WARNQ names below, BOTH groups only print "I WARN" and
+    // never set ifail — tophat/HILLS/TURN absence is print-only here too, same as the
+    // terrain-gated families HELIX/DIP/bankedair. (Gate I's actual hard failure conditions are
+    // censusGenerationOK and the invAvg range check further down.)
     { static const int HARDQ[3]={0,1,2}, WARNQ[3]={3,4,5};
       for (int l=0;l<3;l++) {
           for (int i2=0;i2<3;i2++) if (fam[l][HARDQ[i2]] < 1)

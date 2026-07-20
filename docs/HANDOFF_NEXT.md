@@ -1,5 +1,9 @@
 # Handoff — continue the ride overhaul (written 2026-07-19, HEAD 923f627)
 
+> **Superseded as working guidance by `docs/REFACTOR_PLAN.md`** (2026-07-20, full redesign in
+> progress on this branch). Kept as historical reference only — do not follow this file's plan of
+> record; use REFACTOR_PLAN.md instead.
+
 Read `docs/AGENT_BRIEF.md` first (the user's source of truth), then this file, then skim
 `docs/CONTINUE.md` (updated gate table). Work on `main`. Hard rule unchanged: **every seed must
 complete generation** — never trade completion for a cosmetic fix.
@@ -68,7 +72,8 @@ Generator (`v1/coaster_track.cpp`, plus `src/ride_constants.h`, `src/game_state.
 - **Instrumentation**: fallback counters printed by --census (escapes/forcedLapCloses/relaxedPicks);
   new `--shapedump <seed> [pts] [summary]` probe (per-cp pitch/heading/bank/roll + dead-spot metric).
 Renderer (`src/render_fx.cpp`, `src/coaster_car.cpp`, `src/main.cpp`): shadow bias shrunk to
-~1.3–3.6 texels + light-space texel snapping (no shimmer), stations cast shadows, GL_LEQUAL leak
+~1.3–3.6 texels + light-space texel snapping (no shimmer) [superseded by ShadowSys refactor —
+see REFACTOR_PLAN.md Phase 6], stations cast shadows, GL_LEQUAL leak
 fixed, dead maxDepth guard removed, wheels enlarged + side-friction + upstop wheels added,
 --orbitshot writes unique filenames, HUD g-meter uses accumulated arc (was fixed 13 m floor),
 support-placement search cached by global cp index.

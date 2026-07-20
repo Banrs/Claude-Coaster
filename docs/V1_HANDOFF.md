@@ -1,5 +1,9 @@
 # V1 continuation handoff
 
+> **Superseded as working guidance by `docs/REFACTOR_PLAN.md`** (2026-07-20, full redesign in
+> progress on this branch). This file predates the current work (Codex/codespace-era workflow,
+> paths, and checkpoint); kept as historical reference only — do not follow it as a plan of record.
+
 This is the restart point for the V1 track-generation regression work. It records required work and evidence only; no result below is a claimed pass.
 
 ## Cloud continuation prompt
