@@ -9,7 +9,10 @@
 #include "../src/v1_profiles.h"
 #include <deque>
 #include <vector>
+#include <unordered_map>
 #include <climits>
+#include <cassert>
+#include <cstdint>
 
 struct CommittedTrack {
     static constexpr int ADAPTIVE_LAG = genc::ADAPTIVE_LAG;
@@ -27,6 +30,162 @@ struct CommittedTrack {
     std::deque<float>         arc;
     std::deque<float>         gvlog;
     long base = 0;
+
+    // --- U1 OCCUPANCY INDEX (Phase 2) --------------------------------------
+    // A persistent 16 m hash grid of every committed track span, keyed from
+    // floored x/16,y/16,z/16.  Each grid entry is a self-contained OccSpan
+    // (endpoints + midpoint arc + global span id), so the grid survives
+    // popFront eviction and therefore holds GLOBAL occupancy even though the
+    // cp/arc deques stream.  Two layers share the grid:
+    //   * LIVE  spans -- inserted by pushCP for the span between the last two
+    //     points.  Because generation transactions are append-only + LIFO
+    //     truncate-rollback, the occLive ledger records the cells each live
+    //     span was inserted into so rollback can remove exactly those grid
+    //     entries from the back (occTruncateTo).
+    //   * ARCHIVE spans -- popFront pops the oldest live ledger record; the
+    //     grid entry itself stays permanently (it never rolls back), which is
+    //     what gives occupancy despite the streaming window.
+    static constexpr float OCC_CELL = genc::OCCUPANCY_CELL;
+    struct OccSpan { Vector3 a, b; float arc; long id; };
+    std::unordered_map<int64_t, std::vector<OccSpan>> occGrid;
+    struct OccLive { long id; std::vector<int64_t> cells; };
+    std::deque<OccLive> occLive;   // rollback ledger for the live span tail
+
+    static int64_t occCellKey(float x, float y, float z) {
+        const int64_t ix = (int64_t)floorf(x / OCC_CELL) + (1 << 20);
+        const int64_t iy = (int64_t)floorf(y / OCC_CELL) + (1 << 20);
+        const int64_t iz = (int64_t)floorf(z / OCC_CELL) + (1 << 20);
+        return ix | (iy << 21) | (iz << 42);
+    }
+    // Walk a segment at <= OCC_CELL steps and collect the unique cells it
+    // passes through.  A 14 m span touches only 1-3 cells.
+    template <class Fn>
+    static void occWalkCells(const Vector3 &a, const Vector3 &b, Fn emit) {
+        const float len = Vector3Distance(a, b);
+        const int steps = std::max(1, (int)ceilf(len / OCC_CELL));
+        int64_t last = INT64_MIN;
+        for (int s = 0; s <= steps; ++s) {
+            const float t = (float)s / steps;
+            const int64_t key = occCellKey(a.x + (b.x - a.x) * t,
+                                           a.y + (b.y - a.y) * t,
+                                           a.z + (b.z - a.z) * t);
+            if (key != last) { emit(key); last = key; }
+        }
+    }
+    void occInsertSpan(const Vector3 &a, const Vector3 &b, float spanArc,
+                       long id, std::vector<int64_t> *outCells) {
+        occWalkCells(a, b, [&](int64_t key) {
+            // occWalkCells only skips consecutive duplicates; a segment that
+            // re-enters a cell would double-insert, so guard against that.
+            if (outCells) {
+                for (int64_t c : *outCells) if (c == key) return;
+                outCells->push_back(key);
+            }
+            occGrid[key].push_back({a, b, spanArc, id});
+        });
+    }
+    // Remove live spans (and their grid entries) beyond `cpN` points.  LIFO
+    // truncation guarantees each rolled-back span's entries sit at the back of
+    // every cell it touched, because any span inserted afterwards into a shared
+    // cell was already rolled back.
+    void occTruncateTo(size_t cpN) {
+        const size_t targetSpans = cpN >= 1 ? cpN - 1 : 0;
+        while (occLive.size() > targetSpans) {
+            OccLive &rec = occLive.back();
+            for (int64_t c : rec.cells) {
+                auto it = occGrid.find(c);
+                assert(it != occGrid.end() && !it->second.empty() &&
+                       it->second.back().id == rec.id);
+                it->second.pop_back();
+                if (it->second.empty()) occGrid.erase(it);
+            }
+            occLive.pop_back();
+        }
+        // Debug: the surviving live tail is contiguous ids ending at cpN-2.
+        assert(occLive.empty() ||
+               occLive.back().id == base + (long)occLive.size() - 1);
+    }
+    void occReset() { occGrid.clear(); occLive.clear(); }
+
+    // Segment-segment distance (copied verbatim from
+    // v1_geometry_audit::segmentDistance -- that file is included AFTER this
+    // one, so it cannot be referenced here; keeping the two identical means
+    // the --overlap gate measures exactly what occupancy enforces).
+    static float occSegmentDistance(Vector3 p1, Vector3 q1,
+                                    Vector3 p2, Vector3 q2) {
+        constexpr float EPS = 1.0e-7f;
+        Vector3 d1 = Vector3Subtract(q1, p1), d2 = Vector3Subtract(q2, p2);
+        Vector3 r = Vector3Subtract(p1, p2);
+        float a = Vector3DotProduct(d1, d1), e = Vector3DotProduct(d2, d2);
+        float f = Vector3DotProduct(d2, r), s = 0.0f, t = 0.0f;
+        if (a <= EPS && e <= EPS) return Vector3Distance(p1, p2);
+        if (a <= EPS) t = Clamp(f / e, 0.0f, 1.0f);
+        else {
+            float c = Vector3DotProduct(d1, r);
+            if (e <= EPS) s = Clamp(-c / a, 0.0f, 1.0f);
+            else {
+                float b = Vector3DotProduct(d1, d2);
+                float denom = a * e - b * b;
+                if (fabsf(denom) > EPS) s = Clamp((b * f - c * e) / denom, 0.0f, 1.0f);
+                t = (b * s + f) / e;
+                if (t < 0.0f) { t = 0.0f; s = Clamp(-c / a, 0.0f, 1.0f); }
+                else if (t > 1.0f) { t = 1.0f; s = Clamp((b - c) / a, 0.0f, 1.0f); }
+            }
+        }
+        Vector3 c1 = Vector3Add(p1, Vector3Scale(d1, s));
+        Vector3 c2 = Vector3Add(p2, Vector3Scale(d2, t));
+        return Vector3Distance(c1, c2);
+    }
+    // Min distance from candidate segment a->b to any occupancy span whose
+    // midpoint arc is more than OCCUPANCY_ARC_EXCLUDE from the candidate tip
+    // arc (arc-based self-exclusion of the track just travelled).  Scans the
+    // 3x3x3 cell neighbourhood of every cell the candidate passes through and
+    // early-outs once a hit falls below `envelope`.
+    float occClearanceSegment(const Vector3 &a, const Vector3 &b,
+                              float tipArc, float envelope) const {
+        // Scratch reused across calls (generation is single-threaded and this
+        // is never re-entered): the visited set collapses the heavy overlap
+        // between the 3x3x3 neighbourhoods of a multi-cell candidate segment so
+        // each occupancy cell is scanned at most once per candidate segment.
+        static std::vector<int64_t> baseCells;
+        static std::unordered_map<int64_t, char> visited;
+        baseCells.clear(); visited.clear();
+        occWalkCells(a, b, [&](int64_t key) {
+            for (int64_t c : baseCells) if (c == key) return;
+            baseCells.push_back(key);
+        });
+        float best = 1.0e9f;
+        for (int64_t baseKey : baseCells)
+        for (int dx = -1; dx <= 1; ++dx)
+        for (int dy = -1; dy <= 1; ++dy)
+        for (int dz = -1; dz <= 1; ++dz) {
+            const int64_t key = baseKey + (int64_t)dx +
+                ((int64_t)dy << 21) + ((int64_t)dz << 42);
+            if (!visited.emplace(key, 1).second) continue;
+            auto found = occGrid.find(key);
+            if (found == occGrid.end()) continue;
+            for (const OccSpan &e : found->second) {
+                if (fabsf(e.arc - tipArc) <= genc::OCCUPANCY_ARC_EXCLUDE)
+                    continue;
+                const float d = occSegmentDistance(a, b, e.a, e.b);
+                if (d < best) best = d;
+                if (best < envelope) return best;   // early-out below envelope
+            }
+        }
+        return best;
+    }
+    // Shared U1 qualifier: every span of a candidate centreline must keep at
+    // least `envelope` clearance from committed occupancy.  Returns false at
+    // the first breach (an organic rejection -> the scheduler reroutes).
+    bool occupancyClear(const std::vector<Vector3> &pts, float envelope) const {
+        if (envelope <= 0.0f) return true;   // occupancy disabled (last-resort escape)
+        if (pts.size() < 2 || occGrid.empty()) return true;
+        const float tipArc = arc.empty() ? 0.0f : arc.back();
+        for (size_t i = 0; i + 1 < pts.size(); ++i)
+            if (occClearanceSegment(pts[i], pts[i + 1], tipArc, envelope) < envelope)
+                return false;
+        return true;
+    }
 
     enum MacroProfileKind : unsigned char {
         MACRO_NONE, MACRO_TOP_HAT, MACRO_HILLS, MACRO_DROP
@@ -96,6 +255,12 @@ struct CommittedTrack {
         cp.pop_front(); up.pop_front(); kind.pop_front(); chainf.pop_front(); alignmentf.pop_front();
         spanRun.pop_front(); spanStart.pop_front(); spanEnd.pop_front(); arc.pop_front();
         if (!gvlog.empty()) gvlog.pop_front();
+        // Archive the evicted span: its grid entries stay permanently (they
+        // become global occupancy), only the rollback ledger record is dropped
+        // from the front.  popFront is never called inside a transaction (the
+        // base==snapshot.base assert in rollback guarantees it), so the live
+        // tail remains a clean LIFO stack for occTruncateTo.
+        if (!occLive.empty()) occLive.pop_front();
         base++;
         while (!analyticRuns.empty() && analyticRuns.front().lastGlobalPoint < base)
             analyticRuns.pop_front();
@@ -571,4 +736,11 @@ struct GenCursor {
     float   scurveExitDelta = 0.0f;
     float   diveBaseY = 0.0f;
     float   diveDepth = 12.0f;
+    // Active U1 occupancy envelope (metres of centreline clearance an element
+    // must keep from committed geometry).  Ordinary elements use the 6 m
+    // project constant; escapeForward drops it to the 4 m escape envelope for
+    // its own attempts, and the boundary escape stage may relax it to 4.5 m
+    // for completion safety.  It lives in the cursor so a rolled-back trial
+    // restores it exactly.
+    float   occupancyEnvelope = genc::OCCUPANCY_ENVELOPE;
 };

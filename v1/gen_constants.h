@@ -87,4 +87,25 @@ inline constexpr float HILL_ENTRY_MAX = 66.85f; // 240.7 km/h at 1.5x
 // Macro-profile sampling step (plan-view metres between authored knots).
 inline constexpr float MACRO_SAMPLE_STEP = 7.0f;
 
+// U1 occupancy (Phase 2).  A persistent 16 m hash grid of committed track
+// spans is consulted by every commit qualification path so an element can
+// never be authored through already-built geometry.  The rider envelope is
+// the project 6 m centreline clearance (docs/REFACTOR_PLAN.md U1); escape
+// arcs/connectors relax to 4 m, and a completion-safety fallback relaxes the
+// ordinary envelope to 4.5 m in the boundary escape stage.  A candidate span
+// only tests against committed spans whose arc-length differs by more than
+// OCCUPANCY_ARC_EXCLUDE (the same 120 m self-exclusion the --overlap probe
+// uses), so the track a new element legitimately joins onto is never a clip.
+inline constexpr float OCCUPANCY_CELL            = 16.0f;
+inline constexpr float OCCUPANCY_ENVELOPE        = 6.0f;
+inline constexpr float OCCUPANCY_ENVELOPE_ESCAPE = 4.0f;
+inline constexpr float OCCUPANCY_ENVELOPE_RELAXED = 4.5f;
+// Absolute last-resort clearance for a genuinely boxed-in anchor (occupancy
+// rerouting can steer a lap into a corner baseline never visited).  Kept above
+// the 2 m hard-clip threshold so completion is guaranteed WITHOUT ever
+// producing a <2 m geometry intersection -- the overlap gate's zero-tolerance
+// invariant.  Only the escape/launch fallbacks ever drop this low.
+inline constexpr float OCCUPANCY_ENVELOPE_LASTRESORT = 2.5f;
+inline constexpr float OCCUPANCY_ARC_EXCLUDE     = 120.0f;
+
 } // namespace genc

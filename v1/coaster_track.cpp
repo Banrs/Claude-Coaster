@@ -88,6 +88,7 @@ struct Track : CommittedTrack, GenCursor {
         trunc(chainf, s.cpN); trunc(alignmentf, s.cpN);
         trunc(spanRun, s.cpN); trunc(spanStart, s.cpN); trunc(spanEnd, s.cpN);
         trunc(arc, s.cpN); trunc(gvlog, s.cpN);
+        occTruncateTo(s.cpN);   // U1: drop grid entries of truncated live spans
         while (analyticRuns.size() > s.analyticN) analyticRuns.pop_back();
         while (spatialRuns.size() > s.spatialN) spatialRuns.pop_back();
         for (size_t i = 0; i < s.analyticN; ++i)
@@ -271,10 +272,43 @@ struct Track : CommittedTrack, GenCursor {
         alignmentf.push_back(alignment ? 1 : 0);
         spanRun.push_back(run); spanStart.push_back(runStart); spanEnd.push_back(runEnd); arc.push_back(a);
         gvlog.push_back(genV);
+        // U1: register the LIVE span just closed (cp[n-2] -> cp[n-1]) into the
+        // occupancy grid, tagged with its global id and midpoint arc.  Rollback
+        // (occTruncateTo) and eviction (popFront) both key off this ledger.
+        if (cp.size() >= 2) {
+            const size_t n = cp.size();
+            const long id = base + (long)(n - 2);
+            const float midArc = 0.5f * (arc[n - 2] + arc[n - 1]);
+            occLive.push_back({id, {}});
+            occInsertSpan(cp[n - 2], cp[n - 1], midArc, id, &occLive.back().cells);
+        }
     }
 
     void lockMacroAnchor() {
         if (!cp.empty()) gpos = cp.back();
+    }
+
+    // U1 for analytic macros (top hat / hill chain / straight drop): sample the
+    // longitudinal profile at ~MACRO_SAMPLE_STEP along its straight plan line --
+    // the same convention as the macros' own terrain scans -- and test that
+    // centreline against committed occupancy.
+    bool occMacroClear(const v1profile::Profile &prof, Vector3 origin,
+                       float yaw) const {
+        const float end = (float)prof.length();
+        // The candidate is straight in plan and its profile is smooth, so a
+        // SEG_LEN (14 m) qualify step chords it to well under the 6 m envelope;
+        // the finer 7 m authoring step is not needed for the occupancy test.
+        const float step = SEG_LEN;
+        std::vector<Vector3> pts;
+        pts.reserve((size_t)(end / step) + 2);
+        for (float s = 0.0f; s < end; s += step)
+            pts.push_back({origin.x + sinf(yaw) * s,
+                           (float)prof.sampleDistance(s).height,
+                           origin.z + cosf(yaw) * s});
+        pts.push_back({origin.x + sinf(yaw) * end,
+                       (float)prof.sampleDistance(end).height,
+                       origin.z + cosf(yaw) * end});
+        return occupancyClear(pts, occupancyEnvelope);
     }
 
     bool beginTopHat(bool major) {
@@ -360,6 +394,7 @@ struct Track : CommittedTrack, GenCursor {
                                   "terrain" : "clearance-cap");
             }
         }
+        if (!occMacroClear(built.profile, gpos, gyaw)) return reject("occupancy");
 
         macroProfile = built.profile;
         macroKind = MACRO_TOP_HAT;
@@ -472,6 +507,7 @@ struct Track : CommittedTrack, GenCursor {
                 }
             if (deficiency > 0.05f) return false;
         }
+        if (!occMacroClear(built.profile, gpos, gyaw)) return false;
 
         macroProfile = built.profile;
         macroKind = MACRO_HILLS;
@@ -692,6 +728,7 @@ struct Track : CommittedTrack, GenCursor {
         }
         if (publishedCurved) return true;
 
+        if (!occMacroClear(built, gpos, gyaw)) return false;
         macroProfile = built;
         macroKind = MACRO_DROP;
         macroDistance = 0.0f;
@@ -746,6 +783,8 @@ struct Track : CommittedTrack, GenCursor {
     void reset() {
         rng = ::g_rng;
         gGenTerrain.clear();
+        occReset();
+        occupancyEnvelope = genc::OCCUPANCY_ENVELOPE;
         cp.clear(); up.clear(); kind.clear(); chainf.clear(); alignmentf.clear();
         spanRun.clear(); spanStart.clear(); spanEnd.clear(); analyticRuns.clear(); spatialRuns.clear();
         spatialPts.clear(); spatialUps.clear(); spatialIdx = 0; spatialRunId = 0;
@@ -1270,6 +1309,9 @@ struct Track : CommittedTrack, GenCursor {
                 if (p.y < floor - 0.05f || p.y > BUILD_MAX) return false;
             }
         }
+        // U1: every spatial element / connector / escape arc / power deck that
+        // qualifies through this gate must also clear committed occupancy.
+        if (!occupancyClear(run.points, occupancyEnvelope)) return false;
         return true;
     }
 
@@ -1678,7 +1720,7 @@ struct Track : CommittedTrack, GenCursor {
         return true;
     }
 
-    void buildLoopSpatial(float sweep, float targetHeight, bool immelRoll = false) {
+    bool buildLoopSpatial(float sweep, float targetHeight, bool immelRoll = false) {
         const int denseN = 4096;
         const float transition = 0.06f;
         auto smooth5 = [](float x) { x=Clamp(x,0.0f,1.0f); return x*x*x*(10.0f+x*(-15.0f+6.0f*x)); };
@@ -1803,11 +1845,22 @@ struct Track : CommittedTrack, GenCursor {
             float t = (float)j / curveSteps;
             appendCurveKnot(t,true);
         }
+        // U1: a loop / Immelmann is authored unconditionally otherwise -- this
+        // is the "the Immelmann's top is clipped by other elements" case, so it
+        // must clear committed occupancy before it commits.
+        {
+            std::vector<Vector3> occPts;
+            occPts.reserve(spatialPts.size() + 1);
+            occPts.push_back(origin);
+            occPts.insert(occPts.end(), spatialPts.begin(), spatialPts.end());
+            if (!occupancyClear(occPts, occupancyEnvelope)) return false;
+        }
         remain = (int)spatialPts.size();
         commitSpatialRun(origin, up.empty() ? WUP : up.back(), true);
+        return true;
     }
 
-    void initLoop() {
+    bool initLoop() {
         syncYawToTrack();
         // Full Throttle's 48.8 m loop is the record-height floor. Grow only as
         // much as the actual entry speed requires for roughly +10 g at the
@@ -1816,17 +1869,17 @@ struct Track : CommittedTrack, GenCursor {
         const float loopHeight = Clamp(2.0f * genV * genV / (14.0f * GRAV),
                                        LOOP_RECORD_HEIGHT,
                                        LOOP_RECORD_HEIGHT * RECORD_SCALE_CAP);
-        buildLoopSpatial(2.0f * PI, loopHeight, false);
+        return buildLoopSpatial(2.0f * PI, loopHeight, false);
     }
 
-    void initImmel() {
+    bool initImmel() {
         syncYawToTrack();
         mode    = M_IMMEL;
         const float radius = invRFor(M_IMMEL);
         immelDir = (rnd01() < 0.5f) ? -1.0f : 1.0f;
         // Sweep 24 degrees past the crest: the real element exits BELOW its
         // crest, already diving toward its runout, with the half-roll done.
-        buildLoopSpatial(PI + 24.0f * DEG2RAD, 2.0f * radius, true);
+        return buildLoopSpatial(PI + 24.0f * DEG2RAD, 2.0f * radius, true);
     }
     bool initRoll(float forcedHand = 0.0f) {
         syncYawToTrack();
@@ -2019,6 +2072,13 @@ struct Track : CommittedTrack, GenCursor {
         }
         if (!spatialPts.empty() && !exitAnchorClear(spatialPts.back()))
             return false;
+        {   // U1: corkscrew has no spatialCorridorClear gate; check occupancy.
+            std::vector<Vector3> occPts;
+            occPts.reserve(spatialPts.size() + 1);
+            occPts.push_back(origin);
+            occPts.insert(occPts.end(), spatialPts.begin(), spatialPts.end());
+            if (!occupancyClear(occPts, occupancyEnvelope)) return false;
+        }
         mode = M_ROLL;
         remain = rollSteps;
         rollHand = handedness;
@@ -2172,6 +2232,15 @@ struct Track : CommittedTrack, GenCursor {
         // stitched inside the named element and created a visible flat tail.
         for (const Vector3 &point : points) {
             if (point.y < ordinaryCorridorFloor(genGroundTopAt(point.x, point.z)) - 0.05f) {
+                rng = savedRng; gyaw = savedYaw; return false;
+            }
+        }
+        {   // U1: dive loop commits via its own dense loop, not spatialCorridorClear.
+            std::vector<Vector3> occPts;
+            occPts.reserve(points.size() + 1);
+            occPts.push_back(origin);
+            occPts.insert(occPts.end(), points.begin(), points.end());
+            if (!occupancyClear(occPts, occupancyEnvelope)) {
                 rng = savedRng; gyaw = savedYaw; return false;
             }
         }
@@ -2782,6 +2851,13 @@ struct Track : CommittedTrack, GenCursor {
         if (!points.empty() && !exitAnchorClear(points.back())) {
             rng=savedRng; return false;
         }
+        {   // U1: helix commits via its own dense loop, not spatialCorridorClear.
+            std::vector<Vector3> occPts;
+            occPts.reserve(points.size() + 1);
+            occPts.push_back(origin);
+            occPts.insert(occPts.end(), points.begin(), points.end());
+            if (!occupancyClear(occPts, occupancyEnvelope)) { rng=savedRng; return false; }
+        }
         mode=M_HELIX; turnDir=chosenDir; spatialIdx=0;
         spatialPts.swap(points); spatialUps.swap(frames); spatialD1.swap(d1s);
         spatialD2.swap(d2s); spatialD3.swap(d3s); spatialDs.swap(spans);
@@ -3073,6 +3149,13 @@ struct Track : CommittedTrack, GenCursor {
         };
         append(0.0f,false);
         for (int j=1;j<=hillLen;++j) append((float)j/hillLen,true);
+        {   // U1: banked camelback (BANKAIR/WAVE) commits via its own dense loop.
+            std::vector<Vector3> occPts;
+            occPts.reserve(spatialPts.size() + 1);
+            occPts.push_back(origin);
+            occPts.insert(occPts.end(), spatialPts.begin(), spatialPts.end());
+            if (!occupancyClear(occPts, occupancyEnvelope)) return false;
+        }
         remain = (int)spatialPts.size();
         commitSpatialRun(origin, up.empty() ? WUP : up.back(), true);
         return true;
@@ -4190,9 +4273,9 @@ struct Track : CommittedTrack, GenCursor {
                     if (!committed) committed = beginTopHat(!major);
                     break;
                 }
-                case M_LOOP:     initLoop();     mode = M_LOOP; break;
+                case M_LOOP:     committed=initLoop(); if (committed) mode = M_LOOP; break;
                 case M_ROLL:     committed=initRoll(); break;
-                case M_IMMEL:    initImmel();    break;
+                case M_IMMEL:    committed=initImmel(); break;
                 case M_STALL:    committed=initStall(); break;
                 case M_DIVELOOP: committed=initDiveLoop(); break;
                 case M_SCURVE:   committed=initSCurve(); break;
@@ -4677,6 +4760,16 @@ struct Track : CommittedTrack, GenCursor {
         // stale "momentum" bakes a real, spurious bank spike into its first span.
         if (!boundaryTransactionActive) {
             syncContinuityFromBoundary();
+            // U1 completion safety: the boundary has exhausted every ordinary
+            // element and routing turn.  Relax the occupancy envelope to 4.5 m
+            // for the last-resort launch/boost/escape attempts so a boxed-in
+            // anchor can always close its lap (escapeForward relaxes further to
+            // its own 4 m).  Restored on every exit path.  Escape-territory
+            // spans reading 4-6 m clearance are expected and allowed.
+            const float savedStageEnv = occupancyEnvelope;
+            occupancyEnvelope = genc::OCCUPANCY_ENVELOPE_RELAXED;
+            struct StageEnvRestore { float &e; float v; ~StageEnvRestore() { e = v; } }
+                stageEnvRestore{occupancyEnvelope, savedStageEnv};
             // A powered launch always closes the lap and climbs out under power;
             // prefer it the moment escapes have charged the lap budget past its
             // feature target, and require it before an escape can keep streaming.
@@ -4716,6 +4809,32 @@ struct Track : CommittedTrack, GenCursor {
             if (startLaunch()) { consecutiveEscapes = 0; return ScheduleOutcome::Committed; }
             pending = {}; connLen = 0; terrainAvoidanceTurn = false;
             if (startBoost()) { consecutiveEscapes = 0; return ScheduleOutcome::Committed; }
+
+            // ABSOLUTE completion guarantee.  Every occupancy-checked option is
+            // exhausted: the escape budget is spent (so the sweep above was
+            // gated off) or the launches are boxed even at 4.5 m.  Occupancy
+            // rerouting can steer generation into a spot baseline never visited,
+            // so before dead-ending the ride we retry the escape sweep (which
+            // tiers internally to occupancy-off) unconditionally, then a launch/
+            // boost with occupancy fully disabled.  These fire only at a genuine
+            // box and are exactly what keeps --census complete=yes; the escape
+            // envelope still tried 4 m first, so ordinary clearance is preserved.
+            pending = {}; connLen = 0; terrainAvoidanceTurn = false;
+            if (escapeForward()) {
+                consecutiveEscapes++; escapesSinceLaunch++;
+                elems = std::min(elems + 1, elemLimit + 6);
+                return ScheduleOutcome::Committed;
+            }
+            // Launch/boost descending squeeze (highest feasible clearance,
+            // 2 m last clip-free rung) then, if still boxed, occupancy off.
+            for (float launchEnv : {3.0f, genc::OCCUPANCY_ENVELOPE_LASTRESORT,
+                                    2.0f, 0.0f}) {
+                occupancyEnvelope = launchEnv;
+                pending = {}; connLen = 0; terrainAvoidanceTurn = false;
+                if (startLaunch()) { consecutiveEscapes = 0; return ScheduleOutcome::Committed; }
+                pending = {}; connLen = 0; terrainAvoidanceTurn = false;
+                if (startBoost()) { consecutiveEscapes = 0; return ScheduleOutcome::Committed; }
+            }
         }
 
         pending = {};
@@ -4742,6 +4861,28 @@ struct Track : CommittedTrack, GenCursor {
     // where the incoming element already spent its force, so the reset only
     // relaxes the rider, never adds load.
     bool escapeForward() {
+        // U1: escape arcs / connectors are the last-resort reroute.  They first
+        // try to clear committed geometry to the narrow 4 m escape envelope, but
+        // an escape is ALSO the streaming ride's guaranteed forward-progress
+        // mechanism -- it must never dead-end generation.  So the sweep runs in
+        // two tiers: envelope 4 m first (avoid clips when at all possible), then
+        // occupancy OFF (envelope 0) if the anchor is genuinely boxed in by
+        // prior-lap geometry, guaranteeing completion.  The env member is
+        // restored on every exit path; a rolled-back trial restores it too.
+        const float savedEnv = occupancyEnvelope;
+        struct EnvRestore { float &e; float v; ~EnvRestore() { e = v; } }
+            envRestore{occupancyEnvelope, savedEnv};
+        // Tier down only as far as each anchor actually needs: the 4 m escape
+        // envelope, then a descending squeeze that always takes the HIGHEST
+        // feasible clearance (so the escape never picks a tighter gap than it
+        // must), with 2 m as the last clip-free rung (the overlap gate flags
+        // pairs < 2 m).  Occupancy off is the final rung: the absolute
+        // completion guarantee for a genuinely boxed-in corner where no >=2 m
+        // gap exists at all.
+        for (float envTier : {genc::OCCUPANCY_ENVELOPE_ESCAPE,
+                              3.0f, genc::OCCUPANCY_ENVELOPE_LASTRESORT,
+                              2.0f, 0.0f}) {
+        occupancyEnvelope = envTier;
         const float reachLo = 0.30f, reachHiUp = 0.55f;
         // An escape recovers UP to clearance and never descends: the track often
         // sits exactly on the corridor floor (WATER_Y + deck clearance) with a
@@ -4807,6 +4948,7 @@ struct Track : CommittedTrack, GenCursor {
                     }
                 }
         }
+        }   // envelope tier loop (4 m escape envelope, then occupancy off)
         return false;
     }
 

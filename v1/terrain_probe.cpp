@@ -24,7 +24,7 @@
 // time (play loop or audit), so the memo needs no locking; the tile store
 // underneath stays thread-safe for the terrain-mesh worker.
 struct GenTerrainMemo {
-    static constexpr uint32_t N = 1u << 17;
+    static constexpr uint32_t N = 1u << 20;
     uint64_t key[N];
     float solid[N];
     uint32_t stamp[N];
@@ -38,7 +38,7 @@ struct GenTerrainMemo {
     float solidTopAt(float x, float z) {
         const uint64_t k = pack(x, z);
         const uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ull) >> 40) % N;
-        for (uint32_t probe = 0; probe < 8; ++probe) {
+        for (uint32_t probe = 0; probe < 16; ++probe) {
             const uint32_t i = (h + probe) % N;
             if (stamp[i] == epoch && key[i] == k) return solid[i];
             if (stamp[i] != epoch) {
