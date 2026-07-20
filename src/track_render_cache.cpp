@@ -90,10 +90,22 @@ struct CpuMeshBuilder {
     std::vector<float> texcoords;
     std::vector<float> normals;
     std::vector<unsigned char> colors;
+    // Optional per-vertex tangent (vec4). Enabled only for rail meshes so the
+    // anisotropic rail highlight can read a per-vertex tangent (SHADOW_VS/FS),
+    // letting a whole chunk's rail spans merge into one draw call. All other
+    // builders leave this off and upload no tangent VBO.
+    std::vector<float> tangents;
+    bool wantTangents = false;
+    float curTangent[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
     Vector3 boundsMin{ FLT_MAX, FLT_MAX, FLT_MAX };
     Vector3 boundsMax{ -FLT_MAX, -FLT_MAX, -FLT_MAX };
     int vertexCount() const { return (int)(positions.size() / 3); }
     bool empty() const { return positions.empty(); }
+
+    void enableTangents() { wantTangents = true; }
+    void setTangent(Vector3 t) {
+        curTangent[0] = t.x; curTangent[1] = t.y; curTangent[2] = t.z; curTangent[3] = 1.0f;
+    }
 
     void reserveCubes(int cubeCount) {
         if (cubeCount < 1) return;
@@ -119,6 +131,10 @@ struct CpuMeshBuilder {
         normals.push_back(normal.x); normals.push_back(normal.y); normals.push_back(normal.z);
         colors.push_back(color.r); colors.push_back(color.g);
         colors.push_back(color.b); colors.push_back(color.a);
+        if (wantTangents) {
+            tangents.push_back(curTangent[0]); tangents.push_back(curTangent[1]);
+            tangents.push_back(curTangent[2]); tangents.push_back(curTangent[3]);
+        }
         includePoint(p);
     }
 
@@ -201,6 +217,10 @@ struct CpuMeshBuilder {
         std::memcpy(mesh.texcoords, texcoords.data(), texcoords.size() * sizeof(float));
         std::memcpy(mesh.normals, normals.data(), normals.size() * sizeof(float));
         std::memcpy(mesh.colors, colors.data(), colors.size() * sizeof(unsigned char));
+        if (wantTangents && tangents.size() == (size_t)mesh.vertexCount * 4u) {
+            mesh.tangents = (float *)RL_MALLOC(tangents.size() * sizeof(float));
+            std::memcpy(mesh.tangents, tangents.data(), tangents.size() * sizeof(float));
+        }
         UploadMesh(&mesh, false);
 
         // UploadMesh() retains the caller's RAM arrays even for an immutable
@@ -216,6 +236,7 @@ struct CpuMeshBuilder {
             RL_FREE(mesh.texcoords); mesh.texcoords = nullptr;
             RL_FREE(mesh.normals);   mesh.normals = nullptr;
             RL_FREE(mesh.colors);    mesh.colors = nullptr;
+            RL_FREE(mesh.tangents);  mesh.tangents = nullptr;
         }
         return mesh;
     }
@@ -227,37 +248,24 @@ static void unloadMeshSafe(Mesh &mesh) {
 }
 
 struct TrackMeshChunk {
-    struct RailSpan {
-        Mesh mesh{};
-        Vector3 tangent{ 0.0f, 0.0f, 1.0f };
-
-        void unload() { unloadMeshSafe(mesh); }
-    };
-
     long globalStart = 0;
     long globalEnd = 0; // exclusive spline-segment index
     Mesh ironMesh{};
-    std::array<RailSpan, CACHE_CHUNK_SEGMENTS> railSpans{};
+    // All rail spans of the chunk merged into one mesh; each vertex carries its own
+    // span's world tangent (baked attribute), so the anisotropic highlight is exact
+    // yet the whole chunk's rails draw in a single call.
+    Mesh railMesh{};
     Vector3 centre{};
     float xzRadius = 0.0f;
     int sourceSamples = 0;
 
     void unload() {
         unloadMeshSafe(ironMesh);
-        for (RailSpan &span : railSpans) span.unload();
+        unloadMeshSafe(railMesh);
     }
 
-    int vertexCount() const {
-        int count = ironMesh.vertexCount;
-        for (const RailSpan &span : railSpans) count += span.mesh.vertexCount;
-        return count;
-    }
-
-    int triangleCount() const {
-        int count = ironMesh.triangleCount;
-        for (const RailSpan &span : railSpans) count += span.mesh.triangleCount;
-        return count;
-    }
+    int vertexCount() const { return ironMesh.vertexCount + railMesh.vertexCount; }
+    int triangleCount() const { return ironMesh.triangleCount + railMesh.triangleCount; }
 };
 
 static bool sameVector(Vector3 a, Vector3 b) {
@@ -351,29 +359,11 @@ public:
 
             if ((parts & CACHE_IRON) && meshReady(chunk.ironMesh))
                 DrawMesh(chunk.ironMesh, material, MatrixIdentity());
-            if (parts & CACHE_RAILS) {
-                // SHADOW_FS exposes a uniform rather than a vertex tangent. Keep
-                // each spline span in its own rail mesh so that uniform remains
-                // local, stable, and cannot cancel across a loop/reversal. The
-                // midpoint direction is representative of this one short span;
-                // geometry itself still uses its exact per-sample frame.
-                for (int spanIndex = 0; spanIndex < CACHE_CHUNK_SEGMENTS; ++spanIndex) {
-                    const long globalSpan = chunk.globalStart + spanIndex;
-                    if (globalSpan < firstGlobalSegment || globalSpan >= lastGlobalSegment) continue;
-                    const TrackMeshChunk::RailSpan &span = chunk.railSpans[spanIndex];
-                    if (!meshReady(span.mesh)) continue;
-                    if (!depthPass) {
-                        const float tangent[3] = {
-                            span.tangent.x,
-                            span.tangent.y,
-                            span.tangent.z
-                        };
-                        SetShaderValue(gShadow.lit, gShadow.locRailTangent,
-                                       tangent, SHADER_UNIFORM_VEC3);
-                    }
-                    DrawMesh(span.mesh, material, MatrixIdentity());
-                }
-            }
+            // The rail tangent is now a baked per-vertex attribute (SHADOW_VS/FS read
+            // fragRailTangent), so the whole chunk's rails are one merged mesh drawn in
+            // a single call -- no per-span railTangent uniform, no per-span draw.
+            if ((parts & CACHE_RAILS) && meshReady(chunk.railMesh))
+                DrawMesh(chunk.railMesh, material, MatrixIdentity());
         }
     }
 
@@ -452,9 +442,10 @@ private:
             return false;
 
         CpuMeshBuilder iron;
-        std::array<CpuMeshBuilder, CACHE_CHUNK_SEGMENTS> rails{};
+        CpuMeshBuilder rails;
+        rails.enableTangents();
         iron.reserveCubes(segmentCount * 96);
-        for (CpuMeshBuilder &span : rails) span.reserveCubes(160);
+        rails.reserveCubes(segmentCount * 160);
         int sourceSamples = 0;
 
         const Color tieColor{ 96, 99, 108, 255 };
@@ -463,15 +454,15 @@ private:
         const Color ordinarySpineColor{ 44, 47, 55, 255 };
 
         for (int k = localStart; k < localStart + segmentCount; k++) {
-            const int spanIndex = k - localStart;
-            CpuMeshBuilder &railSpan = rails[spanIndex];
+            // One representative lighting tangent per spline span, baked as a per-vertex
+            // attribute on this span's rail boxes (identical to the old per-span uniform).
             Vector3 lightingTangent = track.tangent((float)k + 0.5f);
             const float lightingTangentLength = Vector3Length(lightingTangent);
             if (!(lightingTangent.x == lightingTangent.x) || lightingTangentLength < 1e-4f)
                 lightingTangent = Vector3{ 0.0f, 0.0f, 1.0f };
             else
                 lightingTangent = Vector3Scale(lightingTangent, 1.0f / lightingTangentLength);
-            out.railSpans[spanIndex].tangent = lightingTangent;
+            rails.setTangent(lightingTangent);
 
             const float segmentLength = fmaxf(track.speedScale((float)k + 0.5f), 0.01f);
             int sampleCount = (int)ceilf(segmentLength / 0.85f);
@@ -518,10 +509,10 @@ private:
                                    0.30f, 0.46f, pieceLength, ordinarySpineColor);
                 }
 
-                railSpan.appendBox(T_RAIL, frame, Vector3{-0.55f, 0.0f, 0.0f},
-                                   0.18f, 0.18f, pieceLength, track.railC);
-                railSpan.appendBox(T_RAIL, frame, Vector3{ 0.55f, 0.0f, 0.0f},
-                                   0.18f, 0.18f, pieceLength, track.railC);
+                rails.appendBox(T_RAIL, frame, Vector3{-0.55f, 0.0f, 0.0f},
+                                0.18f, 0.18f, pieceLength, track.railC);
+                rails.appendBox(T_RAIL, frame, Vector3{ 0.55f, 0.0f, 0.0f},
+                                0.18f, 0.18f, pieceLength, track.railC);
 
                 if ((j & 1) == 0)
                     iron.appendBox(T_IRON, frame, Vector3{ 0.0f, -0.17f, 0.0f },
@@ -532,17 +523,12 @@ private:
             }
         }
 
-        bool railsEmpty = true;
-        for (const CpuMeshBuilder &span : rails) {
-            if (!span.empty()) railsEmpty = false;
-        }
-        if (iron.empty() && railsEmpty) return false;
+        if (iron.empty() && rails.empty()) return false;
 
         Vector3 boundsMin{}, boundsMax{};
         bool haveBounds = false;
         mergeBounds(iron, boundsMin, boundsMax, haveBounds);
-        for (const CpuMeshBuilder &span : rails)
-            mergeBounds(span, boundsMin, boundsMax, haveBounds);
+        mergeBounds(rails, boundsMin, boundsMax, haveBounds);
         if (!haveBounds) return false;
 
         out.globalStart = track.base + localStart;
@@ -555,12 +541,9 @@ private:
         out.xzRadius = sqrtf(rx * rx + rz * rz) + 0.25f;
         out.sourceSamples = sourceSamples;
         out.ironMesh = iron.uploadStatic();
-        for (int spanIndex = 0; spanIndex < segmentCount; ++spanIndex)
-            out.railSpans[spanIndex].mesh = rails[spanIndex].uploadStatic();
+        out.railMesh = rails.uploadStatic();
 
-        bool uploaded = meshReady(out.ironMesh);
-        for (const TrackMeshChunk::RailSpan &span : out.railSpans)
-            uploaded = uploaded || meshReady(span.mesh);
+        bool uploaded = meshReady(out.ironMesh) || meshReady(out.railMesh);
         if (!uploaded) out.unload();
         return uploaded;
     }

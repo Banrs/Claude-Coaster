@@ -4,18 +4,27 @@
 static const char *SHADOW_VS =
     "#version 330\n"
     "in vec3 vertexPosition; in vec2 vertexTexCoord; in vec3 vertexNormal; in vec4 vertexColor;\n"
+    // Per-vertex rail tangent (rail meshes only; every other mesh leaves this at the
+    // default (0,0,0,0)). Baking it as an attribute lets one mesh carry rails of many
+    // orientations, so all rail spans of a chunk merge into a single draw call instead
+    // of one-per-span (which the old railTangent uniform forced). raylib binds
+    // "vertexTangent" to attribute location 4 automatically.
+    "in vec4 vertexTangent;\n"
     "uniform mat4 mvp;\n"
     "out vec2 fragTexCoord; out vec4 fragColor; out vec3 fragNormal; out vec3 fragWorld;\n"
+    "out vec3 fragRailTangent;\n"
     "void main(){\n"
     "  vec4 wp = vec4(vertexPosition,1.0);\n"
     "  fragWorld = wp.xyz;\n"
     "  fragTexCoord = vertexTexCoord; fragColor = vertexColor;\n"
     "  fragNormal = normalize(vertexNormal);\n"
+    "  fragRailTangent = vertexTangent.xyz;\n"
     "  gl_Position = mvp*vec4(vertexPosition,1.0);\n"
     "}\n";
 static const char *SHADOW_FS =
     "#version 330\n"
     "in vec2 fragTexCoord; in vec4 fragColor; in vec3 fragNormal; in vec3 fragWorld;\n"
+    "in vec3 fragRailTangent;\n"
     "uniform sampler2D texture0; uniform vec4 colDiffuse;\n"
     "uniform vec3 lightDir; uniform vec3 viewPos;\n"
     "uniform vec3 sunCol; uniform vec3 skyCol; uniform vec3 groundCol;\n"
@@ -29,20 +38,13 @@ static const char *SHADOW_FS =
     // composite pass's later tonemap (see computeFogColorLinear()'s comment in main.cpp).
     "uniform float fogEnd; uniform float fogStart; uniform float fogRange;\n"
     "uniform vec3 fogCol; uniform vec3 fogColLinear;\n"
-    // Anisotropic highlight for the running rails. railTangent is the rail's own
-    // world-space tangent (its long axis), updated every sample as the track is
-    // drawn -- cheap to set with a plain uniform since it only steers the
-    // highlight's *direction*, and nearby samples' tangents are nearly
-    // identical, so it's harmless if a rail's quads actually flush to the GPU
-    // slightly before/after this value is updated to its own exact sample.
-    // Which fragments the effect applies to is decided independently and
-    // exactly, from fragTexCoord (below) -- a genuinely per-vertex signal that
-    // survives rlgl's immediate-mode batching, unlike an on/off mask uniform
-    // would (rails, ties, spine and bolts share one atlas+shader and get
-    // interleaved into the same draw calls, so a mask flag couldn't be scoped
-    // to just the rail quads without forcing a GPU flush around every one of
-    // the ~1000+ rail samples drawn per frame).
-    "uniform vec3 railTangent; uniform vec2 railUVRange;\n"
+    // Anisotropic highlight for the running rails. The rail's own world-space
+    // tangent (its long axis) now arrives as a per-vertex attribute (fragRailTangent,
+    // baked into the rail mesh), not a uniform -- so every rail span of a chunk can
+    // live in ONE mesh drawn in a single call, instead of one draw per span (the old
+    // uniform had to be re-set per span, forcing a draw call each). Which fragments
+    // the effect applies to is still decided exactly from fragTexCoord (below).
+    "uniform vec2 railUVRange;\n"
     // Authoritative "is this fragment genuine metal" signal: the atlas-space U
     // range spanning T_GOLD..T_RAIL (contiguous tile indices), set once at
     // startup exactly like railUVRange above. Unlike the `sheen` mask below
@@ -259,7 +261,7 @@ static const char *SHADOW_FS =
     // streak that slides along the rail as the camera moves, not a dot.
     "  float aniso = 0.0;\n"
     "  if(fragTexCoord.x > railUVRange.x && fragTexCoord.x < railUVRange.y){\n"
-    "    vec3 tproj = railTangent - N*dot(railTangent,N);\n"
+    "    vec3 tproj = fragRailTangent - N*dot(fragRailTangent,N);\n"
     // On the rail's end-cap faces N is nearly parallel to the tangent, so the
     // in-plane projection collapses to ~0 length -- skip the (undefined,
     // NaN-prone) normalize there; those faces are tiny and rare enough that
@@ -374,7 +376,7 @@ struct ShadowSys {
     int locLightDir=-1, locViewPos=-1;
     int locSun=-1, locSky=-1, locGround=-1, locTime=-1;
     int locFogEnd=-1, locFogStart=-1, locFogRange=-1, locFogCol=-1, locFogColLinear=-1;
-    int locRailTangent=-1, locRailUVRange=-1, locMetalUVRange=-1;
+    int locRailUVRange=-1, locMetalUVRange=-1;
     int locLegacyTonemap=-1;
     int locShadowForce=-1, locShadowDebug=-1;
     Matrix lightVP{};
@@ -406,7 +408,6 @@ struct ShadowSys {
         locFogRange    = GetShaderLocation(lit, "fogRange");
         locFogCol      = GetShaderLocation(lit, "fogCol");
         locFogColLinear = GetShaderLocation(lit, "fogColLinear");
-        locRailTangent = GetShaderLocation(lit, "railTangent");
         locRailUVRange = GetShaderLocation(lit, "railUVRange");
         locMetalUVRange = GetShaderLocation(lit, "metalUVRange");
         locLegacyTonemap = GetShaderLocation(lit, "legacyTonemap");
