@@ -331,3 +331,8 @@ NOT main). Ultracode is ON: user opted into Workflow-tool orchestration for all 
   after it lands+verifies: (B) buried-boundary exit contracts, turn-shoulder lat leak,
   micro-STALL H floor, seed3 clips, share rebalance -- each as a delegated agent with
   numeric verify targets; fable only re-gates census 8 between batches.
+- INTERVENTION RULE UPDATE (user, 07:5x): NO time gating. Two-strike rule: an agent's first
+  failure -> it gets ONE fix attempt; if that second attempt also fails, Fable intervenes
+  IMMEDIATELY and takes the item hands-on. Applies to workflow agents and gate fix rounds
+  (the workflow's single gate-fix round + re-gate = the two strikes; red after that = mine).
+  Priority: finish quickly.
