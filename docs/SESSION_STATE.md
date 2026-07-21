@@ -271,3 +271,18 @@ NOT main). Ultracode is ON: user opted into Workflow-tool orchestration for all 
   curvature-reset "bounded g-step" now marginally over at new speeds — revisit after escape
   agent lands), LOOP/IMMEL/DIVELOOP hi-cluster (needs valley speed diversity), BANKAIR 1.20/
   WAVE 1.24 duration. Then: census 8+16 full gates -> commit+push everything.
+- INTEGRATION (04:45): ROLL/STALL agent DIED at session usage limit (resets 05:40 UTC) but its
+  work is COMPLETE in-tree: speed-stretched heartline roll (rev period pinned ~2.8s real; steady
+  radial rides as VERTICAL g ~9g at scale 1.05; roll-in transient lat ~ linear in r -> radius
+  capped [1.0,1.05]x with derivation comment = documented physics-bound spectrum exception like
+  HELIX; invVMax ROLL 58->75, STALL 56->75 with zero-g speed-agnostic derivation). It left
+  env-gated MC_RSTRACE debug fprintf's in initRoll (STRIP before final commit) and reportedly
+  added an --elementaudit probe to main.cpp (outside its ownership -- REVIEW before commit).
+  Escape agent LANDED (yaw-fan on occupancy-off rungs only, escapeClipPublished counter,
+  checked tiers byte-identical). Turn g-law reject applied by me. ALL prior per-stream
+  measurements were cross-poisoned (concurrent same-file edits) -- integrated binary
+  /tmp/mc_integ built clean (REAL_EXIT=0), full suite running as task bzl9jifaz
+  (integ_census4/force/overlap/joint .txt in /tmp). Verify: ROLL/STALL alive, pairs<2m=0,
+  lat<=6.0, no post-launch starvation, spectrum/duration tables, then census 8+16 gates ->
+  strip traces, review --elementaudit, REFERENCES rows (ROLL stretch law, LOOP invVMax 74.9,
+  turn g-law precedence, tophat split, bankair/wave caps) -> commit+push everything.
