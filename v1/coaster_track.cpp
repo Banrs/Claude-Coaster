@@ -1058,7 +1058,7 @@ struct Track : CommittedTrack, GenCursor {
                                 (int)exitAnchorClear(points.back()));
                     continue;
                 }
-                spatialPts.clear(); spatialUps.clear(); spatialD1.clear();
+                spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear();
                 spatialD2.clear(); spatialD3.clear(); spatialDs.clear();
                 spatialIdx = 0;
                 spatialPts = points;
@@ -1167,7 +1167,7 @@ struct Track : CommittedTrack, GenCursor {
         occupancyEnvelope = genc::OCCUPANCY_ENVELOPE;
         cp.clear(); up.clear(); kind.clear(); chainf.clear(); alignmentf.clear();
         spanRun.clear(); spanStart.clear(); spanEnd.clear(); analyticRuns.clear(); spatialRuns.clear();
-        spatialPts.clear(); spatialUps.clear(); spatialIdx = 0; spatialRunId = 0;
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialIdx = 0; spatialRunId = 0;
         arc.clear(); gvlog.clear(); base = 0;
         nextModePending = false;
         stationPending = false; stationActive = false; stationRamping = false;
@@ -1448,6 +1448,14 @@ struct Track : CommittedTrack, GenCursor {
         run.radialFrame = radialFrame;
         run.frameKind = radialFrame.valid ? SpatialFrameKind::Radial
                                           : SpatialFrameKind::Authored;
+        // Phase 7 (spec §1.4): carry the per-point chain-lift flag if a builder
+        // authored one (cliff-dive crest arc only). The origin inherits the
+        // incoming released state (0); the rest map 1:1 onto spatialPts.
+        if (spatialChain.size() == spatialPts.size() && !spatialChain.empty()) {
+            run.chain.reserve(spatialChain.size() + 1);
+            run.chain.push_back(0);
+            run.chain.insert(run.chain.end(), spatialChain.begin(), spatialChain.end());
+        }
         if (exactDerivatives && spatialD1.size() == spatialPts.size() &&
             spatialD2.size() == spatialPts.size() && spatialD3.size() == spatialPts.size() &&
             spatialDs.size() == spatialPts.size()) {
@@ -2311,7 +2319,7 @@ struct Track : CommittedTrack, GenCursor {
         Vector3 origin = gpos;
         Vector3 forward = headingVec();
         Vector3 side=Vector3Normalize(Vector3CrossProduct(WUP,forward));
-        spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx = 0;
         spatialPts.reserve(curveSteps);
         spatialUps.reserve(curveSteps);
@@ -2409,6 +2417,268 @@ struct Track : CommittedTrack, GenCursor {
                                        LOOP_RECORD_HEIGHT * RECORD_SCALE_MIN,
                                        LOOP_RECORD_HEIGHT * RECORD_SCALE_CAP);
         return buildLoopSpatial(2.0f * PI, loopHeight, false);
+    }
+
+    // --- CLIFF-DIVE SET PIECE (Phase 7 spec §1) --------------------------------
+    // The FIRST generator emitter of the dormant chain-lift flag (ch=1). Structure
+    // (Falcon's Flight): [chain-lift climb to the escarpment lip, ch=1] -> [~3.5 s
+    // crest crawl, ch=1] -> [88-90 deg dive HUGGING the caprock, ch=0] -> [base
+    // pull-out, ch=0]. Vertical-plane SpatialRun built with the buildLoopSpatial
+    // forward x WUP mechanism (§1.3); no new frame system. Count-ruled (<=1/act,
+    // MOUNTAIN-act finale), NOT in SHARE_TARGET, reuses M_DROP accounting; the
+    // §1.5 face-hug/support bounds are the binding gate. OPTIONAL: returns false
+    // WITHOUT touching any generator state whenever no qualifying, bleed-reachable
+    // site exists -- the lap then proceeds normally (never completion-critical).
+
+    // Pure siting scan (no rng, no state): does a forward heading near gyaw offer a
+    // qualifying cliff AND enough climb to bleed the entry speed to the chain crawl?
+    // Used as a cheap pre-gate so the live scheduler pre-check never even opens a
+    // transaction unless a real dive is buildable (guarantees zero perturbation of
+    // the count-ruled-off path). Fills `out` for --cliffaudit diagnostics.
+    struct CliffSite {
+        bool ok = false;
+        float yaw = 0.0f;
+        tprobe::DescentProfile profile;
+        float crestRailY = 0.0f;   // rail height at the lip (crest)
+        float floorRailY = 0.0f;   // rail height at the valley floor
+        float drop = 0.0f;         // sited plunge, Clamp(dropTotal, MIN_DROP, DROP_CAP)
+        float vCrest = 0.0f;       // predicted crest arrival speed after the chain bleed
+        float bleedNeed = 0.0f;    // climb height needed to bleed genV -> CHAIN_V
+        float climbAvail = 0.0f;   // crestRailY - gpos.y
+        // best RAW reachable descent regardless of the gates (diagnostic)
+        float bestReachDrop = 0.0f, bestReachFace = 0.0f;
+    };
+    CliffSite findCliffSite() const {
+        CliffSite best;
+        const float step = tprobe::DESCENT_DEFAULT_STEP;
+        const float maxRun = 260.0f;
+        float bestScore = -1.0e9f;
+        // Heading fan around the current forward heading (the dive continues
+        // roughly forward, never a U-turn): +/-45 deg in 7.5 deg steps.
+        for (int k = -6; k <= 6; ++k) {
+            const float yaw = gyaw + (float)k * (7.5f * DEG2RAD);
+            tprobe::SiteVerdict v = tprobe::evaluateSite(gpos, yaw, maxRun, step);
+            if (v.profile.valid) {
+                if (v.profile.dropTotal > best.bestReachDrop) {
+                    best.bestReachDrop = v.profile.dropTotal;
+                    best.bestReachFace = v.profile.meanFaceDeg;
+                }
+            }
+            if (!v.qualifies) continue;
+            const tprobe::DescentProfile &p = v.profile;
+            const float crestRailY = p.crestGroundY + genc::TERRAIN_DECK_CLEARANCE;
+            const float floorRailY = p.floorGroundY + genc::TERRAIN_DECK_CLEARANCE;
+            const float drop = Clamp(p.dropTotal, genc::CLIFFDIVE_MIN_DROP,
+                                     genc::CLIFFDIVE_DROP_CAP);
+            // §1.4 entry precondition: the chain lift only holds the crawl once
+            // gravity has bled the entry speed down to CHAIN_V -- the chain CANNOT
+            // brake. Height to bleed genV -> CHAIN_V is (v^2 - CHAIN_V^2)/2g. If the
+            // climb from the current anchor to the lip is shorter than that, the
+            // train crests too hot for a crawl: SKIP this site (do not squeeze).
+            const float bleedNeed = fmaxf(0.0f,
+                (genV*genV - CHAIN_V*CHAIN_V) / (2.0f*GRAV));
+            const float climbAvail = crestRailY - gpos.y;
+            if (climbAvail < bleedNeed) continue;   // cannot bleed -> skip
+            const float score = p.dropTotal + p.meanFaceDeg;
+            if (score > bestScore) {
+                bestScore = score;
+                best.ok = true; best.yaw = yaw; best.profile = p;
+                best.crestRailY = crestRailY; best.floorRailY = floorRailY;
+                best.drop = drop; best.bleedNeed = bleedNeed; best.climbAvail = climbAvail;
+                best.vCrest = CHAIN_V;   // crests at the crawl speed by construction
+            }
+        }
+        return best;
+    }
+
+    bool cliffDiveSiteAvailable() const { return findCliffSite().ok; }
+
+    bool beginCliffDive() {
+        syncYawToTrack();
+        const CliffSite site = findCliffSite();
+        if (!site.ok) return false;   // no qualifying, bleed-reachable site: no-op
+        const tprobe::DescentProfile &prof = site.profile;
+        gyaw = site.yaw;
+        const Vector3 origin = gpos;
+        const Vector3 forward = { sinf(site.yaw), 0.0f, cosf(site.yaw) };
+
+        // Local face slope (deg) at a forward distance from the lip, from the
+        // DescentProfile samples (§1.3 face-tracking pitch law input).
+        auto faceSlopeAt = [&](float fwdFromLip) -> float {
+            const float fwd = prof.lipFwd + fmaxf(0.0f, fwdFromLip);
+            float best = 0.0f;
+            for (const tprobe::DescentSample &s : prof.samples)
+                if (s.fwd <= fwd + 1.0e-3f) best = s.localFaceSlopeDeg;
+            return best;
+        };
+
+        // Build ONE vertical-plane run: [chain ramp][crest][dive][pull-out].
+        // Points are laid origin + forward*x + WUP*y with a pitch schedule theta
+        // (from horizontal; +up, -down). Frame = in-plane curveNormal (no roll,
+        // a pure fall line). ch=1 only on the ramp + crest (the crawl).
+        std::vector<Vector3> pts, ups;
+        std::vector<unsigned char> chain;
+        auto emit = [&](float x, float y, float theta, unsigned char ch) {
+            pts.push_back(Vector3Add(origin,
+                Vector3Add(Vector3Scale(forward, x), Vector3Scale(WUP, y))));
+            // curveNormal = WUP cos(theta) + forward*(-sin(theta)) (matches the
+            // buildLoopSpatial in-plane frame convention).
+            ups.push_back(Vector3Normalize(Vector3Add(
+                Vector3Scale(WUP, cosf(theta)), Vector3Scale(forward, -sinf(theta)))));
+            chain.push_back(ch);
+        };
+
+        const float ds = SEG_LEN;
+        // (1) CHAIN RAMP: climb from the anchor to the lip. The lip is prof.lipFwd
+        // forward and site.crestRailY high. A smooth c3 ease over the horizontal
+        // run; grade stays <65 deg so the longitudinal boundary law accepts it.
+        const float rampRun = fmaxf(prof.lipFwd, ds);
+        const float rampRise = site.crestRailY - origin.y;
+        const int rampN = std::max(2, (int)ceilf(hypotf(rampRun, rampRise) / ds));
+        float x = 0.0f, y = origin.y;
+        for (int i = 0; i <= rampN; ++i) {
+            const float t = (float)i / rampN;
+            const float xr = rampRun * t;
+            const float yr = origin.y + rampRise * spatialEase(t);
+            // pitch from the local secant
+            const float dxr = rampRun / rampN;
+            const float dyr = rampRise * (spatialEase(fminf(t + 1.0f/rampN, 1.0f))
+                                          - spatialEase(t));
+            const float theta = atan2f(dyr, fmaxf(dxr, 1.0e-3f));
+            if (i == 0) { emit(xr, yr, theta, 1); }
+            else        { emit(xr, yr, theta, 1); }
+            x = xr; y = yr;
+        }
+        // (2) CREST CRAWL: near-flat crest, length = vCrest * CREST_HOLD_SECS, a
+        // 3.5 s creep-over-the-edge at the chain crawl (§1.4). ch=1.
+        const float crestLen = fmaxf(ds, site.vCrest * genc::CLIFFDIVE_CREST_HOLD_SECS);
+        const int crestN = std::max(2, (int)ceilf(crestLen / ds));
+        for (int i = 1; i <= crestN; ++i) {
+            x += crestLen / crestN;
+            emit(x, y, 0.0f, 1);
+        }
+        const float crestHoldSecs = crestLen / fmaxf(site.vCrest, 1.0e-3f);
+
+        // (3) DIVE + (4) PULL-OUT: integrate a pitch schedule from 0 down the face
+        // and back to level at the valley floor. Pitch TRACKS the local face slope
+        // steepened by at most STEEPEN_MARGIN and clamped to ANGLE_MAX (90 deg)
+        // (§1.3). Depth is the sited drop; the pull-out radius follows the +g law.
+        const float diveTargetY = site.floorRailY;
+        const float vBase = sqrtf(fmaxf(site.vCrest*site.vCrest
+            + 2.0f*GRAV*(y - diveTargetY), 400.0f));
+        // Pull-out radius from the project 2x-record dive g target: real
+        // dive-machine pull-outs sustain ~3.5-4 g -> 2x = 7.0-8.0 g; 7.5 is the
+        // midpoint (docs/REAL_WORLD_REFERENCES.md "Cliff-dive pull-out g target").
+        const float Gt = 7.5f;
+        const float pulloutR = fmaxf(30.0f, vBase*vBase / ((Gt - 1.0f) * GRAV));
+        float theta = 0.0f;             // radians, negative = diving
+        float maxDiveDeg = 0.0f;
+        int guard = 0;
+        // roll-over the crest into the dive, then hold the face-tracking pitch,
+        // then curl out. We integrate until the rail reaches the floor height,
+        // then run the pull-out arc.
+        const float rollDs = ds;
+        bool pullingOut = false;
+        float pulloutTheta0 = 0.0f, pulloutArc = 0.0f, pulloutLen = 1.0f;
+        while (guard++ < 4000) {
+            float targetPitchDeg;
+            if (!pullingOut) {
+                const float fwdFromLip = x - (prof.lipFwd);
+                const float faceDeg = faceSlopeAt(x - (rampRun));
+                targetPitchDeg = fminf(faceDeg + genc::CLIFFDIVE_STEEPEN_MARGIN_DEG,
+                                       genc::CLIFFDIVE_ANGLE_MAX_DEG);
+                (void)fwdFromLip;
+                // begin the pull-out once we are within a pull-out radius of the floor
+                if (y - diveTargetY <= pulloutR * (1.0f - cosf(fabsf(theta)))
+                        + 0.5f * rollDs) {
+                    pullingOut = true;
+                    pulloutTheta0 = theta;
+                    pulloutArc = 0.0f;
+                    pulloutLen = fmaxf(rollDs, pulloutR * fabsf(theta));
+                }
+            }
+            float pitch;
+            if (pullingOut) {
+                pulloutArc += rollDs;
+                const float tt = Clamp(pulloutArc / pulloutLen, 0.0f, 1.0f);
+                pitch = pulloutTheta0 * (1.0f - spatialEase(tt));
+            } else {
+                // ease the crest roll-over toward the target pitch (bounded rate)
+                const float target = -targetPitchDeg * DEG2RAD;
+                const float maxStep = rollDs / pulloutR;   // bounded curvature
+                pitch = theta + Clamp(target - theta, -maxStep, maxStep);
+            }
+            theta = pitch;
+            maxDiveDeg = fmaxf(maxDiveDeg, -theta / DEG2RAD);
+            x += rollDs * cosf(theta);
+            y += rollDs * sinf(theta);
+            emit(x, y, theta, 0);
+            if (pullingOut && fabsf(theta) < 1.0e-2f) break;
+            if (y <= diveTargetY - 0.5f && !pullingOut) {
+                // safety: reached floor without triggering pull-out
+                pullingOut = true; pulloutTheta0 = theta; pulloutArc = 0.0f;
+                pulloutLen = fmaxf(rollDs, pulloutR * fabsf(theta));
+            }
+        }
+
+        if ((int)pts.size() < 6) return false;
+
+        // Publish scratch for makeSpatialRun (exactDerivatives=false: the septic
+        // C3 fallback smooths the authored knots; the force/corridor gates read
+        // spatialRunPos directly, so no analytic derivatives are required).
+        spatialPts.assign(pts.begin() + 1, pts.end());
+        spatialUps.assign(ups.begin() + 1, ups.end());
+        spatialChain.assign(chain.begin() + 1, chain.end());
+        SpatialRun run = makeSpatialRun(origin, ups.front(), false);
+
+        // §1.5 FACE-HUG / SUPPORT-HEIGHT gate (the binding constraint). Walk the
+        // descent samples: support = rail.y - ground directly below; setback =
+        // horizontal march inward (toward the plateau, -forward) to where terrain
+        // = rail height. FAIL (skip the set piece, never relax) on tunnel, support
+        // > 22 m, or setback outside [4,12].
+        float maxSupportH = 0.0f, maxSetback = 0.0f;
+        bool faceOK = true;
+        for (size_t i = 0; i < pts.size(); ++i) {
+            if (chain[i] == 1) continue;   // gate the dive/pull-out, not the ramp/crest
+            const Vector3 &p = pts[i];
+            const float groundBelow = genGroundTopAt(p.x, p.z);
+            const float support = p.y - groundBelow;
+            if (support < -0.05f) { faceOK = false; break; }   // tunneling
+            maxSupportH = fmaxf(maxSupportH, support);
+            // setback: march inward until terrain rises to rail height
+            float setback = genc::CLIFFDIVE_FACE_SETBACK_MAX + 1.0f;
+            for (float d = 0.0f; d <= genc::CLIFFDIVE_FACE_SETBACK_MAX + 2.0f; d += 1.0f) {
+                const float gx = p.x - forward.x * d, gz = p.z - forward.z * d;
+                if (genGroundTopAt(gx, gz) >= p.y) { setback = d; break; }
+            }
+            maxSetback = fmaxf(maxSetback, setback);
+        }
+        const bool supportOK = maxSupportH <= genc::CLIFFDIVE_SUPPORT_H_MAX;
+        const bool setbackOK = maxSetback >= genc::CLIFFDIVE_FACE_SETBACK_MIN &&
+                               maxSetback <= genc::CLIFFDIVE_FACE_SETBACK_MAX;
+
+        CliffDiveRecord rec;
+        rec.drop = site.drop; rec.meanFaceDeg = prof.meanFaceDeg;
+        rec.maxDiveAngleDeg = maxDiveDeg; rec.crestHoldSecs = crestHoldSecs;
+        rec.maxSupportH = maxSupportH; rec.maxFaceSetback = maxSetback;
+        rec.entryV = genV; rec.vCrest = site.vCrest;
+
+        // Occupancy (6 m envelope, no escape relaxation -- §1.7) + force window.
+        std::vector<Vector3> occPts; occPts.reserve(pts.size());
+        occPts.assign(pts.begin(), pts.end());
+        const bool occOK = occupancyClear(occPts, occupancyEnvelope);
+        const bool forceOK = spatialForceClear(run, M_DROP, -5.5f, 11.5f);
+
+        rec.pass = faceOK && supportOK && setbackOK && occOK && forceOK &&
+                   site.drop >= genc::CLIFFDIVE_MIN_DROP &&
+                   maxDiveDeg <= genc::CLIFFDIVE_ANGLE_MAX_DEG + 0.5f;
+        cliffDives.push_back(rec);
+        if (!rec.pass) return false;
+
+        mode = M_DROP;   // reuse M_DROP accounting (spec §1.6)
+        remain = (int)spatialPts.size();
+        publishSpatialRun(std::move(run));
+        return true;
     }
 
     bool initImmel() {
@@ -2629,7 +2899,7 @@ struct Track : CommittedTrack, GenCursor {
 
         const float totalRailLength = denseArc.back();
         const int rollSteps = Clamp((int)ceilf(totalRailLength / 5.0f), 16, 40);
-        spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx = 0;
         spatialPts.reserve(rollSteps); spatialUps.reserve(rollSteps);
         spatialD1.reserve(rollSteps); spatialD2.reserve(rollSteps);
@@ -2736,7 +3006,7 @@ struct Track : CommittedTrack, GenCursor {
         stallSide   = Vector3Normalize(Vector3CrossProduct(WUP, stallF));
         stallDir    = (rnd01() < 0.5f) ? 1.0f : -1.0f;
         const Vector3 origin = gpos;
-        spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx = 0;
         spatialPts.reserve(stallLen); spatialUps.resize(stallLen, WUP);
         for (int k = 1; k <= stallLen; ++k) {
@@ -2946,6 +3216,7 @@ struct Track : CommittedTrack, GenCursor {
     // CLASSIC with rng jitter; WATER only when the corridor ahead actually
     // meets water within the probe distance, else fall back to CLASSIC.
     void chooseActTheme() {
+        actCliffDiveCount = 0;   // spec §1.6: count rule resets per act
         genc::ActTheme picks[genc::ACT_THEME_COUNT] = {
             genc::ActTheme::MOUNTAIN, genc::ActTheme::CANYON,
             genc::ActTheme::WATER,    genc::ActTheme::CLASSIC };
@@ -3466,7 +3737,7 @@ struct Track : CommittedTrack, GenCursor {
         const Vector3 origin = gpos;
         const BoundaryState start = currentBoundary();
         float x = origin.x, z = origin.z, yaw = gyaw, yawRate = genPrevDyaw;
-        spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx = 0;
         spatialPts.reserve(turnLen);
         for (int step = 0; step < turnLen; ++step) {
@@ -3872,7 +4143,7 @@ struct Track : CommittedTrack, GenCursor {
         const BoundaryState start = currentBoundary();
         x=origin.x; z=origin.z; yaw=gyaw; yawRate=genPrevDyaw;
         std::vector<float> yawStep((size_t)totalLen, 0.0f);
-        spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx=0;
         spatialPts.reserve(totalLen); spatialUps.resize(totalLen, WUP);
         for (int i=0;i<totalLen;++i) {
@@ -3932,7 +4203,7 @@ struct Track : CommittedTrack, GenCursor {
         const BoundaryState start=currentBoundary();
         float x=origin.x,z=origin.z,yaw=gyaw;
         std::vector<float> yawStep((size_t)turnLen,0.0f);
-        spatialPts.clear();spatialUps.clear();spatialD1.clear();spatialD2.clear();
+        spatialPts.clear();spatialChain.clear();spatialUps.clear();spatialD1.clear();spatialD2.clear();
         spatialD3.clear();spatialDs.clear();spatialIdx=0;
         spatialPts.reserve(turnLen);spatialUps.resize(turnLen,WUP);
         for(int i=0;i<turnLen;++i){
@@ -4014,7 +4285,7 @@ struct Track : CommittedTrack, GenCursor {
                     return false;
         }
         if (!exitAnchorClear(dense[denseN])) return false;
-        spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx=0;
         spatialPts.reserve(hillLen); spatialUps.reserve(hillLen);
         auto append=[&](float t,bool emit) {
@@ -4185,7 +4456,7 @@ struct Track : CommittedTrack, GenCursor {
         mode=M_DIP; dipSplash=plan.splash; dipLen=plan.length;
         dipEntryY=plan.entryY; dipExitY=plan.exitY; dipTargetY=plan.targetY;
         const Vector3 origin = gpos;
-        spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx = 0;
         spatialPts.reserve(dipLen); spatialUps.resize(dipLen, WUP);
         for (int k = 1; k <= dipLen; ++k) {
@@ -4245,7 +4516,7 @@ struct Track : CommittedTrack, GenCursor {
         const Vector3 origin=gpos;
         const Vector3 forward=headingVec();
         const Vector3 neutral=orthoUp(forward,WUP);
-        spatialPts.clear();spatialUps.clear();spatialD1.clear();spatialD2.clear();
+        spatialPts.clear();spatialChain.clear();spatialUps.clear();spatialD1.clear();spatialD2.clear();
         spatialD3.clear();spatialDs.clear();spatialIdx=0;
         spatialPts.reserve(stationSteps);spatialUps.reserve(stationSteps);
         for(int i=1;i<=stationSteps;++i){
@@ -4937,7 +5208,7 @@ struct Track : CommittedTrack, GenCursor {
         const Vector3 origin = gpos;
         const BoundaryState start = currentBoundary();
         float x = origin.x, z = origin.z, yaw = gyaw, yawRate = genPrevDyaw;
-        spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx = 0;
         spatialPts.reserve(plan.steps); spatialUps.resize(plan.steps, WUP);
         for (int step = 1; step <= plan.steps; ++step) {
@@ -5014,7 +5285,7 @@ struct Track : CommittedTrack, GenCursor {
         const Vector3 origin = gpos;
         const BoundaryState start = currentBoundary();
         float x = origin.x, z = origin.z, yaw = gyaw;
-        spatialPts.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
+        spatialPts.clear(); spatialChain.clear(); spatialUps.clear(); spatialD1.clear(); spatialD2.clear();
         spatialD3.clear(); spatialDs.clear(); spatialIdx = 0;
         spatialPts.reserve(steps); spatialUps.resize(steps, WUP);
         for (int step = 1; step <= steps; ++step) {
@@ -5348,6 +5619,25 @@ struct Track : CommittedTrack, GenCursor {
         // back to the same cursor), so it is read once here.
         const BoundaryState frameBoundary = currentBoundary();
         const float incomingBank = up.empty() ? 0.0f : frameBoundary.bank;
+
+        // Phase 7 (spec §1.6): CLIFF-DIVE set-piece pre-check, offered BEFORE the
+        // ordinary element dispatch exactly like the top-hat count rule. Count-
+        // ruled (<=1 per act), MOUNTAIN-act finale candidate only. findCliffSite()
+        // is a pure terrain scan (no rng, no state), so when no bleed-reachable
+        // qualifying cliff exists -- the common case, since the qualifying faces
+        // sit on the far mesa the corridor never reaches -- this is a no-op and
+        // the normal scheduler runs unchanged (verified census-byte-identical).
+        if (currentAct == genc::ActTheme::MOUNTAIN && actCliffDiveCount < 1 &&
+            lapNearEnd() && cliffDiveSiteAvailable()) {
+            TxnGuard txn(*this);
+            if (beginCliffDive()) {
+                actCliffDiveCount++;
+                commitInitializedElement(true);
+                txn.commit();
+                return true;
+            }
+        }
+
         for (int attempt = 0; attempt < M_COUNT; ++attempt) {
             SegMode pick = M_COUNT;
             if (preferred != M_COUNT &&
@@ -6621,6 +6911,15 @@ struct Track : CommittedTrack, GenCursor {
             sampledRunEnd = macroDistance;
         } else if (spatialSample) {
             upv = stepSpatial();
+            // Phase 7 (spec §1.4): the cliff-dive crest arc is the FIRST (and
+            // currently only) generator emitter of the dormant chain-lift flag.
+            // stepSpatial has advanced spatialIdx to the point just published, so
+            // read the run's per-point chain flag at that index. ch then flows
+            // into pushCP (chainf) AND the genV integration below, so the crest
+            // crawls at CHAIN_V exactly as applyTrackDrive's drive==1 climb cap.
+            if (activeSpatialRun && !activeSpatialRun->chain.empty() &&
+                spatialIdx < (int)activeSpatialRun->chain.size())
+                ch = activeSpatialRun->chain[spatialIdx];
         } else {
             // Every live span must belong to exactly one immutable profile.
             // A missing owner is a failed boundary transaction, not permission

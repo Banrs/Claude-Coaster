@@ -77,6 +77,25 @@ inline constexpr float DROP_RECORD_HEIGHT     = 160.0f;
 // non-tophat airtime camelback: Intimidator 305's 45.7 m (150 ft) hill,
 // Kings Dominion 2010 (docs/REAL_WORLD_REFERENCES.md 5).
 inline constexpr float AIRTIME_RECORD_HEIGHT  = 45.7f;
+
+// --- CLIFF-DIVE SET PIECE (Phase 7 spec §1.1) ------------------------------
+// A count-ruled signature element (NOT in SHARE_TARGET): a chain-lift crest
+// crawl over an escarpment lip, then an 88-90-deg dive HUGGING the cliff face,
+// then a base pull-out. Sizing is anchored on Falcon's Flight's ~160 m (525 ft)
+// vertical cliff drop (Six Flags Qiddiya 2025 -- docs/REAL_WORLD_REFERENCES.md
+// 4/9), sized by the project [1.0,1.5]x window (SCALE_MIN now 1.0). The single
+// source of truth for both the terrain-probe siting gate (tprobe:: aliases
+// these) and the beginCliffDive builder.
+inline constexpr float CLIFFDIVE_REFERENCE_DROP     = 160.0f; // Falcon's Flight 525 ft vertical cliff drop
+inline constexpr float CLIFFDIVE_MIN_DROP           = 120.0f; // 0.75x reference -- siting FLOOR for the signature move
+inline constexpr float CLIFFDIVE_DROP_CAP           = 240.0f; // 1.5x -- never exceeded (terrain caps below anyway)
+inline constexpr float CLIFFDIVE_ANGLE_MAX_DEG      = 90.0f;  // hard CAP, true vertical -- never sustained beyond face support
+inline constexpr float CLIFFDIVE_STEEPEN_MARGIN_DEG = 8.0f;   // pitch may exceed local face slope by at most this (subject to §1.5)
+inline constexpr float CLIFFDIVE_CREST_HOLD_SECS    = 3.5f;   // B&M holding-brake 3-4 s (docs/REAL_WORLD_REFERENCES.md)
+inline constexpr float CLIFFDIVE_FACE_SETBACK_MIN   = 4.0f;   // = OCCUPANCY_ENVELOPE_ESCAPE; never tunnel into rock
+inline constexpr float CLIFFDIVE_FACE_SETBACK_MAX   = 12.0f;  // hug bound (CORRECTION 2, §1.5)
+inline constexpr float CLIFFDIVE_SUPPORT_H_MAX      = 22.0f;  // short cliff-face anchor, not a mega-tower (§1.5)
+inline constexpr float CLIFFDIVE_MIN_FACE_SLOPE_DEG = 58.0f;  // mean terrain-face steepness required along the descent
 inline constexpr float BANKAIR_RECORD_HEIGHT  = 35.0f;
 inline constexpr float CORKSCREW_REFERENCE_RADIUS = 6.6f;
 inline constexpr float CORKSCREW_REFERENCE_EXCURSION =

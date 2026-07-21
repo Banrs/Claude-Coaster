@@ -197,21 +197,21 @@ static inline float deficiencyAlong(HeightFn heightAt, Vector3 origin,
 }
 
 // --- Cliff-dive siting constants (spec §1.1). ------------------------------
-// The spec parks these in gen_constants.h/genc::; that namespace does not exist
-// in the current tree (element sizing constants live as Track:: members). They
-// are the SITING thresholds this probe needs, so they live here, self-contained
-// for this stage; the builder stage can promote/re-home them without changing
-// their values.
-constexpr float CLIFFDIVE_REFERENCE_DROP     = 160.0f; // Falcon's Flight 525 ft vertical cliff drop
-constexpr float CLIFFDIVE_MIN_DROP           = 120.0f; // 0.75x reference -- siting FLOOR for the signature move
-constexpr float CLIFFDIVE_DROP_CAP           = 240.0f; // 1.5x -- never exceeded (terrain caps below anyway)
-constexpr float CLIFFDIVE_ANGLE_MAX_DEG      = 90.0f;  // hard CAP, true vertical -- never sustained beyond face support
-constexpr float CLIFFDIVE_STEEPEN_MARGIN_DEG = 8.0f;   // pitch may exceed local face slope by at most this
-constexpr float CLIFFDIVE_CREST_HOLD_SECS    = 3.5f;   // B&M holding-brake 3-4 s
-constexpr float CLIFFDIVE_FACE_SETBACK_MIN   = 4.0f;   // = occupancy escape; never tunnel into rock
-constexpr float CLIFFDIVE_FACE_SETBACK_MAX   = 12.0f;  // hug bound (CORRECTION 2)
-constexpr float CLIFFDIVE_SUPPORT_H_MAX      = 22.0f;  // short cliff-face anchor, not a mega-tower
-constexpr float CLIFFDIVE_MIN_FACE_SLOPE_DEG = 58.0f;  // mean terrain-face steepness required along the descent
+// Single-sourced from genc:: (gen_constants.h, included before this file in the
+// unity chain, spec §1.1 "Constants block into gen_constants.h"). These tprobe::
+// aliases keep --cliffsites and evaluateSite call sites unchanged while the
+// builder (beginCliffDive) reads the same genc:: values -- probe and builder can
+// never disagree on the siting gate.
+constexpr float CLIFFDIVE_REFERENCE_DROP     = genc::CLIFFDIVE_REFERENCE_DROP;
+constexpr float CLIFFDIVE_MIN_DROP           = genc::CLIFFDIVE_MIN_DROP;
+constexpr float CLIFFDIVE_DROP_CAP           = genc::CLIFFDIVE_DROP_CAP;
+constexpr float CLIFFDIVE_ANGLE_MAX_DEG      = genc::CLIFFDIVE_ANGLE_MAX_DEG;
+constexpr float CLIFFDIVE_STEEPEN_MARGIN_DEG = genc::CLIFFDIVE_STEEPEN_MARGIN_DEG;
+constexpr float CLIFFDIVE_CREST_HOLD_SECS    = genc::CLIFFDIVE_CREST_HOLD_SECS;
+constexpr float CLIFFDIVE_FACE_SETBACK_MIN   = genc::CLIFFDIVE_FACE_SETBACK_MIN;
+constexpr float CLIFFDIVE_FACE_SETBACK_MAX   = genc::CLIFFDIVE_FACE_SETBACK_MAX;
+constexpr float CLIFFDIVE_SUPPORT_H_MAX      = genc::CLIFFDIVE_SUPPORT_H_MAX;
+constexpr float CLIFFDIVE_MIN_FACE_SLOPE_DEG = genc::CLIFFDIVE_MIN_FACE_SLOPE_DEG;
 
 // scanDescent shape/tolerance defaults (spec §1.2: "use 3-4 m, finer than
 // MACRO_SAMPLE_STEP, because a cliff lip is a sharp feature").

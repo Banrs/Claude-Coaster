@@ -255,6 +255,11 @@ struct CommittedTrack {
         std::vector<Vector3> spanD1A, spanD1B;
         std::vector<Vector3> spanD2A, spanD2B;
         std::vector<Vector3> spanD3A, spanD3B;
+        // Phase 7 (spec §1.4): per-point chain-lift flag (0 = released, 1 = chain
+        // crawl). Empty for every builder except the cliff-dive crest arc. When
+        // present, genPoint drives ch from this (drive==1 -> CHAIN_V crawl in
+        // applyTrackDrive) and driveAt/render read it like any other chainf.
+        std::vector<unsigned char> chain;
         SpatialFrameKind frameKind = SpatialFrameKind::Authored;
         std::vector<FeltBankSpan> feltBank;
         // A cylindrical corkscrew derives its rail-up vector from the same
@@ -854,6 +859,18 @@ struct GenCursor {
     }
     int     lapTopHatCount = 0;
     int     completedTopHatCount = 0;
+    // Phase 7 (spec §1.6): cliff-dive set piece is COUNT-RULED (<=1 per act,
+    // modeled on the top-hat rule), reset in chooseActTheme. Per-built-dive
+    // stats (spec §1.5) are recorded here for --cliffaudit and the census
+    // [cliffdive] block; the vector persists across popFront (not a cp deque).
+    int     actCliffDiveCount = 0;
+    struct CliffDiveRecord {
+        bool  pass = false;
+        float drop = 0.0f, meanFaceDeg = 0.0f, maxDiveAngleDeg = 0.0f;
+        float crestHoldSecs = 0.0f, maxSupportH = 0.0f, maxFaceSetback = 0.0f;
+        float entryV = 0.0f, vCrest = 0.0f;
+    };
+    std::vector<CliffDiveRecord> cliffDives;
     int     lapHelixGeometryCount = 0, lapBadHelixGeometry = 0;
     int     completedHelixGeometryCount = 0, completedBadHelixGeometry = 0;
     float   completedMinHelixDropPerRev = 0.0f;
@@ -980,6 +997,11 @@ struct GenCursor {
     uint32_t nextMacroRunId = 1;
     std::vector<Vector3> spatialPts;
     std::vector<Vector3> spatialUps;
+    // Phase 7 (spec §1.4): per-spatial-point chain-lift flag. Non-empty only for
+    // the cliff-dive crest arc (the first, and currently only, ch=1 emitter);
+    // empty for every other spatial builder, so ch stays 0 as before. Indexed
+    // like spatialPts (the origin's flag is prepended in makeSpatialRun).
+    std::vector<unsigned char> spatialChain;
     std::vector<Vector3> spatialD1, spatialD2, spatialD3;
     std::vector<float> spatialDs;
     Vector3 spatialOriginD1{}, spatialOriginD2{}, spatialOriginD3{};

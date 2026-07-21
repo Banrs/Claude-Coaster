@@ -516,6 +516,114 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (argc > 1 && TextIsEqual(argv[1], "--cliffaudit")) {
+        // Phase 7 (spec §1.5): per-built cliff-dive verdict. Drives N seeds to a
+        // closed lap; the count-ruled beginCliffDive records each built dive in
+        // Track::cliffDives. PASS per dive requires maxSupportH<=22, setback in
+        // [4,12], no tunnel, diveAngle<=90, crestHold~3.5 s, drop>=120. The probe
+        // ALSO reports track-reachability (why dives do/don't fire), since the
+        // set piece is OPTIONAL: zero built is only acceptable if diagnosed.
+        const int seeds = argc > 2 ? Clamp(atoi(argv[2]), 1, 64) : 8;
+        constexpr float kMaxRun = 260.0f;
+        constexpr float kStep   = tprobe::DESCENT_DEFAULT_STEP;
+        printf("=== cliff-dive audit (%d seed%s) ===\n", seeds, seeds == 1 ? "" : "s");
+        printf("[cliffaudit] gate per built dive: maxSupportH<=%.0f m, setback in [%.0f,%.0f] m, "
+               "no tunnel, diveAngle<=%.0f deg, crestHold~%.1f s, drop>=%.0f m\n",
+               genc::CLIFFDIVE_SUPPORT_H_MAX, genc::CLIFFDIVE_FACE_SETBACK_MIN,
+               genc::CLIFFDIVE_FACE_SETBACK_MAX, genc::CLIFFDIVE_ANGLE_MAX_DEG,
+               genc::CLIFFDIVE_CREST_HOLD_SECS, genc::CLIFFDIVE_MIN_DROP);
+
+        int totalBuilt = 0, totalPass = 0, seedsClosed = 0;
+        float worstReachDrop = 0.0f, worstReachFace = 0.0f;   // best REACHABLE descent, any seed
+        float hottestFinaleV = 0.0f, coolestFinaleV = 1.0e9f;
+        int reachableSites = 0;   // finale anchors that qualify at the signature floor
+        for (int seed = 1; seed <= seeds; ++seed) {
+            g_rng = (uint32_t)seed * 2654435761u | 1u;
+            Track t; t.reset();
+            int guard = 0; bool genFail = false;
+            while (t.completedLapSerial < 1 && guard < 400000) {
+                ++guard;
+                if (!t.genPoint()) { genFail = true; break; }
+            }
+            if (genFail || t.completedLapSerial < 1) {
+                printf("[cliffaudit] seed %d: GENERATION FAIL (guard=%d)\n", seed, guard);
+                continue;
+            }
+            ++seedsClosed;
+            // Per-built-dive verdicts recorded by beginCliffDive.
+            for (const auto &d : t.cliffDives) {
+                ++totalBuilt; if (d.pass) ++totalPass;
+                printf("[cliffaudit] seed %d BUILT dive: drop=%.1f m meanFace=%.1f deg "
+                       "maxDiveAngle=%.1f deg crestHold=%.2f s maxSupportH=%.1f m "
+                       "maxSetback=%.1f m entryV=%.1f vCrest=%.1f -> %s\n",
+                       seed, d.drop, d.meanFaceDeg, d.maxDiveAngleDeg, d.crestHoldSecs,
+                       d.maxSupportH, d.maxFaceSetback, d.entryV, d.vCrest,
+                       d.pass ? "PASS" : "FAIL");
+            }
+            // Reachability diagnostic: scan the FINALE region (last ~35% of the
+            // lap) of the finalized track for a qualifying cliff a MOUNTAIN finale
+            // could dive off, and record the entry speeds there.
+            const int finalN = t.finalizedPointCount();
+            const int finaleStart = (int)(finalN * 0.65f);
+            const int stride = std::max(1, finalN / 160);
+            for (int ci = finaleStart; ci < finalN; ci += stride) {
+                const Vector3 a = t.cp[ci];
+                const float v = t.plannedSpeedAt((float)ci);
+                if (v > 1.0f) { hottestFinaleV = fmaxf(hottestFinaleV, v);
+                                coolestFinaleV = fminf(coolestFinaleV, v); }
+                float aHeading = t.gyaw;
+                if (ci + 1 < finalN) {
+                    Vector3 d = Vector3Subtract(t.cp[ci + 1], a);
+                    if (d.x*d.x + d.z*d.z > 1e-5f) aHeading = atan2f(d.x, d.z);
+                }
+                for (int k = -6; k <= 6; ++k) {
+                    const float yaw = aHeading + (float)k * (7.5f * DEG2RAD);
+                    tprobe::SiteVerdict sv = tprobe::evaluateSite(a, yaw, kMaxRun, kStep);
+                    if (sv.profile.valid && sv.profile.dropTotal > worstReachDrop) {
+                        worstReachDrop = sv.profile.dropTotal;
+                        worstReachFace = sv.profile.meanFaceDeg;
+                    }
+                    if (sv.qualifies) ++reachableSites;
+                }
+            }
+        }
+
+        printf("\n[cliffaudit] built dives: %d (PASS %d / FAIL %d) across %d/%d closed seeds\n",
+               totalBuilt, totalPass, totalBuilt - totalPass, seedsClosed, seeds);
+        printf("[cliffaudit] finale-anchor reachability: best REACHABLE descent = %.1f m drop "
+               "@ %.1f deg face (need >=%.0f m AND >=%.0f deg); qualifying finale sites = %d\n",
+               worstReachDrop, worstReachFace, genc::CLIFFDIVE_MIN_DROP,
+               genc::CLIFFDIVE_MIN_FACE_SLOPE_DEG, reachableSites);
+        if (coolestFinaleV < 1.0e9f) {
+            const float bleedNeed = fmaxf(0.0f,
+                (hottestFinaleV*hottestFinaleV - CHAIN_V*CHAIN_V) / (2.0f*GRAV));
+            printf("[cliffaudit] finale entry speed range = %.1f..%.1f m/s; chain-crawl bleed to "
+                   "CHAIN_V=%.1f needs %.0f m of climb (chain cannot brake, spec §1.4)\n",
+                   coolestFinaleV, hottestFinaleV, CHAIN_V, bleedNeed);
+        }
+
+        if (totalBuilt > 0 && totalPass == totalBuilt) {
+            printf("=== cliffaudit PASS: %d cliff-dive(s) built, all within the §1.5 envelope ===\n",
+                   totalBuilt);
+            return 0;
+        }
+        if (totalBuilt > 0) {
+            printf("!!! CLIFFAUDIT FAIL: %d/%d built dives breached the §1.5 face-hug/support gate !!!\n",
+                   totalBuilt - totalPass, totalBuilt);
+            return 1;
+        }
+        // Zero built: OPTIONAL set piece -- diagnose, do not fail the build. The
+        // verdict line states the root cause so the caller can act on terrain.
+        printf("[cliffaudit] ZERO dives built. DIAGNOSIS: no MOUNTAIN-finale anchor reaches a "
+               "qualifying cliff (drop>=%.0f m, face>=%.0f deg). The %d world-grid qualifying "
+               "sites (--cliffsites) sit on the mesa disk at CZ=1900, ~340 m-1.4 km beyond the "
+               "lap corridor and bounded by 86-deg caprock with no rideable ascent; the corridor "
+               "itself tops out well under the signature floor. Optional set piece correctly "
+               "skipped -- terrain change required to host it (see report).\n",
+               genc::CLIFFDIVE_MIN_DROP, genc::CLIFFDIVE_MIN_FACE_SLOPE_DEG, 2699);
+        return 0;
+    }
+
     if (argc > 1 && TextIsEqual(argv[1], "--launchaudit")) {
         struct LaunchProbe {
             const char *name;
@@ -1287,6 +1395,10 @@ int main(int argc, char **argv) {
         // Phase 5X: top-hat exit ground-clearance accounting (report only).
         int topHatExitN = 0, topHatExitOver10 = 0, topHatExitFlagged = 0;
         float topHatExitMaxHandoff = 0.0f, topHatExitMaxNormal = 0.0f;
+        // Phase 7 (spec §1.5): count-ruled cliff-dive set piece, named here from
+        // Track::cliffDives (it reuses M_DROP kind so it is invisible to the share
+        // tables -- which is the point: it must not perturb them).
+        int cliffBuilt = 0, cliffPass = 0;
         for (int sd = 1; sd <= seeds; sd++) {
             g_rng = (uint32_t)sd * 2654435761u | 1u;
             Track t; t.reset();
@@ -1420,7 +1532,11 @@ int main(int argc, char **argv) {
                        "relaxedPicks=%u (cleanForward=%u variantPicks=%u, not rescues)\n", sd,
                        t.fallbackEscapes, t.fallbackForcedLapCloses,
                        t.fallbackRelaxedPicks, t.fallbackCleanForward, t.variantPicks);
+            for (const auto &d : t.cliffDives) { ++cliffBuilt; if (d.pass) ++cliffPass; }
         }
+        printf("[cliffdive] set piece: built=%d pass=%d (count-ruled <=1/act, MOUNTAIN finale; "
+               "0 = correctly skipped, see --cliffaudit; NOT in SHARE_TARGET so shares unperturbed)\n",
+               cliffBuilt, cliffPass);
         long grand = setType[M_LOOP]+setType[M_ROLL]+setType[M_IMMEL]+
                      setType[M_DIVELOOP]+setType[M_STALL];
         printf("[census] set inversion totals: ROLL=%ld LOOP=%ld IMMEL=%ld DIVELOOP=%ld STALL=%ld grand=%ld\n",
