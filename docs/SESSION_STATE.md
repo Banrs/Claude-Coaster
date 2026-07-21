@@ -324,3 +324,10 @@ NOT main). Ultracode is ON: user opted into Workflow-tool orchestration for all 
   cut (extend the exit leg to daylight) OR make the cut-exit connector a first-class move.
   Escapes charge the lap budget -> early closes; escapeClipPublished 56 = all clips come from
   these two archetypes. Fix A first, re-measure B.
+- DELEGATION REVERTED (user, 07:2x): fable burning too fast -> back to ~10-80-10 (20-30%
+  fable). Fable = architecting specs, gate verdicts, short verifications only; ALL
+  implementation via delegated agents (opus for hard, sonnet where mechanical). Work
+  autonomously to completion. Pattern-A agent (opus) still owns coaster_track.cpp; queue
+  after it lands+verifies: (B) buried-boundary exit contracts, turn-shoulder lat leak,
+  micro-STALL H floor, seed3 clips, share rebalance -- each as a delegated agent with
+  numeric verify targets; fable only re-gates census 8 between batches.
