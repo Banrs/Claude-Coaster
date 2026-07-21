@@ -790,6 +790,13 @@ struct GenCursor {
     float   topHatFollowDist = 0.0f;  // metres walked since the followed top hat's hand-off
     int     lapElemCount[M_COUNT] = {0};
     int     completedElemCount[M_COUNT] = {0};
+    // SIZE-SPECTRUM / DURATION LAW instrumentation (2026-07-21): planned ride
+    // seconds split per tag (same ds/genV law as lapRideSeconds), the per-tag
+    // peak height above local ground, and a 25 m-bucket histogram of control-
+    // point heights above ground -- lap-scoped, promoted at lap close.
+    float   lapElemSeconds[M_COUNT] = {0}, completedElemSeconds[M_COUNT] = {0};
+    float   lapTagRelYMax[M_COUNT] = {0}, completedTagRelYMax[M_COUNT] = {0};
+    int     lapRelYHist[10] = {0}, completedRelYHist[10] = {0};
     int     lapAuthoredCount[M_COUNT] = {0};
     // Phase 4 share controller (U3/U4): a sliding window of the last
     // SHARE_WINDOW committed COUNTED features drives the live shares.  The
@@ -846,6 +853,22 @@ struct GenCursor {
     // per lap, exposed so the census can print mean built scale vs the real
     // record reference (guards against the sizer clustering at the 0.75 floor).
     float   lapHelixScaleSum = 0.0f, completedHelixScaleSum = 0.0f;
+    // SIZE-SPECTRUM LAW (user, 2026-07-21): per-element built-scale statistics
+    // so the census can PROVE cap adherence and full-window diversity (never a
+    // one-signature-size element).  Lap-scoped, promoted at lap close exactly
+    // like the helix scale sum, so uncommitted tail work never counts.
+    struct ScaleStat {
+        float sum = 0.0f, mn = 1.0e9f, mx = -1.0e9f;
+        int n = 0, ter[3] = {0, 0, 0}, capViol = 0;
+        void add(const ScaleStat &o) {
+            sum += o.sum; n += o.n; capViol += o.capViol;
+            mn = o.n ? (mn < o.mn ? mn : o.mn) : mn;
+            mx = o.n ? (mx > o.mx ? mx : o.mx) : mx;
+            for (int i = 0; i < 3; ++i) ter[i] += o.ter[i];
+        }
+        void clear() { *this = ScaleStat{}; }
+    };
+    ScaleStat lapScaleStat[M_COUNT], completedScaleStat[M_COUNT];
     unsigned completedLapSerial = 0;
     float   straightRun = 0.0f;
     float   genPrevDy = 0;
@@ -897,6 +920,15 @@ struct GenCursor {
     unsigned fallbackForcedLapCloses = 0;
     unsigned fallbackRelaxedPicks = 0;
     unsigned fallbackCleanForward = 0;
+    // Cumulative (like fallbackForcedLapCloses -- not lap-scoped): the last-
+    // resort occupancy-OFF escape/launch runway fanned its exit heading, but
+    // even the roomiest candidate still clipped committed track (<2 m).  A
+    // genuinely boxed corner where the completion guarantee had to publish a
+    // clip; surfaced by the census so these rare events are visible rather
+    // than silent.  Distinct from fallbackEscapes (which classifies EVERY
+    // occupancy-off escape) -- this counts only the ones whose organic fan
+    // could not find a >=2 m heading.
+    unsigned escapeClipPublished = 0;
     unsigned variantPicks = 0;
     // Transient: the true min clearance (to committed occupancy, recent-arc
     // excluded) of the escape geometry just committed by commitEscapeArc.  Used

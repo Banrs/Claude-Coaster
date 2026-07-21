@@ -37,7 +37,13 @@ inline constexpr float ROLL_ACCEL_MAX_DEG_PER_M2   = 5.5f;    // deg/m^2
 // Centreline length alone gets a small allowance for C3 shoulders and 14 m
 // publication quantisation.  A height cap can therefore never conceal an
 // oversized radius or kilometre-long path again.
-inline constexpr float RECORD_SCALE_MIN       = 0.75f;
+// SCALE WINDOW (user law 2026-07-21, supersedes 0.75): [1.0, 1.5]x WR, built
+// mean ~1.25x = the window midpoint.  Draw centring is SPEED-AWARE (see
+// frndUp in coaster_track.cpp): entry-speed percentile maps linearly to the
+// scale window position (lower-quartile speed -> ~1.125x, upper -> ~1.375x),
+// which also enforces the duration law organically (fast entries draw big,
+// so element seconds never collapse).
+inline constexpr float RECORD_SCALE_MIN       = 1.00f;
 inline constexpr float RECORD_SCALE_CAP       = 1.50f;
 inline constexpr float TOP_HAT_RECORD_RISE =
     (float)v1profile::kTopHatReferenceRise; // Intamin Falcon's Flight camelback
@@ -236,6 +242,17 @@ inline constexpr float CLEARANCE_SCORE_W = 2.0f;   // == straightness penalty
 // record reference (v^2 = HELIX_TARGET_G*G*30.5 - G*30): offer-weight pivot
 // for the built-scale-mean-above-1.0x law.
 inline constexpr float HELIX_SCALE_PAR_SPEED = 57.0f;
+// Entry speed at which the physics-locked helix radius equals 1.25x the 30.5 m
+// record reference -- the SIZING LAW target mean (user, 2026-07-21).  Same law
+// as the 1.0x pivot above: v^2 = HELIX_TARGET_G*G*(1.25*30.5) - G*30 ->
+// v = 64.0 m/s.  The offer-bias second pivot: entries at/above this build a
+// >=1.25x coil, so they carry the highest offer up-weight, nudging the built-
+// scale mean up toward 1.25x WITHOUT touching the (physics-locked) geometry.
+// Empirically this is a WEAK lever on the committed terrain -- a helix is rarely
+// eligible at pick time, so its offer weight seldom competes and the built mean
+// stays terrain-supply-bound (~0.9x); the cold floor is kept mild (0.6, not
+// harsher) so the bias cannot STARVE the subtype below its share band.
+inline constexpr float HELIX_SCALE_125_SPEED = 64.0f;
 
 inline constexpr float SHARE_BAND_LO = 0.75f;
 // User directive 2026-07-20: tightened from 1.75 to 1.5. Bands are DIAGNOSTIC
@@ -315,8 +332,17 @@ inline constexpr float REAL_ELEMENT_SECONDS[M_COUNT] = {
     /*M_STALL*/    3.5f,
     /*M_DIVELOOP*/ 5.0f,
 };
-inline constexpr float REAL_DURATION_BIAS_LO = 0.9f;
-inline constexpr float REAL_DURATION_BIAS_HI = 1.0f;
+// DURATION LAW (user, 2026-07-21, supersedes the 0.9-1.0x spec): built mean
+// element duration ~0.75x of REAL_ELEMENT_SECONDS, and no element may AVERAGE
+// longer than 1.0x real.  The soft preference centres at 0.75x; the census
+// duration-ratio line gates the built result (mean band + 1.0x cap).
+inline constexpr float REAL_DURATION_BIAS_LO = 0.65f;
+inline constexpr float REAL_DURATION_BIAS_HI = 0.85f;
+// Speed anchors for the speed-aware size draw: the ride's engineered speed
+// band (ride_constants.h MIN_V/MAX_V mirror).  q = (genV-LO)/(HI-LO) is the
+// entry-speed percentile proxy used to place the scale-window draw centre.
+inline constexpr float SIZE_SPEED_LO_MPS = 42.0f;
+inline constexpr float SIZE_SPEED_HI_MPS = 82.0f;
 
 // Act themes: each lap is one composed act with a rotating theme that biases
 // shares INSIDE their bands (weights, never gates).  Multipliers are bounded

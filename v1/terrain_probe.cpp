@@ -28,7 +28,13 @@ struct GenTerrainMemo {
     uint64_t key[N];
     float solid[N];
     uint32_t stamp[N];
-    uint32_t epoch = 0;
+    // Phase 7 (spec §0.9): terrain field CHANGED (Tuwaiq escarpment added to
+    // terrainH). Bump the memo epoch off its zero-initialised default so any
+    // stale slot (stamp==0) is treated as empty and the memo re-populates
+    // against the NEW field instead of silently trusting a pre-escarpment
+    // value. (Terrain is a pure fn of (x,z), so cached==fresh within a run;
+    // this bump is the field-version guard the escarpment change requires.)
+    uint32_t epoch = 1;
     void clear() { ++epoch; }
     static uint64_t pack(float x, float z) {
         uint32_t xb, zb;
@@ -188,6 +194,249 @@ static inline float deficiencyAlong(HeightFn heightAt, Vector3 origin,
         deficiency = fmaxf(deficiency, floor - y);
     }
     return deficiency;
+}
+
+// --- Cliff-dive siting constants (spec §1.1). ------------------------------
+// The spec parks these in gen_constants.h/genc::; that namespace does not exist
+// in the current tree (element sizing constants live as Track:: members). They
+// are the SITING thresholds this probe needs, so they live here, self-contained
+// for this stage; the builder stage can promote/re-home them without changing
+// their values.
+constexpr float CLIFFDIVE_REFERENCE_DROP     = 160.0f; // Falcon's Flight 525 ft vertical cliff drop
+constexpr float CLIFFDIVE_MIN_DROP           = 120.0f; // 0.75x reference -- siting FLOOR for the signature move
+constexpr float CLIFFDIVE_DROP_CAP           = 240.0f; // 1.5x -- never exceeded (terrain caps below anyway)
+constexpr float CLIFFDIVE_ANGLE_MAX_DEG      = 90.0f;  // hard CAP, true vertical -- never sustained beyond face support
+constexpr float CLIFFDIVE_STEEPEN_MARGIN_DEG = 8.0f;   // pitch may exceed local face slope by at most this
+constexpr float CLIFFDIVE_CREST_HOLD_SECS    = 3.5f;   // B&M holding-brake 3-4 s
+constexpr float CLIFFDIVE_FACE_SETBACK_MIN   = 4.0f;   // = occupancy escape; never tunnel into rock
+constexpr float CLIFFDIVE_FACE_SETBACK_MAX   = 12.0f;  // hug bound (CORRECTION 2)
+constexpr float CLIFFDIVE_SUPPORT_H_MAX      = 22.0f;  // short cliff-face anchor, not a mega-tower
+constexpr float CLIFFDIVE_MIN_FACE_SLOPE_DEG = 58.0f;  // mean terrain-face steepness required along the descent
+
+// scanDescent shape/tolerance defaults (spec §1.2: "use 3-4 m, finer than
+// MACRO_SAMPLE_STEP, because a cliff lip is a sharp feature").
+constexpr float DESCENT_DEFAULT_STEP = 3.5f;
+constexpr float DESCENT_LIP_SLOPE_DEG = 30.0f; // steep-descent onset that marks the cliff lip
+constexpr float DESCENT_RERISE_TOL   = 2.0f;   // re-rise past the lip tolerated before it counts as bench/overhang
+// Base pull-out room (spec §1.2/§1.3): the valley beyond the floor must stay
+// near-flat and non-rising for at least a pull-out radius (~110-120 m at the
+// base speeds of §1.4). This is the horizontal room the base curl needs.
+constexpr float DESCENT_PULLOUT_ROOM     = 120.0f;
+constexpr float DESCENT_PULLOUT_MAX_RISE = 14.0f; // corridor may rise at most this over the room and still be "near-flat"
+
+// --- Descent profile -------------------------------------------------------
+struct DescentSample {
+    float fwd = 0.0f;               // forward distance from origin along yaw
+    float groundY = 0.0f;           // ground(x,z) visible top at this sample
+    float localFaceSlopeDeg = 0.0f; // per-sample descent steepness (>=0), for the §1.3 face-tracking pitch law
+};
+
+struct DescentProfile {
+    std::vector<DescentSample> samples;
+    bool  valid = false;      // a cliff lip was found along the scan
+    float lipFwd = 0.0f;      // forward distance of the first steep-descent onset (cliff lip)
+    int   lipIndex = -1;
+    int   floorIndex = -1;
+    float crestGroundY = 0.0f;
+    float floorGroundY = 0.0f;
+    float dropTotal = 0.0f;   // lip groundY -> local (deepest) min groundY
+    float runToFloor = 0.0f;  // horizontal distance lip -> floor
+    float meanFaceDeg = 0.0f; // atan2(dropTotal, runToFloor)
+    bool  monotone = false;   // no overhang/bench/concave re-rise between lip and floor (within reRiseTol)
+};
+
+// Forward direction convention matches --terrainaudit / the existing generator
+// probes: x += sin(yaw)*d, z += cos(yaw)*d.
+static inline void yawForward(float yaw, float &fx, float &fz) {
+    fx = sinf(yaw);
+    fz = cosf(yaw);
+}
+
+// --- Reduced-profile memo (exact-key, bounded, mutex-guarded). -------------
+namespace detail {
+struct ScanKey {
+    int32_t qx, qz, qyaw, qrun, qstep;
+    bool operator==(const ScanKey &o) const {
+        return qx == o.qx && qz == o.qz && qyaw == o.qyaw &&
+               qrun == o.qrun && qstep == o.qstep;
+    }
+};
+struct ScanKeyHash {
+    size_t operator()(const ScanKey &k) const {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](int32_t v) {
+            h ^= (uint64_t)(uint32_t)v;
+            h *= 1099511628211ull;
+        };
+        mix(k.qx); mix(k.qz); mix(k.qyaw); mix(k.qrun); mix(k.qstep);
+        return (size_t)(h ^ (h >> 29));
+    }
+};
+static std::mutex gScanMutex;
+static std::unordered_map<ScanKey, DescentProfile, ScanKeyHash> gScanMemo;
+static constexpr size_t SCAN_MEMO_MAX = 1u << 20; // 2^20 exact-key, mirrors the terrain memo budget
+
+static ScanKey makeKey(const Vector3 &o, float yaw, float maxRun, float step) {
+    // Wrap yaw to [0,2pi) so equivalent headings share a slot.
+    float y = fmodf(yaw, 2.0f * PI);
+    if (y < 0.0f) y += 2.0f * PI;
+    return ScanKey{
+        (int32_t)lroundf(o.x * 2.0f),   // 0.5 m
+        (int32_t)lroundf(o.z * 2.0f),   // 0.5 m
+        (int32_t)lroundf(y * (1.0f / DEG2RAD) * 2.0f), // 0.5 deg
+        (int32_t)lroundf(maxRun * 2.0f),
+        (int32_t)lroundf(step * 4.0f)};
+}
+} // namespace detail
+
+// (a) scanDescent (spec §1.2). Marches the centreline forward from `origin`
+// along `yaw`, sampling ground at `step`, and reduces to the cliff-lip / drop /
+// face-slope / monotonicity descriptors the siting scan scores on. Per-sample
+// localFaceSlopeDeg is retained for the §1.3 face-tracking pitch law.
+static DescentProfile scanDescent(Vector3 origin, float yaw,
+                                  float maxRun, float step) {
+    if (!(step > 0.5f)) step = DESCENT_DEFAULT_STEP;
+    if (!(maxRun > step)) maxRun = step * 2.0f;
+
+    const detail::ScanKey key = detail::makeKey(origin, yaw, maxRun, step);
+    {
+        std::lock_guard<std::mutex> lock(detail::gScanMutex);
+        auto it = detail::gScanMemo.find(key);
+        if (it != detail::gScanMemo.end()) return it->second;
+    }
+
+    DescentProfile prof;
+    float fx, fz;
+    yawForward(yaw, fx, fz);
+
+    const int n = (int)(maxRun / step) + 1;
+    prof.samples.reserve((size_t)n + 1);
+    for (int i = 0; i <= n; ++i) {
+        const float fwd = (float)i * step;
+        const float x = origin.x + fx * fwd;
+        const float z = origin.z + fz * fwd;
+        DescentSample s;
+        s.fwd = fwd;
+        s.groundY = groundTopAt(x, z);
+        prof.samples.push_back(s);
+    }
+
+    // Per-sample local face slope: forward-difference descent steepness. A
+    // rising or flat step yields 0 (the face law only steepens on descent).
+    // The last sample copies its predecessor (no forward neighbour).
+    const size_t m = prof.samples.size();
+    for (size_t i = 0; i + 1 < m; ++i) {
+        const float drop = prof.samples[i].groundY - prof.samples[i + 1].groundY;
+        prof.samples[i].localFaceSlopeDeg =
+            atan2f(fmaxf(0.0f, drop), step) / DEG2RAD;
+    }
+    if (m >= 2) prof.samples[m - 1].localFaceSlopeDeg = prof.samples[m - 2].localFaceSlopeDeg;
+
+    // Lip: first sample whose per-step descent exceeds the steep-onset slope.
+    int lipIdx = -1;
+    for (size_t i = 0; i + 1 < m; ++i) {
+        if (prof.samples[i].localFaceSlopeDeg >= DESCENT_LIP_SLOPE_DEG) {
+            lipIdx = (int)i;
+            break;
+        }
+    }
+    if (lipIdx < 0) {
+        prof.valid = false;
+        std::lock_guard<std::mutex> lock(detail::gScanMutex);
+        if (detail::gScanMemo.size() < detail::SCAN_MEMO_MAX)
+            detail::gScanMemo.emplace(key, prof);
+        return prof;
+    }
+
+    prof.valid = true;
+    prof.lipIndex = lipIdx;
+    prof.lipFwd = prof.samples[lipIdx].fwd;
+    prof.crestGroundY = prof.samples[lipIdx].groundY;
+
+    // Floor: the deepest ground reached from the lip forward.
+    int floorIdx = lipIdx;
+    float floorY = prof.crestGroundY;
+    for (int j = lipIdx + 1; j < (int)m; ++j) {
+        if (prof.samples[j].groundY < floorY) {
+            floorY = prof.samples[j].groundY;
+            floorIdx = j;
+        }
+    }
+    prof.floorIndex = floorIdx;
+    prof.floorGroundY = floorY;
+    prof.dropTotal = prof.crestGroundY - floorY;
+    prof.runToFloor = prof.samples[floorIdx].fwd - prof.lipFwd;
+    prof.meanFaceDeg = atan2f(fmaxf(0.0f, prof.dropTotal),
+                              fmaxf(prof.runToFloor, 1.0e-3f)) / DEG2RAD;
+
+    // Monotone: lip -> floor must be non-increasing within reRiseTol (no
+    // overhang / bench / concave re-rise before the true floor). A bench shows
+    // up as ground rising above the running minimum by more than the tolerance
+    // while still short of the floor.
+    prof.monotone = true;
+    float runMin = prof.crestGroundY;
+    for (int j = lipIdx + 1; j <= floorIdx; ++j) {
+        const float g = prof.samples[j].groundY;
+        if (g < runMin) runMin = g;
+        else if (g > runMin + DESCENT_RERISE_TOL) { prof.monotone = false; break; }
+    }
+
+    std::lock_guard<std::mutex> lock(detail::gScanMutex);
+    if (detail::gScanMemo.size() < detail::SCAN_MEMO_MAX)
+        detail::gScanMemo.emplace(key, prof);
+    return prof;
+}
+
+// Base pull-out room (spec §1.2 base-room check). From the descent floor,
+// march forward `room` metres and report the maximum RISE of ground above the
+// floor. A qualifying valley stays near-flat/non-rising, so a small max-rise
+// means there is room for the base curl / short tunnel. Returns +inf-ish large
+// if the profile has no floor.
+static float basePullOutRise(const DescentProfile &prof, Vector3 origin,
+                             float yaw, float room, float step) {
+    if (!prof.valid || prof.floorIndex < 0) return 1.0e9f;
+    if (!(step > 0.5f)) step = DESCENT_DEFAULT_STEP;
+    float fx, fz;
+    yawForward(yaw, fx, fz);
+    const float baseFwd = prof.samples[prof.floorIndex].fwd;
+    const float baseY = prof.floorGroundY;
+    const int n = (int)(room / step) + 1;
+    float maxRise = 0.0f;
+    for (int i = 1; i <= n; ++i) {
+        const float fwd = baseFwd + (float)i * step;
+        const float x = origin.x + fx * fwd;
+        const float z = origin.z + fz * fwd;
+        maxRise = fmaxf(maxRise, groundTopAt(x, z) - baseY);
+    }
+    return maxRise;
+}
+
+// Full siting verdict for one heading (spec §1.2 qualification set, minus the
+// occupancy footprint check which belongs to the committing builder). Bundled
+// so both --cliffsites and the future beginCliffDive share one definition of
+// "qualifies".
+struct SiteVerdict {
+    bool  qualifies = false;
+    DescentProfile profile;
+    float basePullOutRise = 0.0f;
+    bool  dropOK = false;
+    bool  slopeOK = false;
+    bool  monotoneOK = false;
+    bool  baseRoomOK = false;
+};
+
+static SiteVerdict evaluateSite(Vector3 origin, float yaw,
+                                float maxRun, float step) {
+    SiteVerdict v;
+    v.profile = scanDescent(origin, yaw, maxRun, step);
+    const DescentProfile &p = v.profile;
+    v.dropOK    = p.valid && p.dropTotal >= CLIFFDIVE_MIN_DROP;
+    v.slopeOK   = p.valid && p.meanFaceDeg >= CLIFFDIVE_MIN_FACE_SLOPE_DEG;
+    v.monotoneOK = p.valid && p.monotone;
+    v.basePullOutRise = basePullOutRise(p, origin, yaw, DESCENT_PULLOUT_ROOM, step);
+    v.baseRoomOK = p.valid && v.basePullOutRise <= DESCENT_PULLOUT_MAX_RISE;
+    v.qualifies = v.dropOK && v.slopeOK && v.monotoneOK && v.baseRoomOK;
+    return v;
 }
 
 } // namespace tprobe

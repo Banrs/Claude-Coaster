@@ -130,6 +130,79 @@ static float ridgef(float x, float z, int oct) {
     return a / norm;
 }
 
+// --- Tuwaiq escarpment (Phase 7, spec §0.9) --------------------------------
+// A dedicated table-mountain band added to the fixed terrain so the playfield
+// can physically host the Falcon's-Flight cliff-dive set piece (the real ride
+// sits on the Tuwaiq escarpment -- we build our Tuwaiq). Deterministic pure
+// function of (x,z) like the rest of the field. Terrain-probe ground truth:
+// the natural noise tops out at ~66 m of drop on <=28 deg faces -- ZERO sites
+// satisfy the signature move (drop >=120 m AND face >=58 deg). This localized
+// additive term supplies the missing relief.
+//
+// Geometry (USER SIZING LAW): a COMPACT table mountain (mesa) centred on the
+// ride origin. The station and the whole lap sit on flat high ground a safe
+// ~450 m margin from every rim, so generation is not fighting a wall at the
+// start; meanwhile EVERY outward heading meets a cliff -> heading-diverse dive
+// sites all the way round. The plateau TOP slopes smoothly along +x from 155 m
+// (west rim) to 275 m (east rim), so the closed-loop rim cliff offers the FULL
+// 0.75-1.5x window of the 160 m Falcon's-Flight reference drop (120..240 m):
+// the tall east rim gives ~245 m (1.5x) for a ~1.25x-mean siting bias, the
+// short west rim ~125 m (0.78x), N/S rims ~185 m in between. The outer wall is
+// a MONOTONE ~72 deg face (inside the 60-75 deg spec band) down to a flat ~30 m
+// valley apron that gives the dive its pull-out room; beyond the apron it
+// feathers back to the natural field, so it is a BOUNDED localized addition,
+// not a lift of the whole map. The apron floor (30 m) sits well above WATER_Y
+// (18 m): the mesa only removes water where its own compact disk overlaps a
+// former basin (measured waterfrac stays in the 10-15% band).
+static float tuwaiqEscarpment(float x, float z, float hNatural) {
+    // Mesa centre is offset NORTH of the ride origin: the natural field has a
+    // large water basin immediately SOUTH of origin (~85% water at (0,-700))
+    // and dry high ground to the north (0% water at (0,+700)). Centering the
+    // mesa on origin drowned that basin (waterfrac 12.9%->7.7%); offsetting the
+    // plateau north keeps the mesa on dry land so waterfrac holds, and makes the
+    // feature asymmetric (station near the south rim, plateau extending north).
+    // RELOCATED 2026-07-21 (Fable takeover): at CZ=380 the station sat ON the
+    // plateau and the lap corridor (measured wander: x [-170,1650], z [-830,960]
+    // over seeds 1-3) fought the 72 deg wall -> degenerate 1.4-5s laps, forced
+    // closes, a 12.7 deg joint (seed 4) and share skew (all verified by A/B with
+    // the mesa disabled: census/jointaudit fully recover).  CZ=1900 keeps the
+    // WALL band (rho 470..~550 -> z >= ~1350 on the near side) ~400 m clear of
+    // the measured corridor; only the benign FLAT 30 m apron/feather can graze
+    // it.  The mesa becomes a northern backdrop + the cliff-dive set piece's
+    // destination (approach run ~1 km, Falcon's Flight-style out-and-back).
+    constexpr float CX = 0.0f, CZ = 1900.0f;    // mesa centre (far north of corridor)
+    constexpr float RP   = 470.0f;              // plateau radius (mesa top)
+    constexpr float FOOT = 30.0f;               // flat valley-apron floor (>WATER_Y=18)
+    constexpr float TAN_FACE = 3.0777f;         // tan(72 deg): outer wall in the 60-75 deg band
+    constexpr float APRON = 175.0f;             // flat valley in front (dive pull-out room)
+    constexpr float FEATHER = 120.0f;           // apron -> natural feather width
+
+    const float dx = x - CX, dz = z - CZ;
+    const float rho = sqrtf(dx * dx + dz * dz);  // distance from the mesa centre
+
+    // Plateau top slopes smoothly along +x (155 W .. 275 E) -> drop-diverse
+    // rims and the full 120..240 m usable-drop window. sin(x*..) is smooth at
+    // the origin (no theta cusp under the station).
+    const float plateauTop = Clamp(215.0f + 62.0f * sinf(x * 0.0042f), 150.0f, 275.0f);
+    const float faceRun = (plateauTop - FOOT) / TAN_FACE;   // keeps the wall ~72 deg for any height
+
+    const float rimEnd   = RP + faceRun;        // foot of the wall
+    const float apronEnd = rimEnd + APRON;
+    if (rho > apronEnd + FEATHER) return hNatural;  // outside the mesa's influence
+
+    // Mesa surface as a monotone function of radius rho.
+    float mesa;
+    if (rho <= RP)            mesa = plateauTop;                                             // flat table top
+    else if (rho < rimEnd)    mesa = plateauTop - (rho - RP) / faceRun * (plateauTop - FOOT); // 72 deg wall
+    else                      mesa = FOOT;                                                   // valley apron
+
+    // Influence weight: full across plateau+wall+apron; feathers to the natural
+    // field out in the valley so the foot meets the surrounding basin smoothly.
+    const float w = (rho <= apronEnd) ? 1.0f
+                                      : smooth01(apronEnd + FEATHER, apronEnd, rho);
+    return hNatural * (1.0f - w) + mesa * w;
+}
+
 static int terrainH(float x, float z) {
     float warpX = (vnoise(x * 0.0011f + 17.5f, z * 0.0011f + 91.0f) - 0.5f) * 220.0f;
     float warpZ = (vnoise(x * 0.0011f + 53.0f, z * 0.0011f + 11.5f) - 0.5f) * 220.0f;
@@ -173,6 +246,13 @@ static int terrainH(float x, float z) {
     float mountains = inland * powf(pv, 2.35f) * powf(1.0f - erosion, 1.45f) * 92.0f;
     float rolling = inland * (fbm(wx * 0.008f + 32.0f, wz * 0.008f + 77.0f, 3) - 0.5f) * 18.0f;
     float h = base + mountains + rolling + (det - 0.5f) * 8.0f;
+
+    // Phase 7 (spec §0.9): add the Tuwaiq escarpment BEFORE terracing so the
+    // outer wall inherits the same <=2 m voxel steps as the rest of the world
+    // (spec allows terrace steps <=2 m on the face) and the plateau keeps the
+    // block-world character. Monotonicity of the wall survives terracing
+    // (floor() of a monotone descent stays monotone).
+    h = tuwaiqEscarpment(x, z, h);
 
     // Gentle voxel terraces retain the block-world character without lifting
     // the entire map above sea level. Low continentalness now forms broad,

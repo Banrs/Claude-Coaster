@@ -198,6 +198,224 @@ int main(int argc, char **argv) {
         return qualified > 0 ? 0 : 1;
     }
 
+    // Standalone cliff-dive SITING scan (spec §1.2). For N seeds, build a full
+    // lap, subsample its control points as anchors, sweep heading candidates
+    // from each anchor, and print the sites that qualify for the signature dive
+    // (dropTotal>=120 m, meanFaceDeg>=58, monotone face, base pull-out room).
+    // Read-only: touches no generation state, so census is unaffected.
+    //
+    // The terrain (terrainH/groundTopAt) is a pure, UNSEEDED function of (x,z):
+    // cliff sites are identical across seeds, and do NOT depend on the track. So
+    // if lap generation cannot close (e.g. a Phase-5 generation regression on
+    // this base -- census is already complete=NO here, independent of this
+    // stage), the siting question is still answerable from a terrain grid. When
+    // no seed closes a lap, this scan falls back to a coarse world grid of
+    // high-ground anchors so the architect/builder still learns whether the
+    // terrain offers any qualifying escarpment BEFORE the beginCliffDive stage.
+    if (argc > 1 && TextIsEqual(argv[1], "--cliffsites")) {
+        const int seeds = argc > 2 ? Clamp(atoi(argv[2]), 1, 64) : 2;
+        const int firstSeed = argc > 3 ? Clamp(atoi(argv[3]), 1, 64) : 1;
+        const int lastSeed = std::min(64, firstSeed + seeds - 1);
+        constexpr float kMaxRun = 260.0f;   // enough to bracket a 120-240 m drop over a >=58 deg face
+        constexpr float kStep   = tprobe::DESCENT_DEFAULT_STEP; // 3.5 m, a cliff lip is a sharp feature
+        constexpr int   kHeadings = 24;     // 15 deg sweep, same candidate cardinality as --terrainaudit
+        constexpr int   kAnchorTarget = 140; // subsample the finalized cp to ~this many anchors
+
+        printf("=== cliff-dive siting scan (%d seed%s, drop>=%.0f m, face>=%.0f deg, monotone, base room) ===\n",
+               lastSeed - firstSeed + 1, (lastSeed - firstSeed + 1) == 1 ? "" : "s",
+               tprobe::CLIFFDIVE_MIN_DROP, tprobe::CLIFFDIVE_MIN_FACE_SLOPE_DEG);
+
+        // Aggregate geometry of one labelled sweep. Carries enough to decide the
+        // world-grid PASS gate (>=3 heading-diverse qualifying sites, a >=220 m
+        // best drop, and a drop spread covering ~120-240 m) without re-scanning.
+        struct SweepResult {
+            int   qualifyingCandidates = 0;
+            int   distinctAnchors = 0;
+            int   distinctHeadings = 0;   // distinct compass headings among qualifiers
+            float dropMin = 0.0f, dropMean = 0.0f, dropMax = 0.0f;
+            float bestDrop = 0.0f;
+        };
+
+        // Sweep every heading from every anchor and report qualifying sites for
+        // one labelled anchor set. Returns the qualifying geometry (shared by the
+        // per-seed track-anchor path and the always-on world-grid sweep).
+        auto sweepAnchors = [&](const char *label,
+                                const std::vector<Vector3> &anchors) -> SweepResult {
+            bool headingSeen[kHeadings] = {false}; // compass headings hit by a qualifier
+            int anchorsScanned = 0, qualifyingCandidates = 0, distinctAnchors = 0;
+            float dropMin = 1.0e9f, dropMax = -1.0e9f, dropSum = 0.0f;
+            float faceMin = 1.0e9f, faceMax = -1.0e9f, faceSum = 0.0f;
+            float bestDrop = -1.0e9f, bestFace = 0.0f, bestRun = 0.0f, bestBaseRise = 0.0f;
+            float bestX = 0.0f, bestZ = 0.0f, bestYawDeg = 0.0f;
+            // Terrain-ceiling diagnostics: the best RAW descent the anchors offer
+            // regardless of whether it clears the qualification gates, so a
+            // ZERO-qualifying result still quantifies how far the terrain falls
+            // short of the 120 m / 58 deg signature-dive floor.
+            float rawBestDrop = 0.0f, rawBestDropFace = 0.0f;
+            float rawBestFace = 0.0f, rawBestFaceDrop = 0.0f;
+            struct Listed { float x, z, yawDeg, drop, face, run, baseRise; };
+            std::vector<Listed> listed;
+
+            for (const Vector3 &anchor : anchors) {
+                ++anchorsScanned;
+                bool anchorHasSite = false;
+                for (int h = 0; h < kHeadings; ++h) {
+                    const float yaw = h * (2.0f * PI / kHeadings);
+                    tprobe::SiteVerdict v = tprobe::evaluateSite(anchor, yaw, kMaxRun, kStep);
+                    if (v.profile.valid) {
+                        if (v.profile.dropTotal > rawBestDrop) {
+                            rawBestDrop = v.profile.dropTotal;
+                            rawBestDropFace = v.profile.meanFaceDeg;
+                        }
+                        if (v.profile.meanFaceDeg > rawBestFace) {
+                            rawBestFace = v.profile.meanFaceDeg;
+                            rawBestFaceDrop = v.profile.dropTotal;
+                        }
+                    }
+                    if (!v.qualifies) continue;
+                    const tprobe::DescentProfile &p = v.profile;
+                    ++qualifyingCandidates;
+                    headingSeen[h] = true;
+                    anchorHasSite = true;
+                    dropMin = fminf(dropMin, p.dropTotal); dropMax = fmaxf(dropMax, p.dropTotal);
+                    faceMin = fminf(faceMin, p.meanFaceDeg); faceMax = fmaxf(faceMax, p.meanFaceDeg);
+                    dropSum += p.dropTotal; faceSum += p.meanFaceDeg;
+                    if (p.dropTotal > bestDrop) {
+                        bestDrop = p.dropTotal; bestFace = p.meanFaceDeg; bestRun = p.runToFloor;
+                        bestBaseRise = v.basePullOutRise;
+                        bestX = anchor.x; bestZ = anchor.z; bestYawDeg = yaw / DEG2RAD;
+                    }
+                    if (listed.size() < 12)
+                        listed.push_back({anchor.x, anchor.z, yaw / DEG2RAD,
+                                          p.dropTotal, p.meanFaceDeg, p.runToFloor, v.basePullOutRise});
+                }
+                if (anchorHasSite) ++distinctAnchors;
+            }
+
+            printf("\n[cliffsites] %s: anchors=%d x %d headings\n",
+                   label, anchorsScanned, kHeadings);
+            printf("[cliffsites] %s: terrain ceiling -> deepest drop=%.1f m (face %.1f deg); "
+                   "steepest face=%.1f deg (drop %.1f m)  [need >=%.0f m AND >=%.0f deg]\n",
+                   label, rawBestDrop, rawBestDropFace, rawBestFace, rawBestFaceDrop,
+                   tprobe::CLIFFDIVE_MIN_DROP, tprobe::CLIFFDIVE_MIN_FACE_SLOPE_DEG);
+            if (qualifyingCandidates == 0) {
+                printf("[cliffsites] %s: *** ZERO qualifying cliff-dive sites ***\n", label);
+                return SweepResult{};
+            }
+            int distinctHeadings = 0;
+            for (int h = 0; h < kHeadings; ++h) if (headingSeen[h]) ++distinctHeadings;
+            printf("[cliffsites] %s: %d qualifying heading-candidates across %d distinct anchors, %d distinct headings\n",
+                   label, qualifyingCandidates, distinctAnchors, distinctHeadings);
+            printf("[cliffsites] %s: drop  min/mean/max = %.1f / %.1f / %.1f m\n",
+                   label, dropMin, dropSum / qualifyingCandidates, dropMax);
+            printf("[cliffsites] %s: face  min/mean/max = %.1f / %.1f / %.1f deg\n",
+                   label, faceMin, faceSum / qualifyingCandidates, faceMax);
+            printf("[cliffsites] %s: BEST  drop=%.1f m face=%.1f deg run=%.1f m baseRise=%.1f m at (%.0f,%.0f) yaw %.0f deg\n",
+                   label, bestDrop, bestFace, bestRun, bestBaseRise, bestX, bestZ, bestYawDeg);
+            for (size_t i = 0; i < listed.size(); ++i)
+                printf("[cliffsites] %s:   site[%zu] (%.0f,%.0f) yaw %.0f deg  drop=%.1f m  face=%.1f deg  run=%.1f m  baseRise=%.1f m\n",
+                       label, i, listed[i].x, listed[i].z, listed[i].yawDeg,
+                       listed[i].drop, listed[i].face, listed[i].run, listed[i].baseRise);
+            SweepResult r;
+            r.qualifyingCandidates = qualifyingCandidates;
+            r.distinctAnchors = distinctAnchors;
+            r.distinctHeadings = distinctHeadings;
+            r.dropMin = dropMin; r.dropMean = dropSum / qualifyingCandidates; r.dropMax = dropMax;
+            r.bestDrop = bestDrop;
+            return r;
+        };
+
+        int trackReachableTotal = 0;
+        int seedsClosed = 0;
+        for (int seed = firstSeed; seed <= lastSeed; ++seed) {
+            g_rng = (uint32_t)seed * 2654435761u | 1u;
+            Track t; t.reset();
+            // Drive generation incrementally to one closed lap, exactly as
+            // --census does (a single big ensureFinalizedAhead jump exhausts the
+            // scheduler on some seeds; genPoint() is the demand-driven driver).
+            int guard = 0; bool genFail = false;
+            while (t.completedLapSerial < 1 && guard < 400000) {
+                ++guard;
+                if (!t.genPoint()) { genFail = true; break; }
+            }
+            if (genFail || t.completedLapSerial < 1) {
+                printf("[cliffsites] seed %d: GENERATION FAIL (lap did not close, guard=%d) -- "
+                       "no track anchors; will use terrain-grid fallback\n", seed, guard);
+                continue;
+            }
+            ++seedsClosed;
+            const int finalN = t.finalizedPointCount();
+            const int stride = std::max(1, finalN / kAnchorTarget);
+            std::vector<Vector3> anchors;
+            for (int ci = 0; ci < finalN; ci += stride) anchors.push_back(t.cp[ci]);
+            char label[32]; snprintf(label, sizeof(label), "seed %d", seed);
+            trackReachableTotal += sweepAnchors(label, anchors).qualifyingCandidates;
+        }
+
+        // ALWAYS run a world terrain-grid sweep (spec: mesa relocated to CZ=1900,
+        // ~1.3 km beyond the lap corridor, so track anchors never reach it -- the
+        // per-seed "track-reachable" sweep is EXPECTED to be zero until the
+        // cliff-dive builder exists. The terrain (groundTopAt) is a pure, unseeded
+        // function of (x,z), so a coarse world grid of high-ground anchors is the
+        // real siting answer regardless of what the track reaches. Range extended
+        // to [-2600,2600]^2 so the mesa wall band (z ~= 1350-2450) is covered; the
+        // 45 m grid step and >=45 m high-ground gate still catch the 150-275 m
+        // plateau rim.
+        std::vector<Vector3> grid;
+        float gmin = 1.0e9f, gmax = -1.0e9f;
+        constexpr float kGridGate = 45.0f; // high-ground gate: mesa rim is 150-275 m, apron 30 m
+        constexpr float kGridLo = -2600.0f, kGridHi = 2600.0f, kGridStep = 45.0f;
+        for (float z = kGridLo; z <= kGridHi; z += kGridStep)
+            for (float x = kGridLo; x <= kGridHi; x += kGridStep) {
+                float h0 = groundTopAt(x, z);
+                gmin = fminf(gmin, h0); gmax = fmaxf(gmax, h0);
+                if (h0 >= kGridGate) grid.push_back(Vector3{x, h0, z}); // plausible crest / upper band
+            }
+        printf("\n[cliffsites] world-grid: unseeded terrain sweep (independent of track reach).\n");
+        printf("[cliffsites] world-grid: height range %.0f..%.0f m; %zu upper-band anchors "
+               "(>=%.0f m) over [%.0f,%.0f]^2 @ %.0f m\n",
+               gmin, gmax, grid.size(), kGridGate, kGridLo, kGridHi, kGridStep);
+        SweepResult world = sweepAnchors("world-grid", grid);
+
+        // ---- Summary: two sweeps reported SEPARATELY -------------------------
+        // Track-reachable (per-seed) is INFORMATIONAL only -- zero must not fail
+        // the probe. The PASS verdict is decided solely by the world-grid geometry.
+        printf("\n=== cliffsites summary ===\n");
+        printf("[cliffsites] track-reachable (per-seed track anchors): %d qualifying candidates"
+               " across %d/%d seeds that closed a lap\n",
+               trackReachableTotal, seedsClosed, lastSeed - firstSeed + 1);
+        if (trackReachableTotal == 0 && world.qualifyingCandidates > 0) {
+            printf("[cliffsites] track-reachable = 0 is EXPECTED (no cliff-dive builder exists yet);"
+                   " reachability deferred to cliff-dive builder -- INFORMATIONAL, not a failure\n");
+        }
+        printf("[cliffsites] world-grid geometry: %d qualifying candidates, %d distinct headings,"
+               " drop min/mean/max = %.1f / %.1f / %.1f m, best drop = %.1f m\n",
+               world.qualifyingCandidates, world.distinctHeadings,
+               world.dropMin, world.dropMean, world.dropMax, world.bestDrop);
+
+        // World-grid PASS gate: >=3 heading-diverse qualifying sites, at least one
+        // drop >=220 m, and a drop spread covering ~120-240 m (low end <=150 m so
+        // the full 0.78-1.5x Falcon's-Flight window is represented).
+        const bool haveCount  = world.qualifyingCandidates >= 3;
+        const bool haveDiverse = world.distinctHeadings >= 3;
+        const bool haveDeep   = world.bestDrop >= 220.0f;
+        const bool haveSpread = world.dropMin <= 150.0f && world.dropMax >= 220.0f;
+        const bool worldPass  = haveCount && haveDiverse && haveDeep && haveSpread;
+        if (worldPass) {
+            printf("=== cliffsites PASS: world-grid offers %d heading-diverse cliff-dive sites"
+                   " (>=3 required); best drop %.1f m (>=220 required); drop spread %.1f..%.1f m"
+                   " (spans ~120-240 m) ===\n",
+                   world.qualifyingCandidates, world.bestDrop, world.dropMin, world.dropMax);
+            return 0;
+        }
+        printf("!!! CLIFFSITES FAIL: world-grid geometry insufficient !!!\n");
+        printf("!!!  count>=3:%s  headings>=3:%s  bestDrop>=220m:%s  spread<=150&&>=220m:%s !!!\n",
+               haveCount ? "YES" : "NO", haveDiverse ? "YES" : "NO",
+               haveDeep ? "YES" : "NO", haveSpread ? "YES" : "NO");
+        printf("!!! Architect must rethink mesa siting/sizing BEFORE the beginCliffDive builder stage. !!!\n");
+        return 1;
+    }
+
     if (argc > 1 && TextIsEqual(argv[1], "--launchaudit")) {
         struct LaunchProbe {
             const char *name;
@@ -956,13 +1174,16 @@ int main(int argc, char **argv) {
         int laps = 0, invBudgetMiss = 0, subtypeRepeat = 0;
         int inversionSpacingMiss = 0, helixGeometryMiss = 0;
         unsigned long totalEscapes = 0, totalForcedCloses = 0, totalRelaxed = 0;
-        unsigned long totalVariant = 0, totalCleanForward = 0;
+        unsigned long totalVariant = 0, totalCleanForward = 0, totalClipPublished = 0;
         // Phase 4: per-lap ride-seconds accumulation for the ~120 s pacing gate.
         double totalLapSeconds = 0.0; int lapSecondsN = 0;
         double minLapSeconds = 1e9, maxLapSeconds = 0.0;
         // Phase-4 HELIX resurrection probe: mean built radius-scale vs the real
         // record reference, accumulated across every committed helix.
         double helixScaleSum = 0.0; long helixScaleN = 0;
+        Track::ScaleStat specScale[M_COUNT];
+        double specElemSecs[M_COUNT] = {0}; long specElemCnt[M_COUNT] = {0};
+        float specRelYMax[M_COUNT] = {0}; long specRelYHist[10] = {0};
         // Phase 5X: top-hat exit ground-clearance accounting (report only).
         int topHatExitN = 0, topHatExitOver10 = 0, topHatExitFlagged = 0;
         float topHatExitMaxHandoff = 0.0f, topHatExitMaxNormal = 0.0f;
@@ -1025,6 +1246,15 @@ int main(int argc, char **argv) {
                            t.completedTopHatCount,lapSecs,ms);
                     helixScaleSum += t.completedHelixScaleSum;
                     helixScaleN += t.completedHelixGeometryCount;
+                    for (int m = 0; m < M_COUNT; ++m) {
+                        specScale[m].add(t.completedScaleStat[m]);
+                        specElemSecs[m] += t.completedElemSeconds[m];
+                        specElemCnt[m] += cnt[m];
+                        specRelYMax[m] = fmaxf(specRelYMax[m],
+                                               t.completedTagRelYMax[m]);
+                    }
+                    for (int b = 0; b < 10; ++b)
+                        specRelYHist[b] += t.completedRelYHist[b];
                     totalLapSeconds += lapSecs; lapSecondsN++;
                     if (lapSecs < minLapSeconds) minLapSeconds = lapSecs;
                     if (lapSecs > maxLapSeconds) maxLapSeconds = lapSecs;
@@ -1083,6 +1313,7 @@ int main(int argc, char **argv) {
             totalRelaxed += t.fallbackRelaxedPicks;
             totalVariant += t.variantPicks;
             totalCleanForward += t.fallbackCleanForward;
+            totalClipPublished += t.escapeClipPublished;
             if (t.fallbackEscapes || t.fallbackForcedLapCloses ||
                 t.fallbackRelaxedPicks || t.variantPicks || t.fallbackCleanForward)
                 printf("[census] seed%d fallbacks: escapes=%u forcedLapCloses=%u "
@@ -1169,6 +1400,55 @@ int main(int argc, char **argv) {
         // window + clearance-matched drop, NOT by clustering at the 0.75 floor).
         printf("[census] scale HELIX mean=%.2fx n=%ld\n",
                helixScaleN ? helixScaleSum / helixScaleN : 0.0, helixScaleN);
+        // SIZE-SPECTRUM LAW (user 2026-07-21): per-element built-scale spectrum.
+        // Gate intent: capViol == 0 always; for any element with n >= 6, all
+        // three window terciles populated (never a one-signature size).
+        {
+            int capViolTotal = 0, terMiss = 0;
+            for (int m = 0; m < M_COUNT; ++m) {
+                const Track::ScaleStat &sc = specScale[m];
+                if (!sc.n) continue;
+                printf("[census] spectrum %-8s n=%-3d scale %.2f/%.2f/%.2fx "
+                       "ter[lo,mid,hi]=%d/%d/%d capViol=%d%s\n",
+                       GEN_NM[m], sc.n, sc.mn, sc.sum / sc.n, sc.mx,
+                       sc.ter[0], sc.ter[1], sc.ter[2], sc.capViol,
+                       (sc.n >= 6 && (!sc.ter[0] || !sc.ter[1] || !sc.ter[2]))
+                           ? "  ONE-SIGNATURE" : "");
+                capViolTotal += sc.capViol;
+                if (sc.n >= 6 && (!sc.ter[0] || !sc.ter[1] || !sc.ter[2]))
+                    terMiss++;
+            }
+            printf("[census] spectrum gate: capViol=%d (need 0) oneSignature=%d"
+                   " (need 0 among n>=6)\n", capViolTotal, terMiss);
+            // DURATION LAW: built mean seconds per occurrence vs the real
+            // reference; target mean ~0.75x, no element averaging > 1.0x.
+            int durOver = 0;
+            for (int m = 0; m < M_COUNT; ++m) {
+                const float real = genc::REAL_ELEMENT_SECONDS[m];
+                if (real <= 0.0f || !specElemCnt[m]) continue;
+                const double mean = specElemSecs[m] / specElemCnt[m];
+                const double ratio = mean / real;
+                const bool over = ratio > 1.0 + 0.02;
+                if (over) durOver++;
+                printf("[census] duration %-8s n=%-3ld mean=%.1fs real=%.1fs "
+                       "ratio=%.2fx%s%s\n", GEN_NM[m], specElemCnt[m], mean,
+                       real, ratio, over ? "  OVER-1.0x" : "",
+                       (m == M_HILLS || m == M_ROLL)
+                           ? " (ref is per lobe/rev)" : "");
+            }
+            printf("[census] duration gate: over-1.0x=%d (need 0; HILLS/ROLL"
+                   " per-lobe refs advisory)\n", durOver);
+            // Height spectrum: 25 m buckets of control-point height above
+            // ground plus each tag's peak -- proves the layout populates the
+            // whole band from ground-huggers to the top hat.
+            printf("[census] heights 25m-buckets:");
+            for (int b = 0; b < 10; ++b) printf(" %ld", specRelYHist[b]);
+            printf("\n[census] peak relY by tag:");
+            for (int m = 0; m < M_COUNT; ++m)
+                if (specRelYMax[m] > 0.5f)
+                    printf(" %s=%.0f", GEN_NM[m], specRelYMax[m]);
+            printf("\n");
+        }
         int deadSubtype = 0;
         if (seeds > 1) for (int i : invType) if (setType[i] == 0) {
             printf("[census] DEAD enabled inversion subtype: %s\n", GEN_NM[i]);
@@ -1179,9 +1459,11 @@ int main(int argc, char **argv) {
         printf("[census] fallback totals (%d seeds): escapes=%lu forcedLapCloses=%lu "
                "relaxedPicks=%lu sum=%lu (target: <=%.1f total artificial rescues)"
                " [cleanForward=%lu excluded: bare 6m-envelope forward continuation, no clip;"
-               " variantPicks=%lu excluded: rhythm relaxation, clears full 6m gate]\n",
+               " variantPicks=%lu excluded: rhythm relaxation, clears full 6m gate;"
+               " escapeClipPublished=%lu: occupancy-off fan best still <2m]\n",
                seeds, totalEscapes, totalForcedCloses, totalRelaxed,
-               fallbackSum, seeds * 0.1, totalCleanForward, totalVariant);
+               fallbackSum, seeds * 0.1, totalCleanForward, totalVariant,
+               totalClipPublished);
         const bool fallbackGateFail = fallbackSum > (unsigned long)(seeds * 0.1 + 0.5);
         if (fallbackGateFail)
             printf("[census] FALLBACK GATE FAIL: %lu genuine reduced-envelope/forced rescues > %.1f target\n",
