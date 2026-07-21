@@ -226,3 +226,12 @@ NOT main). Ultracode is ON: user opted into Workflow-tool orchestration for all 
   confirm (1); fix terrain-aware routing organically (needed for phase7b anyway, do NOT just
   gate the mesa); guaranteed-continuation must never publish <2m; then the queued sizing/
   duration/physics pass on top.
+- SIZE-SPECTRUM LAW (user, post-compact msg 4): census must PROVE, per element: (1) 1.5x cap
+  never exceeded (hard check), (2) built sizes spread across the FULL [1.0,1.5] window --
+  lower/mid/upper terciles all populated across a wide seed set, never a one-signature-size
+  element (realism: real parks build small AND huge versions of the same element), (3) layout
+  height spectrum populated continuously from near-ground (dips) up to the top-hat crest; same
+  spread demanded of non-height parameters (radius/drop/revs) for elements those govern.
+  Implementation: per-element scale accumulators (sum/min/max/N + tercile counts + capViol) in
+  Track, recorded at each init's success path; census prints a scale-spectrum table + element
+  crest-height histogram; gate = all terciles nonzero for elements with N>=6, capViol=0.
