@@ -3738,7 +3738,12 @@ int main(int argc, char **argv) {
 	                            case 3: treeR = 2.6f; treeHi = top + 8.0f;  break;
 	                        }
 	                        float treeLo = top - 0.05f;
-	                        float hitR = BORE_R + treeR + 1.25f;
+	                        // Clearance must cover the FULL visual track envelope, not just the
+	                        // rail bore: supports/bents, the train cars, and the catwalk overhang
+	                        // all extend past BORE_R, so a tree cleared only to bore+1.25 m still
+	                        // visibly clips the structure (user playtest). Widen to bore + tree +
+	                        // 4 m so foliage sits clear of the whole occupied envelope.
+	                        float hitR = BORE_R + treeR + 4.0f;
 	                        float hitR2 = hitR * hitR;
 	                        int kS = (int)fmaxf(u - 16.0f, 0.0f);   // widen the tree-clearance window to cover the carve corridor (u-14..) + margin, so every carved track segment is also tree-tested
 	                        int kE = (int)(u + 30.0f);
