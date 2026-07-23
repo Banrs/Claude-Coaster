@@ -895,6 +895,15 @@ int main(int argc, char **argv) {
         int tamePosRuns = 0, tameNegRuns = 0;
         float sustainedPosByTag[M_COUNT] = {}, sustainedNegByTag[M_COUNT] = {};
         int sustainedPosTagRuns[M_COUNT] = {}, sustainedNegTagRuns[M_COUNT] = {};
+        // Durable airtime readout (playtest item #8): the MIN sustained g on any
+        // built HILLS lobe and how many HILLS lobes actually eject (sustainedNeg
+        // < -1.0 g).  The per-tag mean hides flat lobes (a crest that never
+        // reaches -0.5 g is never counted), so this exposes whether EVERY airtime
+        // hill is delivering ejector airtime.  (Investigation showed the baseline
+        // hills already eject strongly -- min ~-4.7 g, 11/11 lobes -- so the
+        // "no airtime feel" is a HILLS SHARE deficit, not a per-crest g problem.)
+        float hillsLobeMin = 1.0e9f;
+        int hillsLobeCount = 0, hillsLobeEject = 0;
         double allSpeedSum = 0.0;
         long long allSpeedN = 0;
         std::vector<float> seedAverageKmh, cadenceKm;
@@ -912,6 +921,9 @@ int main(int argc, char **argv) {
             const float tameNegSumBeforeSeed = tameNegSum;
             const int tamePosRunsBeforeSeed = tamePosRuns;
             const int tameNegRunsBeforeSeed = tameNegRuns;
+            const float hillsLobeMinBeforeSeed = hillsLobeMin;
+            const int hillsLobeCountBeforeSeed = hillsLobeCount;
+            const int hillsLobeEjectBeforeSeed = hillsLobeEject;
             float sustainedPosByTagBeforeSeed[M_COUNT];
             float sustainedNegByTagBeforeSeed[M_COUNT];
             int sustainedPosTagRunsBeforeSeed[M_COUNT];
@@ -995,6 +1007,11 @@ int main(int argc, char **argv) {
                                     if (intense) bestNegSustained=fminf(bestNegSustained,lmid);
                                     sustainedNegByTag[sustainedTag]+=lmid;
                                     sustainedNegTagRuns[sustainedTag]++;
+                                    if (sustainedTag == M_HILLS) {
+                                        hillsLobeMin = fminf(hillsLobeMin, lmid);
+                                        hillsLobeCount++;
+                                        if (lmid < -1.0f) hillsLobeEject++;
+                                    }
                                     if (intense) {
                                         sustainedNegSum+=lmid; sustainedNegRuns++;
                                     } else {
@@ -1216,6 +1233,9 @@ int main(int argc, char **argv) {
                 tameNegSum = tameNegSumBeforeSeed;
                 tamePosRuns = tamePosRunsBeforeSeed;
                 tameNegRuns = tameNegRunsBeforeSeed;
+                hillsLobeMin = hillsLobeMinBeforeSeed;
+                hillsLobeCount = hillsLobeCountBeforeSeed;
+                hillsLobeEject = hillsLobeEjectBeforeSeed;
                 for (int tag = 0; tag < M_COUNT; ++tag) {
                     sustainedPosByTag[tag] = sustainedPosByTagBeforeSeed[tag];
                     sustainedNegByTag[tag] = sustainedNegByTagBeforeSeed[tag];
@@ -1293,6 +1313,8 @@ int main(int argc, char **argv) {
                        sustainedNegTagRuns[tag]);
         }
         printf("\n");
+        printf("HILLS airtime lobes: min sustained %+.2fg, %d/%d lobes eject (sustainedNeg<-1.0g)\n",
+               hillsLobeCount ? hillsLobeMin : 0.0f, hillsLobeEject, hillsLobeCount);
         printf("sustained target: approximately +10/-5g (acceptance band +9.4/-4.5g)\n");
         std::sort(seedAverageKmh.begin(), seedAverageKmh.end());
         float aggregateKmh = allSpeedN ? (float)(3.6 * allSpeedSum / allSpeedN) : 0.0f;
